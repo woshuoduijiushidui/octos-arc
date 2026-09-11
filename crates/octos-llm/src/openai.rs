@@ -279,6 +279,44 @@ fn is_official_openai_base_url(base_url: &str) -> bool {
         .eq_ignore_ascii_case(OFFICIAL_OPENAI_BASE_URL)
 }
 
+/// Parse the `OCTOS_DEEPSEEK_REASONING_ANY_HOST` opt-in. `None` or an empty
+/// value means off (the conservative default — don't emit DeepSeek-specific
+/// reasoning fields on a non-official host); any non-empty, non-falsy value
+/// (`1`, `true`, `yes`, …) means on. Falsy values are `0`/`false`/`off`/`no`,
+/// case- and whitespace-insensitive — the same set as `OCTOS_PROMPT_CACHING`.
+/// Pure over its input so the switch is unit-testable without mutating process
+/// env (the workspace is `deny(unsafe_code)`; `std::env::set_var` is `unsafe`
+/// on edition 2024).
+fn deepseek_reasoning_any_host_from(env_value: Option<&str>) -> bool {
+    match env_value {
+        Some(v) => {
+            let t = v.trim().to_ascii_lowercase();
+            !t.is_empty() && !matches!(t.as_str(), "0" | "false" | "off" | "no")
+        }
+        None => false,
+    }
+}
+
+/// Resolve a route's DeepSeek reasoning style. Downgrades
+/// `EffortAndThinkingToggle` to `None` on non-DeepSeek-reasoning hosts unless
+/// the operator opted in via `OCTOS_DEEPSEEK_REASONING_ANY_HOST` (`any_host`).
+/// Other styles pass through unchanged. Pure over its inputs so the gate is
+/// unit-testable without env mutation.
+fn deepseek_reasoning_style_from(
+    current: ReasoningStyle,
+    url: &str,
+    any_host: bool,
+) -> ReasoningStyle {
+    if current == ReasoningStyle::EffortAndThinkingToggle
+        && !deepseek_v4_reasoning_endpoint(url)
+        && !any_host
+    {
+        ReasoningStyle::None
+    } else {
+        current
+    }
+}
+
 impl OpenAIProvider {
     /// Create a new OpenAI provider.
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
@@ -343,13 +381,19 @@ impl OpenAIProvider {
         // The DeepSeek `thinking` toggle is specific to DeepSeek's official API.
         // The same `deepseek-v4` model name fronted by other endpoints
         // (nvidia/vllm/wisemodel) uses different — or no — reasoning controls, so
-        // don't emit DeepSeek-specific fields there by default. Operators opt in
-        // per route via `model_hints` (with_hints, applied after this, still wins).
-        if self.hints.reasoning_style == ReasoningStyle::EffortAndThinkingToggle
-            && !deepseek_v4_reasoning_endpoint(&url)
-        {
-            self.hints.reasoning_style = ReasoningStyle::None;
-        }
+        // by default we don't emit DeepSeek-specific fields there. Operators opt
+        // in per route via `model_hints` (with_hints, applied after this, still
+        // wins), or globally with `OCTOS_DEEPSEEK_REASONING_ANY_HOST=1` when the
+        // custom host is known to speak the DeepSeek reasoning contract (e.g. an
+        // OpenAI-compatible proxy in front of deepseek-v4). Without either opt-in
+        // the style is downgraded so vllm/nvidia/wisemodel routes don't 400.
+        let any_host = deepseek_reasoning_any_host_from(
+            std::env::var("OCTOS_DEEPSEEK_REASONING_ANY_HOST")
+                .ok()
+                .as_deref(),
+        );
+        self.hints.reasoning_style =
+            deepseek_reasoning_style_from(self.hints.reasoning_style, &url, any_host);
         self.base_url = url;
         self
     }
@@ -1954,6 +1998,68 @@ mod tests {
                 ..Default::default()
             });
         assert_eq!(overridden.hints.reasoning_style, ReasoningStyle::Effort);
+    }
+
+    #[test]
+    fn deepseek_reasoning_any_host_env_value_parses() {
+        // Off by default — the conservative behavior for non-official hosts.
+        assert!(!deepseek_reasoning_any_host_from(None));
+        assert!(!deepseek_reasoning_any_host_from(Some("")));
+        assert!(!deepseek_reasoning_any_host_from(Some("   ")));
+        // Falsy values opt out (same set as OCTOS_PROMPT_CACHING).
+        assert!(!deepseek_reasoning_any_host_from(Some("0")));
+        assert!(!deepseek_reasoning_any_host_from(Some("false")));
+        assert!(!deepseek_reasoning_any_host_from(Some("FALSE")));
+        assert!(!deepseek_reasoning_any_host_from(Some("off")));
+        assert!(!deepseek_reasoning_any_host_from(Some("no")));
+        // Any other non-empty value opts the route in.
+        assert!(deepseek_reasoning_any_host_from(Some("1")));
+        assert!(deepseek_reasoning_any_host_from(Some("true")));
+        assert!(deepseek_reasoning_any_host_from(Some("yes")));
+        // Case- and whitespace-insensitive.
+        assert!(deepseek_reasoning_any_host_from(Some("  True  ")));
+    }
+
+    #[test]
+    fn deepseek_reasoning_style_gate_resolves_without_env_mutation() {
+        use ReasoningStyle::*;
+        // Official host keeps the DeepSeek style regardless of the opt-in.
+        assert_eq!(
+            deepseek_reasoning_style_from(
+                EffortAndThinkingToggle,
+                "https://api.deepseek.com/v1",
+                false
+            ),
+            EffortAndThinkingToggle
+        );
+        // Non-official host: downgraded by default (the vllm/nvidia guard).
+        assert_eq!(
+            deepseek_reasoning_style_from(
+                EffortAndThinkingToggle,
+                "http://10.7.1.149:10081/v1",
+                false
+            ),
+            None
+        );
+        // Non-official host + operator opt-in: style survives so the gateway
+        // receives `reasoning_effort` + `thinking` and can throttle the model.
+        assert_eq!(
+            deepseek_reasoning_style_from(
+                EffortAndThinkingToggle,
+                "http://10.7.1.149:10081/v1",
+                true
+            ),
+            EffortAndThinkingToggle
+        );
+        // Non-DeepSeek styles pass through untouched on any host.
+        assert_eq!(
+            deepseek_reasoning_style_from(Effort, "http://x/v1", false),
+            Effort
+        );
+        assert_eq!(
+            deepseek_reasoning_style_from(None, "http://x/v1", true),
+            None
+        );
     }
 
     #[test]
