@@ -1,4 +1,4 @@
 local-grader/
-arc-output/
+arc-output
 __pycache__/
 .octos-acceptance/

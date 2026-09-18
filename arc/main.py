@@ -461,8 +461,13 @@ def source_listing(output_dir: Path, limit: int = 60) -> str:
 
 # ---------------------------------------------------------------- octos driver
 
+# SSOT is `runtime_release.url` in the repo-root arc-runtime-lock.json, which
+# `octos arc run` verifies against the running binary. The lock is deliberately
+# not part of the packed bundle (see pack.sh), so this constant cannot be read
+# from it at runtime and the two MUST be bumped together. `OCTOS_RELEASE_URL`
+# overrides it for controlled tests only.
 OCTOS_RELEASE_URL = (
-    "https://github.com/octos-org/octos-arc/releases/download/v2.0.3-rc.11-arc.13/"
+    "https://github.com/woshuoduijiushidui/octos-arc/releases/download/v2.0.3-rc.11-arc.14/"
     "octos-bundle-x86_64-unknown-linux-gnu.tar.gz"
 )
 
