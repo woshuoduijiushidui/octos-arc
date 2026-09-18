@@ -153,3 +153,17 @@ All code changes follow the RED -> GREEN -> REFACTOR cycle. See `.claude/rules/t
 - Plugin skills use binary protocol: `./binary <tool_name>` with JSON stdin/stdout
 - `deny(unsafe_code)` workspace-wide lint
 - API server (`octos serve`) binds to 127.0.0.1 by default (`--host` to override)
+
+## Agent skills
+
+### Issue tracker
+
+Issues live as GitHub issues in `woshuoduijiushidui/octos-arc`, via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five canonical triage roles use their default label strings (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context — `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
