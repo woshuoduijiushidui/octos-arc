@@ -3633,18 +3633,15 @@ fn session_compaction_mode_str(session_id: &SessionKey, state: &AppState) -> &'s
     }
 }
 
-/// Produce an LLM-summarization compaction summary for the AppUI path, falling
-/// back to the deterministic [`compact_messages`] heuristic whenever the LLM
-/// summary errors, times out, or the runtime is unsupported — so it can never
-/// break a turn. Only invoked when the `--llm-compaction` serve flag is on
-/// (`AppState::llm_compaction`); the flag-off path calls the heuristic directly.
-/// Returns the summary and the path that actually produced it.
+/// Produce a validated H01e structured checkpoint for the AppUI path, falling
+/// back byte-for-byte to the deterministic B summary whenever the model result
+/// is invalid, incomplete, too large, or unavailable.
 fn appui_compaction_summary(
     llm_provider: &Arc<dyn octos_llm::LlmProvider>,
     frame: &crate::context_manager::PromptFrame,
     budget_tokens: u32,
 ) -> (String, &'static str) {
-    if let Some(summary) = octos_agent::compaction::llm_compaction_summary_with_budget(
+    if let Some(summary) = octos_agent::compaction::llm_structured_checkpoint_with_budget(
         llm_provider,
         &frame.messages,
         budget_tokens,
@@ -3652,9 +3649,11 @@ fn appui_compaction_summary(
             octos_agent::compaction::DEFAULT_LLM_COMPACTION_TIMEOUT_SECS,
         ),
     ) {
-        return (summary, "llm");
+        return (
+            summary,
+            octos_agent::compaction::H01E_STRUCTURED_CHECKPOINT_KIND,
+        );
     }
-    // Heuristic fallback still uses the summary-size budget (correct there).
     (frame.compact_summary(budget_tokens), "extractive_fallback")
 }
 

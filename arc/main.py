@@ -49,7 +49,8 @@ Environment (all optional):
     OCTOS_ARC_MAX_TOKENS      minimum max_tokens the proxy enforces on chat requests (32768; kernel arc.11 sends 4096)
     OCTOS_ARC_CODEGEN         "0" disables one-request codegen turns for one-node tasks (default on)
     OCTOS_SESSION_SCOPE       turn (default) | node | run — when a fresh octos session starts
-    OCTOS_H01_VARIANT         A | B (default) | C observation label
+    OCTOS_H01_VARIANT         A | B (default) | C experiment variant
+    OCTOS_H01E_LLM_CHECKPOINT "0" disables C checkpoint; "1" enables it (C default)
     OCTOS_ARC_INSTALL_PLAYWRIGHT  "0" never installs Playwright on the fly
     OCTOS_ARC_ALIAS_SPEC_IDS  "0" stops mirroring node states onto spec ids
     OCTOS_PERF_CONTRACT       "0" drops the performance rules from prompts
@@ -85,7 +86,7 @@ from acceptance import (  # noqa: E402
     restore_worktree, snapshot_worktree, tree_digest, workers_for_final, reap_workspace_processes)
 from codegen import FORMAT_INSTRUCTIONS, dedupe_nav_links, parse_file_blocks, write_files  # noqa: E402
 from guard import TurnMonitor  # noqa: E402
-from llm_proxy import LlmProxy, configured_model_routes  # noqa: E402
+from llm_proxy import LlmProxy, configured_model_routes, h01e_usage_totals  # noqa: E402
 from requirement_order import ancestors_of, node_fingerprint, topo_order  # noqa: E402
 from task_evidence import TaskEvidenceError, TaskEvidenceStore  # noqa: E402
 
@@ -97,6 +98,15 @@ def log(msg: str) -> None:
     stdout on long runs but keeps stderr as a separate field)."""
     print(msg, flush=True)
     print(msg, file=sys.stderr, flush=True)
+
+
+def h01e_checkpoint_enabled(variant: str, raw: str | None) -> bool:
+    if raw not in (None, "0", "1"):
+        raise ValueError("OCTOS_H01E_LLM_CHECKPOINT must be 0 or 1")
+    enabled = variant == "C" if raw is None else raw == "1"
+    if enabled and variant != "C":
+        raise ValueError("OCTOS_H01E_LLM_CHECKPOINT is only valid for H01 variant C")
+    return enabled
 
 
 # ---------------------------------------------------------------- postflight
@@ -811,6 +821,7 @@ class OctosDriver:
         max_iterations: int,
         events_log: Path,
         h01_observer=None,
+        h01e_llm_checkpoint: bool = False,
     ) -> None:
         self.mode = os.environ.get("OCTOS_DRIVER", "stdio")
         # "turn": new session every turn; "node": one session per requirement
@@ -829,6 +840,7 @@ class OctosDriver:
         self.max_iterations = max_iterations
         self.events_log = events_log
         self.h01_observer = h01_observer
+        self.h01e_llm_checkpoint = h01e_llm_checkpoint
         self.h01_compaction_count = 0
         self._h01_artifact_reads: dict[str, str] = {}
         self._session = None
@@ -975,7 +987,12 @@ class OctosDriver:
         if self._session is None:
             from octos_stdio import OctosStdioSession
             self._session = OctosStdioSession(self.octos_bin, self.cwd, self.env, self.data_dir,
-                                              on_event=self._log_event)
+                                              on_event=self._log_event,
+                                              extra_args=(
+                                                  ["--llm-compaction"]
+                                                  if self.h01e_llm_checkpoint
+                                                  else None
+                                              ))
             self._session.bootstrap_profile(
                 provider=self.env.get("_ARC_PROVIDER", "openai"),
                 model=self.env.get("_ARC_MODEL", ""),
@@ -1465,6 +1482,10 @@ class Flow:
             raise ValueError(
                 f"OCTOS_H01_VARIANT must be A, B, or C; got {self.h01_variant!r}"
             )
+        self.h01e_llm_checkpoint = h01e_checkpoint_enabled(
+            self.h01_variant,
+            os.environ.get("OCTOS_H01E_LLM_CHECKPOINT"),
+        )
         self.t_start = time.time()
         self.runtime = None
         self.events = None
@@ -2001,9 +2022,17 @@ class Flow:
             mode = "none" if getattr(self, "nodes_to_implement", 2) <= 1 else "low"
         upstream = os.environ.get("OPENAI_BASE_URL", "")
         routes_configured = bool(json.loads(configured_model_routes() or "[]"))
-        if mode == "passthrough" and not routes_configured:
+        if (
+            mode == "passthrough"
+            and not routes_configured
+            and not self.h01e_llm_checkpoint
+        ):
             return
         if not upstream.startswith("http"):
+            if self.h01e_llm_checkpoint:
+                raise ValueError(
+                    "H01e requires an HTTP provider endpoint so its usage is measurable"
+                )
             if routes_configured:
                 raise ValueError("model routing requires an HTTP provider endpoint")
             return
@@ -2014,7 +2043,7 @@ class Flow:
                                       trim=os.environ.get("OCTOS_ARC_TRIM_PROMPT", "1") != "0",
                                       min_max_tokens=int(os.environ.get("OCTOS_ARC_MAX_TOKENS", "32768"))).start()
         except OSError as exc:
-            if routes_configured:
+            if routes_configured or self.h01e_llm_checkpoint:
                 raise
             log(f"[proxy] could not start local LLM proxy ({exc}); using the endpoint directly")
             return
@@ -2027,6 +2056,23 @@ class Flow:
         proxy = getattr(self, "llm_proxy", None)
         if proxy:
             proxy.stop()
+        usage_path = self.output_dir / ".arc" / "llm-usage.jsonl"
+        h01e_requests, h01e_tokens = h01e_usage_totals(usage_path)
+        driver = getattr(self, "driver", None)
+        self.record_h01_observation(
+            "run",
+            {
+                "compaction_count": int(
+                    getattr(driver, "h01_compaction_count", 0) or 0
+                ),
+                "h01e_extra_requests": h01e_requests,
+                "h01e_extra_tokens": h01e_tokens,
+                "typed_input_enabled": (
+                    getattr(self, "task_evidence", None) is not None
+                    and os.environ.get("OCTOS_DRIVER", "stdio") != "chat"
+                ),
+            },
+        )
         self.log_usage_summary()
 
     def log_usage_summary(self) -> None:
@@ -2900,7 +2946,8 @@ class Flow:
             self.driver = DryRunDriver() if dry_run else OctosDriver(
                 octos_bin, self.output_dir, env, data_dir, int(os.environ.get("OCTOS_MAX_ITERATIONS", "500")),
                 events_log=self.output_dir / ".arc" / "octos-events.jsonl",
-                h01_observer=self.record_h01_observation)
+                h01_observer=self.record_h01_observation,
+                h01e_llm_checkpoint=self.h01e_llm_checkpoint)
             self.driver.hooks = protected_hooks(protected)
             threading.Thread(target=_port_watchdog, args=(self.web_port, self.output_dir, watchdog_stop),
                              daemon=True).start()

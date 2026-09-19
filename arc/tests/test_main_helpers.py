@@ -1,6 +1,15 @@
 import unittest
+from unittest import mock
 
-from main import OctosDriver, describe_node, folder_descendants, inline_sources, inline_spec_text, unchanged_node_ids
+from main import (
+    OctosDriver,
+    describe_node,
+    folder_descendants,
+    h01e_checkpoint_enabled,
+    inline_sources,
+    inline_spec_text,
+    unchanged_node_ids,
+)
 import main as m
 
 
@@ -66,6 +75,37 @@ class TransientTests(unittest.TestCase):
 
 
 class H01ObservationTests(unittest.TestCase):
+    def test_h01e_checkpoint_is_c_only_and_can_be_disabled(self):
+        self.assertFalse(h01e_checkpoint_enabled("B", None))
+        self.assertTrue(h01e_checkpoint_enabled("C", None))
+        self.assertFalse(h01e_checkpoint_enabled("C", "0"))
+        self.assertTrue(h01e_checkpoint_enabled("C", "1"))
+        with self.assertRaises(ValueError):
+            h01e_checkpoint_enabled("B", "1")
+        with self.assertRaises(ValueError):
+            h01e_checkpoint_enabled("C", "yes")
+
+    @mock.patch("octos_stdio.OctosStdioSession")
+    def test_c_driver_enables_structured_compaction_server_flag(self, session_cls):
+        from pathlib import Path
+
+        driver = OctosDriver(
+            "octos",
+            Path("."),
+            {},
+            Path(".arc/data"),
+            10,
+            Path(".arc/octos-events.jsonl"),
+            h01e_llm_checkpoint=True,
+        )
+
+        driver._get_session()
+
+        self.assertEqual(
+            session_cls.call_args.kwargs["extra_args"],
+            ["--llm-compaction"],
+        )
+
     def test_should_write_allowlisted_run_observation_without_sensitive_fields(self):
         import json
         import tempfile
@@ -100,6 +140,52 @@ class H01ObservationTests(unittest.TestCase):
             self.assertNotIn("api_key", record)
             self.assertNotIn("command", record)
             self.assertNotIn("must-not-be-logged", json.dumps(record))
+
+    def test_should_publish_h01e_usage_totals_at_shutdown(self):
+        import argparse
+        import json
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+
+        from arcbench_agent_runtime.context import RuntimePaths
+        from arcbench_agent_runtime.events import EventClient
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".arc").mkdir()
+            (root / ".arc" / "llm-usage.jsonl").write_text(
+                json.dumps({
+                    "request_kind": "h01e_compaction",
+                    "prompt_tokens": 31,
+                    "completion_tokens": 11,
+                })
+                + "\n",
+                encoding="utf-8",
+            )
+            with mock.patch.dict(
+                "os.environ",
+                {
+                    "OCTOS_H01_VARIANT": "C",
+                    "OCTOS_H01E_LLM_CHECKPOINT": "0",
+                },
+            ):
+                flow = m.Flow(argparse.Namespace(web_port=3000), root, root)
+            flow.events = EventClient(RuntimePaths.from_env(project_dir=str(root)))
+            flow.driver = SimpleNamespace(h01_compaction_count=2)
+            flow.task_evidence = object()
+
+            flow.stop_llm_proxy()
+
+            record = json.loads(
+                (root / ".arc" / "runner-events.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()[-1]
+            )
+            self.assertEqual(record["variant"], "C")
+            self.assertEqual(record["h01e_extra_requests"], 1)
+            self.assertEqual(record["h01e_extra_tokens"], 42)
+            self.assertEqual(record["compaction_count"], 2)
 
     def test_should_reduce_compaction_and_artifact_recall_events_to_safe_metadata(self):
         import tempfile

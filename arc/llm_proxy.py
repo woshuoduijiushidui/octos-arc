@@ -24,6 +24,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 HOP_HEADERS = {"host", "content-length", "transfer-encoding", "connection", "accept-encoding"}
+H01E_RESPONSE_FORMAT_NAME = "h01e_structured_checkpoint"
 
 
 def model_routes(raw: str) -> list[dict]:
@@ -179,6 +180,25 @@ def request_shape(body: bytes) -> dict | None:
             chars += len(json.dumps(msg["tool_calls"], ensure_ascii=False))
         shape[f"{role}_chars"] = shape.get(f"{role}_chars", 0) + chars
     return shape
+
+
+def request_kind(body: bytes) -> str:
+    """Classify requests without retaining prompt content in the usage log."""
+    try:
+        data = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return "agent"
+    if not isinstance(data, dict):
+        return "agent"
+    response_format = data.get("response_format")
+    if isinstance(response_format, dict):
+        json_schema = response_format.get("json_schema")
+        if (
+            isinstance(json_schema, dict)
+            and json_schema.get("name") == H01E_RESPONSE_FORMAT_NAME
+        ):
+            return "h01e_compaction"
+    return "agent"
 
 
 # System-prompt sections of the octos coding profile that no ARC task uses.
@@ -367,11 +387,21 @@ def to_sse(response_body: bytes) -> bytes:
     return "".join(f"data: {l}\n\n" for l in lines).encode("utf-8") + b"data: [DONE]\n\n"
 
 
-def usage_record(response_body: bytes, elapsed_ms: int, mode: str) -> dict | None:
+def usage_record(
+    response_body: bytes,
+    elapsed_ms: int,
+    mode: str,
+    kind: str | None = None,
+) -> dict | None:
     usage = _usage_from_body(response_body)
     if not isinstance(usage, dict):
-        return None
+        if kind != "h01e_compaction":
+            return None
+        usage = {}
     rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()), "elapsed_ms": elapsed_ms, "mode": mode}
+    if kind is not None:
+        rec["request_kind"] = kind
+    rec["usage_available"] = bool(usage)
     text = response_body.decode("utf-8", errors="replace")
     if text.lstrip().startswith("data:"):
         rec["sse_chunks"] = sum(1 for l in text.splitlines() if l.startswith("data:") and l.strip() != "data: [DONE]")
@@ -391,6 +421,23 @@ def usage_record(response_body: bytes, elapsed_ms: int, mode: str) -> dict | Non
     if "prompt_cache_hit_tokens" not in rec and isinstance(pdetails, dict) and "cached_tokens" in pdetails:
         rec["prompt_cache_hit_tokens"] = pdetails["cached_tokens"]
     return rec
+
+
+def h01e_usage_totals(path: Path) -> tuple[int, int]:
+    requests = tokens = 0
+    if not path.is_file():
+        return requests, tokens
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            record = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(record, dict) or record.get("request_kind") != "h01e_compaction":
+            continue
+        requests += 1
+        tokens += int(record.get("prompt_tokens") or 0)
+        tokens += int(record.get("completion_tokens") or 0)
+    return requests, tokens
 
 
 class LlmProxy:
@@ -434,22 +481,29 @@ class LlmProxy:
                 length = int(self.headers.get("Content-Length") or 0)
                 body = self.rfile.read(length) if length else b""
                 was_streaming = False
+                kind = "other"
                 if method == "POST" and self.path.rstrip("/").endswith("/chat/completions"):
-                    body = inject_reasoning(body, proxy.mode)
-                    body = ensure_max_tokens(body, proxy.min_max_tokens)
-                    with proxy._lock:
-                        used = proxy.turn_requests
-                        proxy.turn_requests += 1
-                    capped = enforce_turn_budget(body, used, proxy.turn_budget)
-                    if capped is not body:
-                        proxy.budget_hits += 1
-                    body = capped
-                    if proxy.trim or proxy.extra_drop_tools:
-                        body = trim_request(body, (DROP_TOOLS if proxy.trim else set()) | proxy.extra_drop_tools)
-                    if proxy.no_tools:
-                        body = strip_all_tools(body)
-                    if proxy.system_override:
-                        body = replace_system_prompt(body, proxy.system_override)
+                    kind = request_kind(body)
+                    if kind != "h01e_compaction":
+                        body = inject_reasoning(body, proxy.mode)
+                        body = ensure_max_tokens(body, proxy.min_max_tokens)
+                        with proxy._lock:
+                            used = proxy.turn_requests
+                            proxy.turn_requests += 1
+                        capped = enforce_turn_budget(body, used, proxy.turn_budget)
+                        if capped is not body:
+                            proxy.budget_hits += 1
+                        body = capped
+                        if proxy.trim or proxy.extra_drop_tools:
+                            body = trim_request(
+                                body,
+                                (DROP_TOOLS if proxy.trim else set())
+                                | proxy.extra_drop_tools,
+                            )
+                        if proxy.no_tools:
+                            body = strip_all_tools(body)
+                        if proxy.system_override:
+                            body = replace_system_prompt(body, proxy.system_override)
                     if proxy.destream:
                         body, was_streaming = destream_request(body)
                     body = route_request(body, proxy.routes, proxy.phase)
@@ -459,7 +513,9 @@ class LlmProxy:
                 path = self.path
                 if path.startswith("/v1") and proxy.upstream.endswith("/v1"):
                     path = path[3:]
-                status, payload, resp_headers = proxy._request_upstream(method, path, body, headers)
+                status, payload, resp_headers = proxy._request_upstream(
+                    method, path, body, headers, kind
+                )
                 ctype = resp_headers.get("Content-Type", "application/json") if resp_headers else "application/json"
                 if was_streaming and status == 200:
                     payload, ctype = to_sse(payload), "text/event-stream; charset=utf-8"
@@ -484,7 +540,14 @@ class LlmProxy:
         self.base_url = f"http://{host}:{self.port}/v1"
         self._thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
-    def _request_upstream(self, method: str, path: str, body: bytes, headers: dict) -> tuple:
+    def _request_upstream(
+        self,
+        method: str,
+        path: str,
+        body: bytes,
+        headers: dict,
+        kind: str = "other",
+    ) -> tuple:
         # Only pending identical completions are shared. Include credentials and
         # all forwarded headers; never share across distinct requests or phases.
         key = (method, path, body, tuple(sorted((k.lower(), v) for k, v in headers.items())), self.phase) \
@@ -510,7 +573,14 @@ class LlmProxy:
             except Exception as exc:  # noqa: BLE001
                 result = 502, json.dumps({"error": {"message": f"proxy: {exc}"}}).encode(), {}
             _, payload, _ = result
-            self._log(payload, int((time.time() - t0) * 1000), body, len(body), len(payload))
+            self._log(
+                payload,
+                int((time.time() - t0) * 1000),
+                body,
+                len(body),
+                len(payload),
+                kind,
+            )
             future.set_result(result)
             return result
         except BaseException as exc:
@@ -537,10 +607,10 @@ class LlmProxy:
             pass
 
     def _log(self, payload: bytes, elapsed_ms: int, request_body: bytes = b"", req_bytes: int = 0,
-             resp_bytes: int = 0) -> None:
+             resp_bytes: int = 0, kind: str = "other") -> None:
         if not self.log_path:
             return
-        rec = usage_record(payload, elapsed_ms, self.mode)
+        rec = usage_record(payload, elapsed_ms, self.mode, kind)
         if rec is None:
             return
         with self._lock:

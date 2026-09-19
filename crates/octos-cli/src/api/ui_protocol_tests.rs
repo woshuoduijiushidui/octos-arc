@@ -4000,6 +4000,113 @@ fn compaction_observation_uses_enumerated_rejection_reason() {
     assert_eq!(observed.candidate_reason, "rejected_empty_summary");
 }
 
+struct H01eCheckpointProvider {
+    content: String,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl octos_llm::LlmProvider for H01eCheckpointProvider {
+    async fn chat(
+        &self,
+        _messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &octos_llm::ChatConfig,
+    ) -> eyre::Result<octos_llm::ChatResponse> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(octos_llm::ChatResponse {
+            content: Some(self.content.clone()),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            stop_reason: octos_llm::StopReason::EndTurn,
+            usage: octos_llm::TokenUsage::default(),
+            provider_index: None,
+        })
+    }
+
+    fn model_id(&self) -> &str {
+        "h01e-test"
+    }
+
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
+fn h01e_compaction_frame() -> crate::context_manager::PromptFrame {
+    let history = vec![
+        test_message(
+            MessageRole::User,
+            format!("historical request {}", "alpha ".repeat(500)),
+        ),
+        test_message(
+            MessageRole::Assistant,
+            format!("historical result {}", "beta ".repeat(500)),
+        ),
+        test_message(MessageRole::User, "current request"),
+    ];
+    let manager = ContextManager::from_session_history("h01e-frame", None, &history);
+    manager.compaction_input(
+        &CompactContextPolicy {
+            keep_recent_items: 1,
+            ..Default::default()
+        },
+        &PromptBuildPolicy::default(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn appui_compaction_reports_structured_kind_for_valid_h01e_checkpoint() {
+    let provider_impl = Arc::new(H01eCheckpointProvider {
+        content: serde_json::json!({
+            "historical_decisions": ["Keep the parser deterministic."],
+            "completed_work": ["Added focused tests."],
+            "unresolved_investigation": [],
+            "next_suggested_action": "Run the parser tests.",
+            "critical_file_references": ["src/parser.rs#L10-L20"]
+        })
+        .to_string(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let provider: Arc<dyn octos_llm::LlmProvider> = provider_impl.clone();
+
+    let (summary, kind) = appui_compaction_summary(&provider, &h01e_compaction_frame(), 1_000);
+
+    assert_eq!(
+        kind,
+        octos_agent::compaction::H01E_STRUCTURED_CHECKPOINT_KIND
+    );
+    assert!(summary.contains("## Historical Decisions"));
+    assert_eq!(
+        provider_impl
+            .calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn appui_h01e_failure_is_byte_identical_to_b_summary() {
+    let provider_impl = Arc::new(H01eCheckpointProvider {
+        content: "{malformed".to_owned(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let provider: Arc<dyn octos_llm::LlmProvider> = provider_impl.clone();
+    let frame = h01e_compaction_frame();
+    let expected = frame.compact_summary(1_000);
+
+    let (summary, kind) = appui_compaction_summary(&provider, &frame, 1_000);
+
+    assert_eq!(kind, "extractive_fallback");
+    assert_eq!(summary, expected);
+    assert_eq!(
+        provider_impl
+            .calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+}
+
 fn h01_task_evidence(next_action: &str) -> TaskEvidenceCapsule {
     serde_json::from_value(json!({
         "schema": octos_core::ui_protocol::TASK_EVIDENCE_SCHEMA_V1,

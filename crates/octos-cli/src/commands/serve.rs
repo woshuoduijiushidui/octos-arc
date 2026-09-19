@@ -398,11 +398,10 @@ pub struct ServeCommand {
     #[arg(long)]
     pub no_network: bool,
 
-    /// Use LLM-summarization for AppUI context compaction: when a session's
-    /// context fills, ask the model for a high-quality handoff summary (a real
-    /// model call — slower, a few seconds) instead of the instant deterministic
-    /// heuristic. Falls back to the heuristic on any error/timeout, so it never
-    /// breaks a turn. Off by default.
+    /// Use the validated H01e structured checkpoint for AppUI context
+    /// compaction. This adds at most one model request per compaction and falls
+    /// back to the deterministic summary on any invalid result, error, or
+    /// timeout. Off by default.
     #[arg(long)]
     pub llm_compaction: bool,
 
