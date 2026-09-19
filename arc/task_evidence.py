@@ -7,7 +7,7 @@ import json
 import os
 import re
 import tempfile
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -16,8 +16,11 @@ from acceptance import RunSummary, TestOutcome, failure_signature
 
 TASK_EVIDENCE_SCHEMA = "octos.task-evidence.v1"
 TASK_EVIDENCE_RELATIVE_PATH = Path(".arc/context/task-evidence.v1.json")
+ACCEPTANCE_EVIDENCE_SCHEMA = "octos.acceptance-evidence.v1"
+ACCEPTANCE_EVIDENCE_RELATIVE_DIR = Path(".arc/evidence")
 MAX_CAPSULE_BYTES = 128 * 1024
 OFFICIAL_TEST_POLICY = "official tests are read-only"
+_RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SOURCE_ROOTS = ("frontend", "backend")
 _IGNORED_SOURCE_PARTS = {
     ".arc",
@@ -198,15 +201,14 @@ def serialize_capsule(capsule: TaskEvidenceCapsule) -> bytes:
     return data
 
 
-def write_capsule_atomic(path: Path, capsule: TaskEvidenceCapsule) -> None:
-    data = serialize_capsule(capsule)
+def _write_atomic_bytes(path: Path, data: bytes, label: str) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, raw_tmp = tempfile.mkstemp(
             prefix=f".{path.name}.tmp-", dir=str(path.parent)
         )
     except OSError as exc:
-        raise TaskEvidenceWriteError(f"prepare task evidence write failed: {exc}") from exc
+        raise TaskEvidenceWriteError(f"prepare {label} write failed: {exc}") from exc
 
     tmp = Path(raw_tmp)
     try:
@@ -228,12 +230,32 @@ def write_capsule_atomic(path: Path, capsule: TaskEvidenceCapsule) -> None:
             tmp.unlink()
         except OSError:
             pass
-        raise TaskEvidenceWriteError(f"write task evidence failed: {exc}") from exc
+        raise TaskEvidenceWriteError(f"write {label} failed: {exc}") from exc
+
+
+def write_capsule_atomic(path: Path, capsule: TaskEvidenceCapsule) -> None:
+    _write_atomic_bytes(path, serialize_capsule(capsule), "task evidence")
 
 
 def _normalized_text(value: Any) -> str:
     text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
     return "\n".join(line.rstrip() for line in text.splitlines()).strip()
+
+
+def _bounded_text(value: Any, max_bytes: int) -> str:
+    text = _normalized_text(value)
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    suffix = b" [truncated]"
+    end = max(0, max_bytes - len(suffix))
+    while end > 0:
+        try:
+            prefix = encoded[:end].decode("utf-8")
+            return prefix + suffix.decode("ascii")
+        except UnicodeDecodeError:
+            end -= 1
+    return suffix[:max_bytes].decode("ascii", errors="ignore")
 
 
 def _normalized_value(value: Any) -> Any:
@@ -489,13 +511,18 @@ def _source_state(
 
 
 def _safe_command(specs: list[str]) -> str:
+    safe = _safe_specs(specs)
+    return "npx playwright test" + (" " + " ".join(safe) if safe else "")
+
+
+def _safe_specs(specs: list[str]) -> list[str]:
     safe = []
     for raw in sorted(set(specs)):
         path = Path(raw)
         if path.is_absolute() or ".." in path.parts or not raw.endswith(".spec.ts"):
             continue
         safe.append(path.as_posix())
-    return "npx playwright test" + (" " + " ".join(safe) if safe else "")
+    return safe
 
 
 def _failure_digest(outcome: TestOutcome) -> str:
@@ -509,7 +536,7 @@ def _expected_actual(message: str) -> tuple[str | None, str | None]:
     actual = _ACTUAL.search(message or "")
     if not expected or not actual:
         return None, None
-    return expected.group(1).strip()[:500], actual.group(1).strip()[:500]
+    return _bounded_text(expected.group(1), 500), _bounded_text(actual.group(1), 500)
 
 
 def _fallback_run_id(summary: RunSummary, source_sha256: str, command: str) -> str:
@@ -522,6 +549,132 @@ def _fallback_run_id(summary: RunSummary, source_sha256: str, command: str) -> s
         "failures": sorted(list(failure_signature(summary))),
     }
     return "acceptance-" + _sha256_json(payload).split(":", 1)[1][:12]
+
+
+def _serialize_acceptance_evidence(
+    summary: RunSummary,
+    source_sha256: str,
+    specs: list[str],
+    run_id: str,
+    command: str,
+) -> bytes:
+    summary_payload = asdict(summary)
+    summary_payload["run_id"] = run_id
+    summary_payload["command"] = command
+    payload = {
+        "schema": ACCEPTANCE_EVIDENCE_SCHEMA,
+        "run_id": run_id,
+        "source_sha256": source_sha256,
+        "specs": _safe_specs(specs),
+        "summary": summary_payload,
+    }
+    return (
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _acceptance_artifact_ref(
+    output_dir: Path, run_id: str, artifact_data: bytes
+) -> str:
+    primary = (ACCEPTANCE_EVIDENCE_RELATIVE_DIR / f"{run_id}.json").as_posix()
+    path = _artifact_path(output_dir, primary)
+    try:
+        existing = path.read_bytes()
+    except FileNotFoundError:
+        return primary
+    except OSError as exc:
+        raise TaskEvidenceError(
+            f"cannot inspect acceptance artifact {primary}: {exc}"
+        ) from exc
+    if existing == artifact_data:
+        return primary
+    digest = hashlib.sha256(artifact_data).hexdigest()
+    return (
+        ACCEPTANCE_EVIDENCE_RELATIVE_DIR / f"{run_id}-{digest}.json"
+    ).as_posix()
+
+
+def _artifact_path(output_dir: Path, artifact_ref: str) -> Path:
+    reference = Path(artifact_ref)
+    if (
+        not artifact_ref
+        or "\\" in artifact_ref
+        or reference.is_absolute()
+        or reference.parts[:2] != ACCEPTANCE_EVIDENCE_RELATIVE_DIR.parts
+        or len(reference.parts) != 3
+        or any(part in ("", ".", "..") for part in reference.parts)
+    ):
+        raise TaskEvidenceError(
+            f"invalid acceptance artifact reference: {artifact_ref!r}"
+        )
+    root = output_dir.resolve()
+    path = (root / reference).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise TaskEvidenceError(
+            f"acceptance artifact escapes output directory: {artifact_ref}"
+        ) from exc
+    return path
+
+
+def _validate_artifact(
+    output_dir: Path,
+    artifact_ref: str,
+    artifact_sha256: str,
+    artifact_bytes: int,
+) -> None:
+    if (
+        not isinstance(artifact_bytes, int)
+        or isinstance(artifact_bytes, bool)
+        or artifact_bytes < 0
+    ):
+        raise TaskEvidenceError("acceptance artifact byte count is invalid")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", artifact_sha256):
+        raise TaskEvidenceError("acceptance artifact SHA-256 is invalid")
+    path = _artifact_path(output_dir, artifact_ref)
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError as exc:
+        raise TaskEvidenceError(
+            f"referenced acceptance artifact is missing: {artifact_ref}"
+        ) from exc
+    except OSError as exc:
+        raise TaskEvidenceError(
+            f"cannot read acceptance artifact {artifact_ref}: {exc}"
+        ) from exc
+    if len(data) != artifact_bytes:
+        raise TaskEvidenceError(
+            f"acceptance artifact byte count mismatch: {artifact_ref}"
+        )
+    if _sha256_bytes(data) != artifact_sha256:
+        raise TaskEvidenceError(f"acceptance artifact hash mismatch: {artifact_ref}")
+
+
+def _validate_capsule_artifacts(
+    output_dir: Path, capsule: TaskEvidenceCapsule
+) -> None:
+    validated = set()
+    for failure in capsule.active_failures:
+        metadata = (
+            failure.artifact_ref,
+            failure.artifact_sha256,
+            failure.artifact_bytes,
+        )
+        if metadata == (None, None, None):
+            continue
+        if any(value is None for value in metadata):
+            raise TaskEvidenceError("active failure artifact metadata is incomplete")
+        if metadata in validated:
+            continue
+        _validate_artifact(output_dir, *metadata)
+        validated.add(metadata)
 
 
 def _capsule_from_dict(data: Any) -> TaskEvidenceCapsule:
@@ -576,9 +729,21 @@ def _capsule_from_dict(data: Any) -> TaskEvidenceCapsule:
                 signature=str(item["signature"]),
                 occurrences=int(item["occurrences"]),
                 run_id=str(item["run_id"]),
-                artifact_ref=item.get("artifact_ref"),
-                artifact_sha256=item.get("artifact_sha256"),
-                artifact_bytes=item.get("artifact_bytes"),
+                artifact_ref=(
+                    str(item["artifact_ref"])
+                    if item.get("artifact_ref") is not None
+                    else None
+                ),
+                artifact_sha256=(
+                    str(item["artifact_sha256"])
+                    if item.get("artifact_sha256") is not None
+                    else None
+                ),
+                artifact_bytes=(
+                    int(item["artifact_bytes"])
+                    if item.get("artifact_bytes") is not None
+                    else None
+                ),
             )
             for item in data.get("active_failures") or []
         )
@@ -631,6 +796,7 @@ class TaskEvidenceStore:
                 self.capsule = _capsule_from_dict(
                     json.loads(self.path.read_text(encoding="utf-8"))
                 )
+                _validate_capsule_artifacts(self.output_dir, self.capsule)
             except (OSError, UnicodeError, json.JSONDecodeError) as exc:
                 raise TaskEvidenceError(
                     f"cannot load task evidence {self.path}: {exc}"
@@ -751,6 +917,8 @@ class TaskEvidenceStore:
         run_id = _normalized_text(getattr(summary, "run_id", "")) or _fallback_run_id(
             summary, source.tree_sha256, command
         )
+        if not _RUN_ID.fullmatch(run_id):
+            run_id = _fallback_run_id(summary, source.tree_sha256, command)
         verification = VerificationRun(
             run_id=run_id,
             source_sha256=source.tree_sha256,
@@ -759,6 +927,34 @@ class TaskEvidenceStore:
             passed=max(0, int(summary.passed)),
             total=max(0, int(summary.total)),
         )
+        artifact_ref = None
+        artifact_sha256 = None
+        artifact_bytes = None
+        if summary.error or any(not outcome.ok for outcome in summary.results):
+            artifact_data = _serialize_acceptance_evidence(
+                summary,
+                source.tree_sha256,
+                specs,
+                run_id,
+                command,
+            )
+            artifact_ref = _acceptance_artifact_ref(
+                self.output_dir, run_id, artifact_data
+            )
+            artifact_sha256 = _sha256_bytes(artifact_data)
+            artifact_bytes = len(artifact_data)
+            artifact_path = _artifact_path(self.output_dir, artifact_ref)
+            _write_atomic_bytes(
+                artifact_path,
+                artifact_data,
+                "acceptance evidence artifact",
+            )
+            _validate_artifact(
+                self.output_dir,
+                artifact_ref,
+                artifact_sha256,
+                artifact_bytes,
+            )
         previous = {item.signature: item for item in current.active_failures}
         failures_by_signature: dict[str, ActiveFailure] = {}
         for outcome in summary.results:
@@ -775,16 +971,19 @@ class TaskEvidenceStore:
                 else (prior.occurrences + 1 if prior else 1)
             )
             failures_by_signature[signature] = ActiveFailure(
-                test_id=_normalized_text(outcome.title)
-                or _normalized_text(outcome.file)
+                test_id=_bounded_text(outcome.title, 500)
+                or _bounded_text(outcome.file, 500)
                 or "unknown-test",
-                location=_normalized_text(outcome.location or outcome.file),
-                status=_normalized_text(outcome.status) or "failed",
+                location=_bounded_text(outcome.location or outcome.file, 1000),
+                status=_bounded_text(outcome.status, 100) or "failed",
                 expected=expected,
                 actual=actual,
                 signature=signature,
                 occurrences=occurrences,
                 run_id=run_id,
+                artifact_ref=artifact_ref,
+                artifact_sha256=artifact_sha256,
+                artifact_bytes=artifact_bytes,
             )
         if summary.error and not failures_by_signature:
             signature = _sha256_json(
@@ -805,10 +1004,13 @@ class TaskEvidenceStore:
                 location="build/start/test runner",
                 status="infrastructure_error",
                 expected=None,
-                actual=_normalized_text(summary.error)[:500],
+                actual=_bounded_text(summary.error, 500),
                 signature=signature,
                 occurrences=occurrences,
                 run_id=run_id,
+                artifact_ref=artifact_ref,
+                artifact_sha256=artifact_sha256,
+                artifact_bytes=artifact_bytes,
             )
         verified = tuple(
             VerifiedBehavior(
@@ -852,5 +1054,6 @@ class TaskEvidenceStore:
         return self.capsule
 
     def _persist(self, candidate: TaskEvidenceCapsule) -> None:
+        _validate_capsule_artifacts(self.output_dir, candidate)
         write_capsule_atomic(self.path, candidate)
         self.capsule = candidate

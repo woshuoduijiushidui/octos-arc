@@ -4703,9 +4703,9 @@ mod tests {
                 "signature": format!("sha256:{}", "c".repeat(64)),
                 "occurrences": 3,
                 "run_id": "acceptance-0003",
-                "artifact_ref": null,
-                "artifact_sha256": null,
-                "artifact_bytes": null
+                "artifact_ref": ".arc/evidence/acceptance-0003.json",
+                "artifact_sha256": format!("sha256:{}", "d".repeat(64)),
+                "artifact_bytes": 42000
             }))
             .unwrap(),
         ];
@@ -4737,6 +4737,17 @@ mod tests {
 
         assert!(evidence.content.len() <= TASK_EVIDENCE_PROMPT_MAX_BYTES);
         assert!(evidence.content.contains("CRITICAL SECOND-LINE CONSTRAINT"));
+        assert!(
+            evidence
+                .content
+                .contains(".arc/evidence/acceptance-0003.json")
+        );
+        assert!(
+            evidence
+                .content
+                .contains(&format!("sha256:{}", "d".repeat(64)))
+        );
+        assert!(!evidence.content.contains("RAW_ACCEPTANCE_LOG"));
         let task = evidence.content.find("Task contract").unwrap();
         let failure = evidence.content.find("Active failures").unwrap();
         let verification = evidence.content.find("Latest verification").unwrap();

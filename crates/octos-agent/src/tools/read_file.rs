@@ -1276,6 +1276,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_file_explicitly_recovers_acceptance_evidence() {
+        let scope_dir = tempfile::tempdir().unwrap();
+        let artifact = scope_dir.path().join(".arc/evidence/acceptance-0003.json");
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        std::fs::write(&artifact, r#"{"message":"RAW_ACCEPTANCE_LOG"}"#).unwrap();
+
+        let scope = SessionScope::solo(scope_dir.path().to_path_buf(), vec![]).unwrap();
+        let tool = ReadFileTool::new(scope_dir.path());
+        let ctx = ctx_with_scope(scope);
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "path": ".arc/evidence/acceptance-0003.json"
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "expected success, got: {}", result.output);
+        assert!(result.output.contains("RAW_ACCEPTANCE_LOG"));
+    }
+
+    #[tokio::test]
     async fn read_file_allows_in_shared_zone_path() {
         // Multi-tenant scopes expose shared zones (research/, skills/).
         // READS into those zones are allowed (writes are not — see the

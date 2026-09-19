@@ -1,3 +1,4 @@
+import hashlib
 import json
 import tempfile
 import unittest
@@ -70,6 +71,17 @@ def create_store(root: Path) -> TaskEvidenceStore:
     return TaskEvidenceStore(
         output_dir=app,
         requirement_file=requirements,
+        requirement_tree=tree,
+        ordered_nodes=tree["children"],
+        folder_children={"ROOT": ["REQ-1", "REQ-2"]},
+    )
+
+
+def reopen_store(root: Path) -> TaskEvidenceStore:
+    tree = requirement_tree()
+    return TaskEvidenceStore(
+        output_dir=root / "app",
+        requirement_file=root / "requirements.yaml",
         requirement_tree=tree,
         ordered_nodes=tree["children"],
         folder_children={"ROOT": ["REQ-1", "REQ-2"]},
@@ -253,7 +265,7 @@ class EvidenceReductionTests(unittest.TestCase):
             failure = capsule.active_failures[0]
             self.assertIsNone(failure.expected)
             self.assertIsNone(failure.actual)
-            self.assertIsNone(failure.artifact_ref)
+            self.assertTrue(failure.artifact_ref.startswith(".arc/evidence/"))
 
     def test_should_replace_pass_with_regression_for_the_current_source(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -340,6 +352,203 @@ class EvidenceReductionTests(unittest.TestCase):
                     store.refresh_source("repair")
             self.assertEqual(store.path.read_bytes(), previous)
             self.assertEqual(list(store.path.parent.glob("*.tmp-*")), [])
+
+
+class AcceptanceArtifactTests(unittest.TestCase):
+    @staticmethod
+    def failed_summary(message: str, *, two_failures: bool = False) -> RunSummary:
+        results = [
+            TestOutcome(
+                "login works",
+                False,
+                "failed",
+                10,
+                file="REQ-2.spec.ts",
+                location="REQ-2.spec.ts:71",
+                message=message,
+                steps=["open login", "submit credentials"],
+                action_errors=["button was covered"],
+            )
+        ]
+        if two_failures:
+            results.append(
+                TestOutcome(
+                    "login rejects stale session",
+                    False,
+                    "timedOut",
+                    4000,
+                    file="REQ-2.spec.ts",
+                    location="REQ-2.spec.ts:93",
+                    message="session banner never appeared",
+                )
+            )
+        return RunSummary(
+            passed=0,
+            total=len(results),
+            results=results,
+            stdout_tail="playwright terminal output",
+            run_id="acceptance-0042",
+            command="npx playwright test REQ-2.spec.ts",
+            exit_code=1,
+        )
+
+    def test_should_persist_complete_failure_artifact_before_referencing_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = create_store(root)
+            store.activate("REQ-2", "implement")
+
+            capsule = store.record_verification(
+                self.failed_summary("dashboard missing"),
+                ["REQ-2.spec.ts"],
+                "repair",
+            )
+
+            failure = capsule.active_failures[0]
+            self.assertEqual(failure.artifact_ref, ".arc/evidence/acceptance-0042.json")
+            artifact = store.output_dir / failure.artifact_ref
+            data = artifact.read_bytes()
+            self.assertEqual(failure.artifact_bytes, len(data))
+            self.assertEqual(
+                failure.artifact_sha256,
+                "sha256:" + hashlib.sha256(data).hexdigest(),
+            )
+            payload = json.loads(data)
+            self.assertEqual(payload["schema"], "octos.acceptance-evidence.v1")
+            self.assertEqual(payload["summary"]["results"][0]["message"], "dashboard missing")
+            self.assertEqual(payload["summary"]["stdout_tail"], "playwright terminal output")
+
+    def test_should_reject_replay_when_referenced_artifact_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = create_store(root)
+            store.activate("REQ-2", "implement")
+            capsule = store.record_verification(
+                self.failed_summary("dashboard missing"),
+                ["REQ-2.spec.ts"],
+                "repair",
+            )
+            (store.output_dir / capsule.active_failures[0].artifact_ref).unlink()
+
+            with self.assertRaisesRegex(TaskEvidenceError, "artifact.*missing"):
+                reopen_store(root)
+
+    def test_should_reject_replay_when_artifact_hash_does_not_match(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = create_store(root)
+            store.activate("REQ-2", "implement")
+            capsule = store.record_verification(
+                self.failed_summary("dashboard missing"),
+                ["REQ-2.spec.ts"],
+                "repair",
+            )
+            artifact = store.output_dir / capsule.active_failures[0].artifact_ref
+            data = bytearray(artifact.read_bytes())
+            data[-2] = ord(" ")
+            artifact.write_bytes(data)
+
+            with self.assertRaisesRegex(TaskEvidenceError, "hash mismatch"):
+                reopen_store(root)
+
+    def test_should_keep_long_utf8_logs_out_of_the_capsule(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = create_store(root)
+            store.activate("REQ-2", "implement")
+            marker = "数据库连接失败"
+            message = marker * 20_000
+            summary = self.failed_summary(message)
+            summary.stdout_tail = "终端输出" * 10_000
+            summary.results[0].action_errors = ["浏览器诊断" * 10_000]
+
+            capsule = store.record_verification(
+                summary,
+                ["REQ-2.spec.ts"],
+                "repair",
+            )
+
+            encoded_capsule = serialize_capsule(capsule)
+            self.assertLess(len(encoded_capsule), 16 * 1024)
+            self.assertNotIn(message.encode("utf-8"), encoded_capsule)
+            artifact = store.output_dir / capsule.active_failures[0].artifact_ref
+            artifact_text = artifact.read_text(encoding="utf-8")
+            self.assertIn(message, artifact_text)
+            self.assertIn(summary.stdout_tail, artifact_text)
+            self.assertIn(summary.results[0].action_errors[0], artifact_text)
+
+    def test_should_make_all_failures_in_one_run_share_one_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = create_store(root)
+            store.activate("REQ-2", "implement")
+
+            capsule = store.record_verification(
+                self.failed_summary("dashboard missing", two_failures=True),
+                ["REQ-2.spec.ts"],
+                "repair",
+            )
+
+            self.assertEqual(len(capsule.active_failures), 2)
+            self.assertEqual(
+                {failure.artifact_ref for failure in capsule.active_failures},
+                {".arc/evidence/acceptance-0042.json"},
+            )
+            self.assertEqual(
+                len({failure.artifact_sha256 for failure in capsule.active_failures}),
+                1,
+            )
+
+    def test_should_replay_valid_artifact_metadata_byte_stably(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = create_store(root)
+            store.activate("REQ-2", "implement")
+            capsule = store.record_verification(
+                self.failed_summary("dashboard missing"),
+                ["REQ-2.spec.ts"],
+                "repair",
+            )
+            before = serialize_capsule(capsule)
+
+            replayed = reopen_store(root)
+
+            self.assertIsNotNone(replayed.capsule)
+            self.assertEqual(serialize_capsule(replayed.capsule), before)
+            self.assertEqual(
+                replayed.capsule.active_failures[0].artifact_ref,
+                ".arc/evidence/acceptance-0042.json",
+            )
+
+    def test_should_not_overwrite_an_older_artifact_when_run_id_is_reused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = create_store(root)
+            store.activate("REQ-2", "implement")
+            first = store.record_verification(
+                self.failed_summary("first failure"),
+                ["REQ-2.spec.ts"],
+                "repair",
+            )
+            first_failure = first.active_failures[0]
+            first_path = store.output_dir / first_failure.artifact_ref
+            first_data = first_path.read_bytes()
+
+            second = store.record_verification(
+                self.failed_summary("different failure"),
+                ["REQ-2.spec.ts"],
+                "repair",
+            )
+
+            second_failure = second.active_failures[0]
+            self.assertNotEqual(second_failure.artifact_ref, first_failure.artifact_ref)
+            self.assertTrue(
+                second_failure.artifact_ref.startswith(
+                    ".arc/evidence/acceptance-0042-"
+                )
+            )
+            self.assertEqual(first_path.read_bytes(), first_data)
+            self.assertTrue((store.output_dir / second_failure.artifact_ref).is_file())
 
 
 if __name__ == "__main__":
