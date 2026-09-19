@@ -13,6 +13,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
+use std::path::{Component, Path};
 use std::sync::{OnceLock, RwLock};
 use uuid::Uuid;
 
@@ -30,6 +31,10 @@ pub const JSON_RPC_VERSION: &str = "2.0";
 
 /// Maximum accepted JSON-RPC text frame size for UI transports.
 pub const MAX_TEXT_FRAME_BYTES: usize = 1024 * 1024;
+
+/// ARC task-evidence wire schema and independent payload limit.
+pub const TASK_EVIDENCE_SCHEMA_V1: &str = "octos.task-evidence.v1";
+pub const MAX_TASK_EVIDENCE_BYTES: usize = 128 * 1024;
 
 /// Per-turn ownership context for UI/SSE emission.
 ///
@@ -1963,12 +1968,232 @@ pub fn first_server_result_kind_for_method(method: &str) -> Option<UiResultKind>
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskEvidenceContract {
+    pub requirement_id: String,
+    pub phase: String,
+    pub requirement_sha256: String,
+    pub requirement_ref: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub acceptance_conditions: Vec<String>,
+    #[serde(default)]
+    pub dependencies: Vec<String>,
+    #[serde(default)]
+    pub ancestor_constraints: Vec<String>,
+    #[serde(default)]
+    pub policies: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskEvidenceChangedFile {
+    pub path: String,
+    pub sha256: String,
+    pub purpose: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskEvidenceSourceState {
+    pub tree_sha256: String,
+    #[serde(default)]
+    pub changed_files: Vec<TaskEvidenceChangedFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskEvidenceVerificationRun {
+    pub run_id: String,
+    pub source_sha256: String,
+    pub command: String,
+    pub exit_code: Option<i32>,
+    pub passed: usize,
+    pub total: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskEvidenceActiveFailure {
+    pub test_id: String,
+    #[serde(default)]
+    pub location: String,
+    pub status: String,
+    pub expected: Option<String>,
+    pub actual: Option<String>,
+    pub signature: String,
+    pub occurrences: usize,
+    pub run_id: String,
+    pub artifact_ref: Option<String>,
+    pub artifact_sha256: Option<String>,
+    pub artifact_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskEvidenceVerifiedBehavior {
+    pub test_id: String,
+    pub run_id: String,
+    pub source_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskEvidenceCapsule {
+    pub schema: String,
+    pub task: TaskEvidenceContract,
+    pub source_state: TaskEvidenceSourceState,
+    pub verification: Option<TaskEvidenceVerificationRun>,
+    #[serde(default)]
+    pub active_failures: Vec<TaskEvidenceActiveFailure>,
+    #[serde(default)]
+    pub verified_behavior: Vec<TaskEvidenceVerifiedBehavior>,
+    #[serde(default)]
+    pub next_action: String,
+}
+
+impl TaskEvidenceCapsule {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema != TASK_EVIDENCE_SCHEMA_V1 {
+            return Err(format!("unsupported task evidence schema: {}", self.schema));
+        }
+        let encoded = serde_json::to_vec(self)
+            .map_err(|error| format!("task evidence serialization failed: {error}"))?;
+        if encoded.len() > MAX_TASK_EVIDENCE_BYTES {
+            return Err(format!(
+                "task evidence is {} bytes; limit is {}",
+                encoded.len(),
+                MAX_TASK_EVIDENCE_BYTES
+            ));
+        }
+
+        require_non_empty("task.requirement_id", &self.task.requirement_id)?;
+        require_non_empty("task.phase", &self.task.phase)?;
+        validate_sha256("task.requirement_sha256", &self.task.requirement_sha256)?;
+        validate_reference_path("task.requirement_ref", &self.task.requirement_ref, false)?;
+        validate_sha256("source_state.tree_sha256", &self.source_state.tree_sha256)?;
+        for changed in &self.source_state.changed_files {
+            validate_reference_path("source_state.changed_files.path", &changed.path, true)?;
+            validate_sha256("source_state.changed_files.sha256", &changed.sha256)?;
+        }
+
+        if let Some(run) = &self.verification {
+            require_non_empty("verification.run_id", &run.run_id)?;
+            validate_sha256("verification.source_sha256", &run.source_sha256)?;
+            if run.source_sha256 != self.source_state.tree_sha256 {
+                return Err("verification source hash does not match source state".to_owned());
+            }
+            if run.passed > run.total {
+                return Err("verification passed count exceeds total".to_owned());
+            }
+            validate_test_command(&run.command)?;
+        } else if !self.verified_behavior.is_empty() {
+            return Err("verified behavior requires a verification run".to_owned());
+        }
+
+        for failure in &self.active_failures {
+            require_non_empty("active_failures.test_id", &failure.test_id)?;
+            require_non_empty("active_failures.status", &failure.status)?;
+            require_non_empty("active_failures.run_id", &failure.run_id)?;
+            validate_sha256("active_failures.signature", &failure.signature)?;
+            if failure.occurrences == 0 {
+                return Err("active failure occurrences must be positive".to_owned());
+            }
+            if let Some(run) = &self.verification
+                && failure.run_id != run.run_id
+            {
+                return Err("active failure run_id does not match verification".to_owned());
+            }
+            match (
+                &failure.artifact_ref,
+                &failure.artifact_sha256,
+                failure.artifact_bytes,
+            ) {
+                (None, None, None) => {}
+                (Some(reference), Some(hash), Some(_)) => {
+                    validate_reference_path("active_failures.artifact_ref", reference, true)?;
+                    validate_sha256("active_failures.artifact_sha256", hash)?;
+                }
+                _ => return Err("active failure artifact metadata is incomplete".to_owned()),
+            }
+        }
+        for behavior in &self.verified_behavior {
+            require_non_empty("verified_behavior.test_id", &behavior.test_id)?;
+            require_non_empty("verified_behavior.run_id", &behavior.run_id)?;
+            validate_sha256("verified_behavior.source_sha256", &behavior.source_sha256)?;
+            if behavior.source_sha256 != self.source_state.tree_sha256 {
+                return Err("verified behavior source hash does not match source state".to_owned());
+            }
+            if let Some(run) = &self.verification
+                && behavior.run_id != run.run_id
+            {
+                return Err("verified behavior run_id does not match verification".to_owned());
+            }
+        }
+        Ok(())
+    }
+}
+
+fn require_non_empty(label: &str, value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        Err(format!("{label} must not be empty"))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_sha256(label: &str, value: &str) -> Result<(), String> {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return Err(format!("{label} must use sha256:<hex>"));
+    };
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!("{label} must contain 64 lowercase hex digits"));
+    }
+    Ok(())
+}
+
+fn validate_reference_path(label: &str, value: &str, relative_only: bool) -> Result<(), String> {
+    if value.is_empty() || value.contains(['\0', '\\']) {
+        return Err(format!("{label} is not a valid normalized path"));
+    }
+    let path = Path::new(value);
+    if relative_only && path.is_absolute() {
+        return Err(format!("{label} must be relative"));
+    }
+    if path
+        .components()
+        .any(|part| matches!(part, Component::ParentDir | Component::CurDir))
+    {
+        return Err(format!("{label} must not contain traversal components"));
+    }
+    Ok(())
+}
+
+fn validate_test_command(command: &str) -> Result<(), String> {
+    let parts = command.split_ascii_whitespace().collect::<Vec<_>>();
+    if parts.len() < 3 || parts[..3] != ["npx", "playwright", "test"] || parts.join(" ") != command
+    {
+        return Err("verification command is not allowlisted".to_owned());
+    }
+    for spec in &parts[3..] {
+        if !spec.ends_with(".spec.ts") {
+            return Err("verification command contains a non-spec argument".to_owned());
+        }
+        validate_reference_path("verification command spec", spec, true)?;
+    }
+    Ok(())
+}
+
 /// Minimal input item for a started turn.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum InputItem {
     Text {
         text: String,
+    },
+    TaskEvidence {
+        capsule: TaskEvidenceCapsule,
     },
     /// Forward-compat fallback for input item kinds not yet known to this
     /// client. The original `kind` tag and any sibling fields are dropped on

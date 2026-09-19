@@ -86,6 +86,7 @@ from codegen import FORMAT_INSTRUCTIONS, dedupe_nav_links, parse_file_blocks, wr
 from guard import TurnMonitor  # noqa: E402
 from llm_proxy import LlmProxy, configured_model_routes  # noqa: E402
 from requirement_order import ancestors_of, node_fingerprint, topo_order  # noqa: E402
+from task_evidence import TaskEvidenceError, TaskEvidenceStore  # noqa: E402
 
 BUNDLE_DIR = Path(__file__).resolve().parent
 
@@ -1293,6 +1294,7 @@ class Flow:
         self.pending_corrections: list[str] = []
         self.evolution = False
         self.folder_children: dict[str, list[str]] = {}
+        self.task_evidence: TaskEvidenceStore | None = None
 
     # -- helpers ----------------------------------------------------------
     def wound_down(self) -> bool:
@@ -1322,6 +1324,53 @@ class Flow:
             for alias, target in self.aliases.items():
                 if target == node_id:
                     fn(alias, message)
+
+    def activate_task_evidence(
+        self, node_id: str, phase: str, next_action: str = ""
+    ) -> None:
+        store = getattr(self, "task_evidence", None)
+        if store is None:
+            return
+        try:
+            store.activate(node_id, phase, next_action)
+        except TaskEvidenceError as exc:
+            log(f"[evidence] could not activate {node_id}/{phase}: {exc}")
+
+    def activate_suite_evidence(
+        self, node_ids: list[str], phase: str, next_action: str = ""
+    ) -> None:
+        store = getattr(self, "task_evidence", None)
+        if store is None:
+            return
+        try:
+            store.activate_suite(node_ids, phase, next_action)
+        except TaskEvidenceError as exc:
+            log(f"[evidence] could not activate full suite/{phase}: {exc}")
+
+    def record_task_evidence(
+        self,
+        summary: RunSummary,
+        specs: list[str],
+        phase: str,
+        next_action: str = "",
+    ):
+        store = getattr(self, "task_evidence", None)
+        if store is None:
+            return None
+        try:
+            return store.record_verification(summary, specs, phase, next_action)
+        except TaskEvidenceError as exc:
+            log(f"[evidence] could not record {phase} verification: {exc}")
+            return None
+
+    def refresh_task_evidence(self, phase: str, next_action: str = "") -> None:
+        store = getattr(self, "task_evidence", None)
+        if store is None or store.capsule is None:
+            return
+        try:
+            store.refresh_source(phase, next_action)
+        except TaskEvidenceError as exc:
+            log(f"[evidence] could not refresh {phase} source state: {exc}")
 
     def protected_prefixes(self) -> list[str]:
         prefixes = [".arc/", str(self.output_dir / ".arc"), "requirements/", str(self.req_dir)]
@@ -1506,6 +1555,16 @@ class Flow:
             return False
         summary = self.run_specs(specs)
         passed = (not summary.error) and summary.total and summary.passed == summary.total
+        self.record_task_evidence(
+            summary,
+            specs,
+            "verify" if passed else "repair",
+            (
+                "continue with the accepted tiny implementation"
+                if passed
+                else f"repair the tiny implementation for {node_id}"
+            ),
+        )
         log(f"[flow] {node_id}: tiny tier {'passed' if passed else 'failed'} its specs"
             f" ({summary.passed}/{summary.total})" if not summary.error else f"[flow] {node_id}: tiny tier could not run specs")
         if not passed:
@@ -1674,6 +1733,9 @@ class Flow:
                 git.run(["checkout", sha, "--", part], check=False)
         git.run(["clean", "-fd", "-e", "node_modules", "-e", "dist", "--", "frontend", "backend"], check=False)
         log(f"[flow] restored frontend/ and backend/ to best commit {sha[:8]}")
+        self.refresh_task_evidence(
+            "restore", "revalidate the restored source before treating prior passes as current"
+        )
 
     # -- acceptance -------------------------------------------------------
     def setup_playwright(self) -> None:
@@ -1814,7 +1876,7 @@ class Flow:
             if err is None:
                 err = server.start()
             if err is not None:
-                return RunSummary(error=err)
+                return self.runner.infrastructure_failure(specs, err)
             return self.runner.run(specs, f"http://127.0.0.1:{self.smoke_port}", workers=workers)
         finally:
             server.stop()
@@ -1842,24 +1904,47 @@ class Flow:
         A failing extension is repaired without replacing working features."""
         if self.runner is None or not specs:
             return None
-        best_passed, best_sha, regressions, stalls = -1, self.head(), 0, 0
+        best_passed, best_sha, best_summary, regressions, stalls = (
+            -1,
+            self.head(),
+            None,
+            0,
+            0,
+        )
         rewrite_used = False
         previous_failures = None
         self.codegen_blocked = False  # same failure twice in codegen mode -> tool mode for this node
         for attempt in range(self.repair_rounds + 1):
             summary = self.run_specs(specs)
             if summary.error and summary.killed:
+                self.record_task_evidence(
+                    summary,
+                    specs,
+                    "verify",
+                    "retry acceptance after the runner is available",
+                )
                 log(f"[acceptance] {node_id}: test runner killed ({summary.error[:120]}); no verdict from this round")
                 return None
             if summary.error:
                 log(f"[acceptance] {node_id} infrastructure error: {summary.error[:300]}")
                 failures = f"- Feature: app startup\n  Failed at: build/start\n  Observation: {summary.error[:600]}\n  Steps: npm run build -> npm start"
-                summary = RunSummary(passed=0, total=max(1, len(specs)))
+                summary.passed = 0
+                summary.total = max(1, len(specs))
                 passed = 0
             else:
                 passed = summary.passed
                 failures = failure_summaries(summary) + failure_source_context(summary, self.tests_dir)
                 self.record_tests(node_id, specs, summary)
+            self.record_task_evidence(
+                summary,
+                specs,
+                "verify" if summary.total and passed == summary.total else "repair",
+                (
+                    "continue to the next requirement"
+                    if summary.total and passed == summary.total
+                    else f"repair the failing acceptance evidence for {node_id}"
+                ),
+            )
             log(f"[acceptance] {node_id} round {attempt}: {passed}/{summary.total}")
             was_codegen = self.codegen_mode()
             normalized = failure_signature(summary) if summary.results else failures
@@ -1885,7 +1970,13 @@ class Flow:
             if passed > best_passed:
                 if best_passed >= 0:
                     self.commit(f"{node_id} (repair {attempt}): {passed}/{summary.total} pass")
-                best_passed, best_sha, regressions, stalls = passed, self.head(), 0, 0
+                best_passed, best_sha, best_summary, regressions, stalls = (
+                    passed,
+                    self.head(),
+                    summary,
+                    0,
+                    0,
+                )
             elif passed == best_passed and attempt > 0:
                 stalls += 1
                 if stalls >= 2 and not (was_codegen and self.codegen_blocked):
@@ -1897,6 +1988,13 @@ class Flow:
                 regressions += 1
                 if regressions >= 2 and best_sha:
                     self.restore_app(best_sha)
+                    if best_summary is not None:
+                        self.record_task_evidence(
+                            best_summary,
+                            specs,
+                            "repair",
+                            f"continue repairing {node_id} from the restored best state",
+                        )
                     self.pending_corrections.append(
                         f"Your last two repairs made the tests worse; the harness restored frontend/ and backend/ "
                         f"to the best state ({best_passed}/{summary.total}). Start from that code.")
@@ -1946,6 +2044,13 @@ class Flow:
         # even when the current commit already equals the best recorded commit.
         if best_passed > 0 and best_sha:
             self.restore_app(best_sha)
+            if best_summary is not None:
+                self.record_task_evidence(
+                    best_summary,
+                    specs,
+                    "verify",
+                    f"review unresolved acceptance evidence for {node_id}",
+                )
             self.commit(f"{node_id}: keep best acceptance state {best_passed}")
         return False
 
@@ -2007,6 +2112,9 @@ class Flow:
         design_wanted = self.design_enabled and total >= self.design_min_nodes
         inline_design = design_wanted and self.design_mode == "inline"
         if design_wanted and not inline_design:
+            self.activate_task_evidence(
+                node_id, "design", f"design the implementation for {node_id}"
+            )
             design = self.design(node, ordered, deadline)
         if design:
             self.designs[node_id] = design
@@ -2015,6 +2123,9 @@ class Flow:
         elif not inline_design:
             self.mark("design_done", node_id, "design folded into the implementation prompt")
 
+        self.activate_task_evidence(
+            node_id, "implement", f"implement and verify {node_id}"
+        )
         self.mark("implementation_started", node_id)
         design_text = ("Design contract for this node (follow it):\n"
                        + json.dumps(design, ensure_ascii=False)[:4000] + "\n") if design else ""
@@ -2190,8 +2301,21 @@ class Flow:
             specs = list(self.spec_map.get(node_id) or [])
             if not specs:
                 continue
+            self.activate_task_evidence(
+                node_id, "probe", f"check whether the existing app already satisfies {node_id}"
+            )
             summary = self.run_specs(specs)
             self.probe_count += 1
+            self.record_task_evidence(
+                summary,
+                specs,
+                "probe",
+                (
+                    "reuse the existing implementation"
+                    if summary.all_passed
+                    else f"implement or repair {node_id}"
+                ),
+            )
             if summary.error:
                 log(f"[acceptance] probe {node_id}: existing app does not build/start/serve ({summary.error[:160]})")
                 continue
@@ -2207,6 +2331,9 @@ class Flow:
         """Evolution: unchanged node — carry the design/impl over, re-run its specs."""
         node_id = str(node.get("id"))
         specs = list(self.spec_map.get(node_id) or [])
+        self.activate_task_evidence(
+            node_id, "regression", f"verify unchanged behavior for {node_id}"
+        )
         self.mark("design_started", node_id)
         self.mark("design_done", node_id, "unchanged since the previous requirement version; carried over")
         self.mark("implementation_started", node_id)
@@ -2215,10 +2342,23 @@ class Flow:
         if self.runner is not None and specs:
             summary = self.probe_summaries.pop(node_id, None) or self.run_specs(specs)
             if summary.error:
+                self.record_task_evidence(
+                    summary, specs, "regression", "resolve the acceptance infrastructure error"
+                )
                 log(f"[acceptance] regression {node_id} infrastructure error: {summary.error[:300]}")
             else:
                 self.record_tests(node_id, specs, summary)
                 verdict = summary.all_passed
+                self.record_task_evidence(
+                    summary,
+                    specs,
+                    "regression",
+                    (
+                        "continue to the next requirement"
+                        if verdict
+                        else f"repair the regression in {node_id}"
+                    ),
+                )
                 log(f"[acceptance] regression {node_id}: {summary.passed}/{summary.total}")
                 if not verdict:
                     deadline = time.time() + min(self.node_budget_cap, max(240, self.remaining() / 2))
@@ -2244,13 +2384,34 @@ class Flow:
         specs = sorted({spec for paths in verified.values() for spec in paths})
         if len(specs) < 2:
             return
+        self.activate_suite_evidence(
+            list(verified),
+            "regression",
+            f"run regression checkpoint {index}",
+        )
         workers = workers_for_final(getattr(self, "mem_limit", None),
                                     int(os.environ.get("OCTOS_ARC_FINAL_WORKERS", "4")))
         summary = self.run_specs(specs, workers=workers, grader_like=True)
         if summary.error or summary.killed:
+            self.record_task_evidence(
+                summary,
+                specs,
+                "regression",
+                "retry the regression checkpoint when the runner is available",
+            )
             log(f"[acceptance] checkpoint {index}: no reliable verdict; {summary.error or 'runner killed'}")
             return
         grouped = nodes_for_failures(summary.results, verified)
+        self.record_task_evidence(
+            summary,
+            specs,
+            "regression",
+            (
+                "continue implementation"
+                if not grouped
+                else "repair the regressions reported by the checkpoint"
+            ),
+        )
         log(f"[acceptance] checkpoint {index}: {summary.passed}/{summary.total}; "
             f"regressed nodes {sorted(node for node in grouped if node)}")
         for node in grouped:
@@ -2285,6 +2446,16 @@ class Flow:
             [n for n in self.spec_map if n and self.spec_map[n] and n not in self.test_verdict]
         if len(all_specs) < 2 and not unverified:
             return  # single spec already judged by the node run
+        suite_nodes = [
+            node_id
+            for node_id, specs in self.spec_map.items()
+            if node_id and specs
+        ]
+        self.activate_suite_evidence(
+            suite_nodes,
+            "full_suite",
+            "verify all requirements together",
+        )
         rounds = int(os.environ.get("OCTOS_FINAL_REPAIR_ROUNDS", "2"))
         workers = workers_for_final(getattr(self, "mem_limit", None), int(os.environ.get("OCTOS_ARC_FINAL_WORKERS", "4")))
         previous_failing: frozenset | None = None
@@ -2293,6 +2464,12 @@ class Flow:
         for attempt in range(rounds + 1):
             summary = self.run_specs(all_specs, workers=workers, grader_like=True)
             if summary.error and summary.killed:
+                self.record_task_evidence(
+                    summary,
+                    all_specs,
+                    "full_suite",
+                    "retry the full suite when the runner is available",
+                )
                 # Cloud 29c840566f36: the runner was OOM-killed under a 512 MiB
                 # cgroup; two repair rounds were wasted on a non-failure.
                 log(f"[acceptance] full suite could not run ({summary.error[:120]}); keeping per-node verdicts")
@@ -2306,10 +2483,21 @@ class Flow:
                 grouped = {None: []}
                 failures = (f"- Feature: application startup exactly as the grader runs it (only PORT set)\n"
                             f"  Failed at: npm start\n  Observation: {summary.error[:700]}\n  Steps: npm run build -> npm start")
-                summary = RunSummary(passed=0, total=len(all_specs))
+                summary.passed = 0
+                summary.total = len(all_specs)
             else:
                 grouped = nodes_for_failures(summary.results, self.spec_map)
                 failures = failure_summaries(summary) + failure_source_context(summary, self.tests_dir)
+            self.record_task_evidence(
+                summary,
+                all_specs,
+                "full_suite",
+                (
+                    "finish the run"
+                    if not grouped
+                    else "repair the failures from the full acceptance suite"
+                ),
+            )
             log(f"[acceptance] full suite round {attempt}: {summary.passed}/{summary.total}; failing nodes "
                 f"{sorted(k for k in grouped if k) or ('all' if None in grouped and not summary.results else [])}")
             self.record_full_suite(summary, grouped)
@@ -2345,6 +2533,12 @@ class Flow:
         if best is not None and best["sha"] and last_passed < best["passed"]:
             log(f"[acceptance] full suite: last round {last_passed} < best {best['passed']}; restoring the best state")
             self.restore_app(best["sha"])
+            self.record_task_evidence(
+                best["summary"],
+                all_specs,
+                "full_suite",
+                "finish from the restored best full-suite state",
+            )
             self.record_full_suite(best["summary"], best["grouped"])
             self.commit(f"chore: keep best full-suite state {best['passed']}/{best['summary'].total}")
 
@@ -2417,12 +2611,25 @@ class Flow:
                 raise ValueError("no ATOMIC requirement nodes found")
             self.classify_tree(tree)
             node_ids = [str(n.get("id")) for n in ordered]
+            self.folder_children = folder_descendants(tree)
+            requirement_file = self.req_dir / "requirements.yaml"
+            if not requirement_file.is_file():
+                requirement_file = self.req_dir / "requirements.yml"
+            try:
+                self.task_evidence = TaskEvidenceStore(
+                    self.output_dir,
+                    requirement_file,
+                    tree,
+                    ordered,
+                    self.folder_children,
+                )
+            except TaskEvidenceError as exc:
+                self.task_evidence = None
+                log(f"[evidence] task evidence disabled: {exc}")
             if not self.budget_explicit:
                 # 32-node trees need hours, not the 1-hour smoke default.
                 self.budget = max(self.budget, self.seconds_per_node * len(ordered))
             log(f"[flow] {len(ordered)} atomic nodes in dependency order: {node_ids}; time budget {self.budget}s")
-            self.folder_children = folder_descendants(tree)
-
             self.evolution = self.has_app()
             unchanged: set[str] = set()
             if self.evolution:

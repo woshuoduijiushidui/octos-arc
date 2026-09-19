@@ -1,6 +1,145 @@
 use super::*;
 use serde_json::json;
 
+fn task_evidence_wire(next_action: &str) -> serde_json::Value {
+    let digest = format!("sha256:{}", "a".repeat(64));
+    json!({
+        "kind": "task_evidence",
+        "capsule": {
+            "schema": TASK_EVIDENCE_SCHEMA_V1,
+            "task": {
+                "requirement_id": "REQ-1",
+                "phase": "implement",
+                "requirement_sha256": digest,
+                "requirement_ref": "/workspace/requirements/requirements.yaml",
+                "name": "Login",
+                "description": "Authenticate the user.",
+                "acceptance_conditions": ["login succeeds"],
+                "dependencies": [],
+                "ancestor_constraints": [],
+                "policies": ["official tests are read-only"]
+            },
+            "source_state": {
+                "tree_sha256": format!("sha256:{}", "b".repeat(64)),
+                "changed_files": [{
+                    "path": "frontend/src/App.tsx",
+                    "sha256": format!("sha256:{}", "c".repeat(64)),
+                    "purpose": "implement REQ-1"
+                }]
+            },
+            "verification": {
+                "run_id": "acceptance-0001",
+                "source_sha256": format!("sha256:{}", "b".repeat(64)),
+                "command": "npx playwright test REQ-1.spec.ts",
+                "exit_code": 1,
+                "passed": 0,
+                "total": 1
+            },
+            "active_failures": [{
+                "test_id": "login works",
+                "location": "REQ-1.spec.ts:7",
+                "status": "failed",
+                "expected": null,
+                "actual": null,
+                "signature": format!("sha256:{}", "d".repeat(64)),
+                "occurrences": 1,
+                "run_id": "acceptance-0001",
+                "artifact_ref": null,
+                "artifact_sha256": null,
+                "artifact_bytes": null
+            }],
+            "verified_behavior": [],
+            "next_action": next_action
+        }
+    })
+}
+
+#[test]
+fn task_evidence_input_round_trips_and_validates() {
+    let wire = task_evidence_wire("repair login");
+    let item: InputItem = serde_json::from_value(wire.clone()).expect("task evidence decodes");
+    let InputItem::TaskEvidence { capsule } = &item else {
+        panic!("expected typed task evidence");
+    };
+    capsule.validate().expect("valid capsule");
+    assert_eq!(serde_json::to_value(item).unwrap(), wire);
+}
+
+#[test]
+fn task_evidence_validation_rejects_schema_size_path_and_hash_errors() {
+    let decode = |wire| {
+        let InputItem::TaskEvidence { capsule } =
+            serde_json::from_value::<InputItem>(wire).expect("typed item decodes")
+        else {
+            panic!("expected typed task evidence");
+        };
+        capsule
+    };
+
+    let mut unknown_schema = task_evidence_wire("repair login");
+    unknown_schema["capsule"]["schema"] = json!("octos.task-evidence.v2");
+    assert!(decode(unknown_schema).validate().is_err());
+
+    let oversized = task_evidence_wire(&"x".repeat(MAX_TASK_EVIDENCE_BYTES));
+    assert!(decode(oversized).validate().is_err());
+
+    let mut unsafe_path = task_evidence_wire("repair login");
+    unsafe_path["capsule"]["source_state"]["changed_files"][0]["path"] =
+        json!("../official-tests/login.spec.ts");
+    assert!(decode(unsafe_path).validate().is_err());
+
+    let mut invalid_hash = task_evidence_wire("repair login");
+    invalid_hash["capsule"]["task"]["requirement_sha256"] = json!("not-a-hash");
+    assert!(decode(invalid_hash).validate().is_err());
+
+    let mut unsafe_command = task_evidence_wire("repair login");
+    unsafe_command["capsule"]["verification"]["command"] =
+        json!("npx playwright test REQ-1.spec.ts; printenv");
+    assert!(decode(unsafe_command).validate().is_err());
+
+    let mut stale_failure = task_evidence_wire("repair login");
+    stale_failure["capsule"]["active_failures"][0]["run_id"] = json!("acceptance-0000");
+    assert!(decode(stale_failure).validate().is_err());
+}
+
+#[test]
+fn legacy_and_unknown_turn_inputs_keep_their_existing_behavior() {
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    enum LegacyInputItem {
+        Text {
+            text: String,
+        },
+        #[serde(other)]
+        Unknown,
+    }
+
+    let legacy: TurnStartParams = serde_json::from_value(json!({
+        "session_id": "local:demo",
+        "turn_id": "00000000-0000-0000-0000-000000000001",
+        "input": [{"kind": "text", "text": "hello"}]
+    }))
+    .unwrap();
+    assert_eq!(
+        legacy.input,
+        vec![InputItem::Text {
+            text: "hello".into()
+        }]
+    );
+
+    let unknown: InputItem =
+        serde_json::from_value(json!({"kind": "future_input", "payload": true})).unwrap();
+    assert_eq!(unknown, InputItem::Unknown);
+
+    let old_server: LegacyInputItem =
+        serde_json::from_value(task_evidence_wire("ignored by old server")).unwrap();
+    assert!(matches!(old_server, LegacyInputItem::Unknown));
+
+    let old_text: LegacyInputItem =
+        serde_json::from_value(json!({"kind": "text", "text": "still handled"})).unwrap();
+    assert!(matches!(old_text, LegacyInputItem::Text { text } if text == "still handled"));
+}
+
 #[test]
 fn skill_action_job_updated_notification_method_is_registered() {
     assert!(UI_PROTOCOL_NOTIFICATION_METHODS.contains(&methods::SKILL_ACTION_JOB_UPDATED));

@@ -1,0 +1,346 @@
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from acceptance import RunSummary, TestOutcome
+from task_evidence import (
+    TaskEvidenceError,
+    TaskEvidenceStore,
+    TaskEvidenceWriteError,
+    build_task_contract,
+    serialize_capsule,
+)
+
+
+def requirement_tree():
+    return {
+        "id": "ROOT",
+        "type": "FOLDER",
+        "description": "Keep the application accessible.",
+        "children": [
+            {
+                "id": "REQ-1",
+                "type": "ATOMIC",
+                "name": "Register",
+                "description": "Create an account.",
+                "dependencies": [],
+                "scenarios": [
+                    {
+                        "name": "registration",
+                        "steps": [
+                            {"keyword": "GIVEN", "content": "a new visitor"},
+                            {"keyword": "WHEN", "content": "they submit valid details"},
+                            {"keyword": "THEN", "content": "the account is created"},
+                        ],
+                    }
+                ],
+            },
+            {
+                "id": "REQ-2",
+                "type": "ATOMIC",
+                "name": "Login",
+                "description": "Authenticate an existing account.",
+                "dependencies": ["REQ-1"],
+                "scenarios": [
+                    {
+                        "name": "login",
+                        "steps": [
+                            {"keyword": "GIVEN", "content": "a registered account"},
+                            {"keyword": "WHEN", "content": "valid credentials are submitted"},
+                            {"keyword": "THEN", "content": "the dashboard is visible"},
+                        ],
+                    }
+                ],
+            },
+        ],
+    }
+
+
+def create_store(root: Path) -> TaskEvidenceStore:
+    requirements = root / "requirements.yaml"
+    requirements.write_text("id: ROOT\n", encoding="utf-8")
+    app = root / "app"
+    (app / "frontend").mkdir(parents=True)
+    (app / "backend").mkdir()
+    (app / "frontend" / "index.html").write_text("v1", encoding="utf-8")
+    (app / "backend" / "server.js").write_text("server", encoding="utf-8")
+    tree = requirement_tree()
+    return TaskEvidenceStore(
+        output_dir=app,
+        requirement_file=requirements,
+        requirement_tree=tree,
+        ordered_nodes=tree["children"],
+        folder_children={"ROOT": ["REQ-1", "REQ-2"]},
+    )
+
+
+class TaskContractTests(unittest.TestCase):
+    def test_should_serialize_same_requirement_source_and_summary_byte_stably(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = create_store(Path(tmp))
+            capsule = store.activate("REQ-2", "implement")
+            summary = RunSummary(
+                passed=1,
+                total=1,
+                run_id="acceptance-0001",
+                command="npx playwright test REQ-2.spec.ts",
+                exit_code=0,
+                results=[
+                    TestOutcome(
+                        "login works",
+                        True,
+                        "passed",
+                        10,
+                        file="REQ-2.spec.ts",
+                    )
+                ],
+            )
+            first = serialize_capsule(
+                store.record_verification(summary, ["REQ-2.spec.ts"], "verify")
+            )
+            second = serialize_capsule(
+                store.record_verification(summary, ["REQ-2.spec.ts"], "verify")
+            )
+
+            self.assertEqual(first, second)
+            self.assertTrue(capsule.task.requirement_sha256.startswith("sha256:"))
+            self.assertEqual(capsule.task.dependencies, ("REQ-1",))
+            self.assertIn("ROOT: Keep the application accessible.", capsule.task.ancestor_constraints)
+            self.assertIn(
+                "login: GIVEN a registered account WHEN valid credentials are submitted THEN the dashboard is visible",
+                capsule.task.acceptance_conditions,
+            )
+
+    def test_should_reject_missing_requirement_and_invalid_existing_schema(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaises(TaskEvidenceError):
+                TaskEvidenceStore(
+                    root / "app",
+                    root / "missing.yaml",
+                    requirement_tree(),
+                    requirement_tree()["children"],
+                )
+
+            requirements = root / "requirements.yaml"
+            requirements.write_text("id: ROOT\n", encoding="utf-8")
+            evidence = root / "app" / ".arc" / "context"
+            evidence.mkdir(parents=True)
+            (evidence / "task-evidence.v1.json").write_text(
+                '{"schema":"wrong"}\n', encoding="utf-8"
+            )
+            with self.assertRaises(TaskEvidenceError):
+                TaskEvidenceStore(
+                    root / "app",
+                    requirements,
+                    requirement_tree(),
+                    requirement_tree()["children"],
+                )
+
+    def test_should_build_full_suite_contract_from_selected_requirements(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = create_store(Path(tmp))
+            capsule = store.activate_suite(
+                ["REQ-2", "REQ-1"], "full_suite", "verify all requirements"
+            )
+            self.assertEqual(capsule.task.requirement_id, "ARC-FULL-SUITE")
+            self.assertEqual(capsule.task.dependencies, ("REQ-1", "REQ-2"))
+            self.assertEqual(len(capsule.task.acceptance_conditions), 2)
+            with self.assertRaises(TaskEvidenceError):
+                store.activate("REQ-2", "")
+            with self.assertRaises(TaskEvidenceError):
+                store.activate_suite(["REQ-1"], "")
+
+    def test_should_hash_normalized_requirement_semantics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            requirement_file = Path(tmp) / "requirements.yaml"
+            requirement_file.write_text("id: ROOT\n", encoding="utf-8")
+            tree = requirement_tree()
+            first = build_task_contract(
+                "REQ-2", "implement", requirement_file, tree, tree["children"]
+            )
+            tree["children"][1]["description"] += " "
+            whitespace_only = build_task_contract(
+                "REQ-2", "repair", requirement_file, tree, tree["children"]
+            )
+            tree["children"][1]["description"] = "Reject invalid credentials."
+            changed = build_task_contract(
+                "REQ-2", "implement", requirement_file, tree, tree["children"]
+            )
+
+            self.assertEqual(first.requirement_sha256, whitespace_only.requirement_sha256)
+            self.assertNotEqual(first.requirement_sha256, changed.requirement_sha256)
+
+
+class EvidenceReductionTests(unittest.TestCase):
+    def test_should_deduplicate_same_failure_across_distinct_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = create_store(Path(tmp))
+            store.activate("REQ-2", "implement")
+
+            def failed(run_id, duration):
+                return RunSummary(
+                    passed=0,
+                    total=1,
+                    run_id=run_id,
+                    command="npx playwright test REQ-2.spec.ts",
+                    exit_code=1,
+                    results=[
+                        TestOutcome(
+                            "login works",
+                            False,
+                            "timedOut",
+                            duration,
+                            file="REQ-2.spec.ts",
+                            location="REQ-2.spec.ts:71",
+                            message=(
+                                f"Timeout {duration}ms exceeded.\n"
+                                'Expected: "dashboard visible"\n'
+                                'Received: "locator timed out"'
+                            ),
+                        )
+                    ],
+                )
+
+            first = store.record_verification(
+                failed("acceptance-0001", 4000),
+                ["REQ-2.spec.ts"],
+                "repair",
+            )
+            second = store.record_verification(
+                failed("acceptance-0002", 4100),
+                ["REQ-2.spec.ts"],
+                "repair",
+            )
+
+            self.assertEqual(len(first.active_failures), 1)
+            self.assertEqual(len(second.active_failures), 1)
+            failure = second.active_failures[0]
+            self.assertEqual(failure.occurrences, 2)
+            self.assertEqual(failure.run_id, "acceptance-0002")
+            self.assertEqual(failure.expected, '"dashboard visible"')
+            self.assertEqual(failure.actual, '"locator timed out"')
+            self.assertTrue(failure.signature.startswith("sha256:"))
+
+    def test_should_deduplicate_one_run_and_leave_unparsed_fields_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = create_store(Path(tmp))
+            store.activate("REQ-2", "implement")
+            outcome = TestOutcome(
+                "login works",
+                False,
+                "failed",
+                10,
+                file="REQ-2.spec.ts",
+                message="dashboard missing without a structured assertion",
+            )
+            capsule = store.record_verification(
+                RunSummary(
+                    passed=0,
+                    total=2,
+                    command="npx playwright test REQ-2.spec.ts; printenv",
+                    results=[outcome, outcome],
+                ),
+                ["REQ-2.spec.ts", "../secret.spec.ts"],
+                "repair",
+            )
+
+            self.assertEqual(capsule.verification.command, "npx playwright test REQ-2.spec.ts")
+            self.assertTrue(capsule.verification.run_id.startswith("acceptance-"))
+            self.assertEqual(len(capsule.active_failures), 1)
+            failure = capsule.active_failures[0]
+            self.assertIsNone(failure.expected)
+            self.assertIsNone(failure.actual)
+            self.assertIsNone(failure.artifact_ref)
+
+    def test_should_replace_pass_with_regression_for_the_current_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = create_store(Path(tmp))
+            store.activate("REQ-2", "implement")
+            passed = RunSummary(
+                passed=1,
+                total=1,
+                run_id="acceptance-0001",
+                command="npx playwright test REQ-2.spec.ts",
+                exit_code=0,
+                results=[
+                    TestOutcome("login works", True, "passed", 10, file="REQ-2.spec.ts")
+                ],
+            )
+            capsule = store.record_verification(passed, ["REQ-2.spec.ts"], "verify")
+            self.assertEqual(len(capsule.verified_behavior), 1)
+
+            failed = RunSummary(
+                passed=0,
+                total=1,
+                run_id="acceptance-0002",
+                command="npx playwright test REQ-2.spec.ts",
+                exit_code=1,
+                results=[
+                    TestOutcome(
+                        "login works",
+                        False,
+                        "failed",
+                        10,
+                        file="REQ-2.spec.ts",
+                        message="dashboard missing",
+                    )
+                ],
+            )
+            capsule = store.record_verification(failed, ["REQ-2.spec.ts"], "repair")
+            self.assertEqual(capsule.verified_behavior, ())
+            self.assertEqual([failure.test_id for failure in capsule.active_failures], ["login works"])
+
+    def test_should_recompute_source_and_restore_the_best_verified_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = create_store(root)
+            store.activate("REQ-2", "implement")
+            source = root / "app" / "frontend" / "index.html"
+            source.write_text("best", encoding="utf-8")
+            passed = RunSummary(
+                passed=1,
+                total=1,
+                run_id="acceptance-0007",
+                command="npx playwright test REQ-2.spec.ts",
+                exit_code=0,
+                results=[
+                    TestOutcome("login works", True, "passed", 10, file="REQ-2.spec.ts")
+                ],
+            )
+            best = store.record_verification(passed, ["REQ-2.spec.ts"], "verify")
+            best_source_sha = best.source_state.tree_sha256
+
+            source.write_text("regressed", encoding="utf-8")
+            changed = store.refresh_source("repair")
+            self.assertNotEqual(changed.source_state.tree_sha256, best_source_sha)
+            self.assertIsNone(changed.verification)
+            self.assertEqual(changed.verified_behavior, ())
+
+            source.write_text("best", encoding="utf-8")
+            restored = store.record_verification(
+                passed,
+                ["REQ-2.spec.ts"],
+                "verify",
+                next_action="continue to the next requirement",
+            )
+            self.assertEqual(restored.source_state.tree_sha256, best_source_sha)
+            self.assertEqual(restored.verification.run_id, "acceptance-0007")
+            self.assertEqual(len(restored.verified_behavior), 1)
+
+    def test_should_keep_previous_file_when_atomic_replace_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = create_store(Path(tmp))
+            store.activate("REQ-2", "implement")
+            previous = store.path.read_bytes()
+            with patch("task_evidence.os.replace", side_effect=OSError("disk full")):
+                with self.assertRaises(TaskEvidenceWriteError):
+                    store.refresh_source("repair")
+            self.assertEqual(store.path.read_bytes(), previous)
+            self.assertEqual(list(store.path.parent.glob("*.tmp-*")), [])
+
+
+if __name__ == "__main__":
+    unittest.main()

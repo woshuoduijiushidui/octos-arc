@@ -111,6 +111,9 @@ class RunSummary:
     error: str | None = None  # infrastructure error (no report)
     killed: bool = False      # the test runner itself was killed (OOM); not a verdict
     load_errors: list[str] = field(default_factory=list)  # Playwright top-level errors
+    run_id: str = ""
+    command: str = ""
+    exit_code: int | None = None
 
     def slow(self, threshold_ms: int) -> list[str]:
         return [r.title for r in self.results if r.duration_ms >= threshold_ms]
@@ -782,6 +785,31 @@ class AcceptanceRunner:
         self.log = log
         self.timeout_ms = timeout_ms
         self.workers = workers
+        self._run_sequence = 0
+
+    def _next_run_metadata(self, spec_rel_paths: list[str]) -> tuple[str, str]:
+        self._run_sequence += 1
+        safe_specs = []
+        for raw in sorted(set(spec_rel_paths)):
+            path = Path(raw)
+            if path.is_absolute() or ".." in path.parts or not raw.endswith(".spec.ts"):
+                continue
+            safe_specs.append(path.as_posix())
+        command = "npx playwright test" + (
+            " " + " ".join(safe_specs) if safe_specs else ""
+        )
+        return f"acceptance-{self._run_sequence:04d}", command
+
+    def infrastructure_failure(
+        self, spec_rel_paths: list[str], error: str, *, killed: bool = False
+    ) -> RunSummary:
+        run_id, command = self._next_run_metadata(spec_rel_paths)
+        return RunSummary(
+            error=error,
+            killed=killed,
+            run_id=run_id,
+            command=command,
+        )
 
     def _prepare(self, workers: int | None = None) -> Path:
         # Specs `import '@playwright/test'`; Node resolves that upward from the
@@ -817,6 +845,7 @@ class AcceptanceRunner:
 
     def run(self, spec_rel_paths: list[str], base_url: str, wall_timeout: int = 900,
             workers: int | None = None) -> RunSummary:
+        run_id, command = self._next_run_metadata(spec_rel_paths)
         config = self._prepare(workers)
         report_path = self.work_dir / "report.json"
         cmd = [str(self.root / "node_modules" / ".bin" / "playwright"), "test", "-c", str(config)]
@@ -829,15 +858,18 @@ class AcceptanceRunner:
             r = subprocess.run(cmd, cwd=self.work_dir, env=env, capture_output=True, text=True, timeout=wall_timeout)
             tail = ((r.stdout or "") + (r.stderr or ""))[-2000:]
         except subprocess.TimeoutExpired:
-            return RunSummary(error=f"playwright run exceeded {wall_timeout}s")
+            return RunSummary(error=f"playwright run exceeded {wall_timeout}s",
+                              run_id=run_id, command=command)
         except OSError as exc:
-            return RunSummary(error=f"playwright could not start: {exc}")
+            return RunSummary(error=f"playwright could not start: {exc}",
+                              run_id=run_id, command=command)
         if not report_path.exists():
             killed = r.returncode < 0 or "Killed" in tail
             return RunSummary(error=(f"playwright was killed (rc={r.returncode}); likely out of memory — "
                                      f"not an application failure" if killed else
                                      f"playwright produced no report (rc={r.returncode}): {_ANSI.sub('', tail)[-600:]}"),
-                              killed=killed)
+                              killed=killed, run_id=run_id, command=command,
+                              exit_code=r.returncode)
         try:
             report = json.loads(report_path.read_text())
             try:
@@ -848,15 +880,21 @@ class AcceptanceRunner:
                 pass  # Optional diagnostics never change acceptance outcomes.
             summary = summarize_report(report)
         except (OSError, json.JSONDecodeError) as exc:
-            return RunSummary(error=f"unreadable playwright report: {exc}")
+            return RunSummary(error=f"unreadable playwright report: {exc}",
+                              run_id=run_id, command=command,
+                              exit_code=r.returncode)
         summary.stdout_tail = _ANSI.sub("", tail)
+        summary.run_id = run_id
+        summary.command = command
+        summary.exit_code = r.returncode
         if summary.total == 0:
             # Cloud run a6ccc437539f: the model had edited /workspace/tests, the
             # copied spec no longer loaded, and "0/0" looked like a verdict.
             detail = "; ".join(summary.load_errors) or summary.stdout_tail[-600:] or f"rc={r.returncode}"
             self.log(f"[acceptance] 0 tests collected from {', '.join(spec_rel_paths)}: {detail[:300]}")
             return RunSummary(error=f"Playwright collected 0 tests from {', '.join(spec_rel_paths)} "
-                                    f"(spec files unreadable or broken): {detail}", load_errors=summary.load_errors)
+                                    f"(spec files unreadable or broken): {detail}", load_errors=summary.load_errors,
+                              run_id=run_id, command=command, exit_code=r.returncode)
         self.log(f"[acceptance] {summary.passed}/{summary.total} passed in {time.time()-t0:.0f}s "
                  f"({', '.join(spec_rel_paths)})")
         return summary

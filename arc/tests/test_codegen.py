@@ -179,15 +179,22 @@ class BestRepairStateTests(unittest.TestCase):
         flow.turn = Mock()  # failed repair leaves uncommitted edits; HEAD remains unchanged
         flow.commit = Mock()
         flow.restore_app = Mock()
+        flow.record_task_evidence = Mock()
         failure = TestOutcome('behavior', False, 'failed', 1, message='missing control')
-        flow.run_specs = Mock(side_effect=[RunSummary(passed=1, total=2, results=[failure]),
-                                          RunSummary(passed=0, total=2, results=[failure]),
-                                          RunSummary(passed=1, total=2, results=[failure])])
+        summaries = [RunSummary(passed=1, total=2, results=[failure]),
+                     RunSummary(passed=0, total=2, results=[failure]),
+                     RunSummary(passed=1, total=2, results=[failure])]
+        flow.run_specs = Mock(side_effect=summaries)
         rebuild = Mock(return_value='Rewrite everything')
         self.assertFalse(flow.acceptance_loop('node', ['example.spec.ts'], time.time()+1000, rebuild))
         rebuild.assert_not_called()
         self.assertEqual(flow.turn.call_count, 2)
         flow.restore_app.assert_called_once_with('same-commit')
+        self.assertEqual(
+            [call.args[0] for call in flow.record_task_evidence.call_args_list[:3]],
+            summaries,
+        )
+        self.assertIs(flow.record_task_evidence.call_args_list[-1].args[0], summaries[0])
 
 
 class VerifiedBehaviorRewriteTests(unittest.TestCase):

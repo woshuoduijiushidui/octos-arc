@@ -17,6 +17,12 @@ import uuid
 from pathlib import Path
 from typing import Callable, Iterator
 
+from task_evidence import (
+    MAX_CAPSULE_BYTES,
+    TASK_EVIDENCE_RELATIVE_PATH,
+    TASK_EVIDENCE_SCHEMA,
+)
+
 
 class OctosProtocolError(RuntimeError):
     pass
@@ -185,6 +191,28 @@ class OctosStdioSession:
             params["profile_id"] = self.profile_id
         self._send("session/open", params, want_response=True, timeout=timeout)
 
+    def _turn_input_items(self, text: str) -> list[dict]:
+        items = [{"kind": "text", "text": text}]
+        path = Path(self.cwd) / TASK_EVIDENCE_RELATIVE_PATH
+        try:
+            data = path.read_bytes()
+        except FileNotFoundError:
+            return items
+        except OSError as exc:
+            raise OctosProtocolError(f"could not read task evidence {path}: {exc}") from exc
+        if len(data) > MAX_CAPSULE_BYTES:
+            raise OctosProtocolError(
+                f"task evidence is {len(data)} bytes; limit is {MAX_CAPSULE_BYTES}"
+            )
+        try:
+            capsule = json.loads(data)
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise OctosProtocolError(f"invalid task evidence {path}: {exc}") from exc
+        if not isinstance(capsule, dict) or capsule.get("schema") != TASK_EVIDENCE_SCHEMA:
+            raise OctosProtocolError(f"invalid task evidence schema in {path}")
+        items.append({"kind": "task_evidence", "capsule": capsule})
+        return items
+
     def run_turn(self, text: str, timeout: float = 1800.0) -> tuple[bool, str]:
         """Run one turn; stream events to on_event. Returns (ok, full_text)."""
         deadline = time.monotonic() + timeout
@@ -194,7 +222,7 @@ class OctosStdioSession:
         self._send("turn/start", {
             "session_id": self.session_id,
             "turn_id": turn_id,
-            "input": [{"kind": "text", "text": text}],
+            "input": self._turn_input_items(text),
         }, want_response=True, timeout=min(60.0, timeout))
 
         chunks: list[str] = []

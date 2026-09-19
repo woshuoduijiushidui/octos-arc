@@ -43,13 +43,13 @@ use octos_core::ui_protocol::{
     SessionSnapshotParams, SessionStatusGetParams, SessionTasksListParams, SessionTitleSetParams,
     SessionWorkspaceGetParams, SkillActionJobUpdatedEvent, SystemStatusGetParams,
     TaskArtifactListParams, TaskArtifactListResult, TaskArtifactReadParams, TaskArtifactReadResult,
-    TaskArtifactRecord, TaskCancelParams, TaskCancelResult, TaskListEntry, TaskListParams,
-    TaskListResult, TaskOutputDeltaEvent, TaskRestartFromNodeParams, TaskRestartFromNodeResult,
-    TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent, ThreadGraphEntry,
-    ThreadGraphGetParams, ThreadGraphGetResult, ToolCompletedEvent, ToolProgressEvent,
-    ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent, TurnErrorPartialResult, TurnId,
-    TurnInterruptParams, TurnInterruptResult, TurnLifecycleState, TurnSessionResult,
-    TurnStartParams, TurnStateGetParams, TurnStateGetResult, TurnTerminalError,
+    TaskArtifactRecord, TaskCancelParams, TaskCancelResult, TaskEvidenceCapsule, TaskListEntry,
+    TaskListParams, TaskListResult, TaskOutputDeltaEvent, TaskRestartFromNodeParams,
+    TaskRestartFromNodeResult, TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent,
+    ThreadGraphEntry, ThreadGraphGetParams, ThreadGraphGetResult, ToolCompletedEvent,
+    ToolProgressEvent, ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent,
+    TurnErrorPartialResult, TurnId, TurnInterruptParams, TurnInterruptResult, TurnLifecycleState,
+    TurnSessionResult, TurnStartParams, TurnStateGetParams, TurnStateGetResult, TurnTerminalError,
     TurnTerminalOutcome, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
     UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1, UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1,
     UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1, UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
@@ -3804,6 +3804,7 @@ fn appui_context_history_for_agent(
     data_dir: &Path,
     session_id: &SessionKey,
     history: &[Message],
+    task_evidence: Option<&TaskEvidenceCapsule>,
     llm_provider: &Arc<dyn octos_llm::LlmProvider>,
     llm_compaction_enabled: bool,
     trigger: &str,
@@ -3826,6 +3827,15 @@ fn appui_context_history_for_agent(
         ledger_status = ?ledger_status,
         "appui context manager loaded for turn"
     );
+    if let Some(capsule) = task_evidence
+        && let Err(error) = manager.record_task_evidence(capsule.clone())
+    {
+        warn!(
+            session = %session_id.0,
+            error = %error,
+            "validated task evidence could not be recorded"
+        );
+    }
     let policy = appui_context_prompt_policy(llm_provider.as_ref());
     let mut lifecycle_notifications = appui_compact_context_if_over_threshold(
         &mut manager,
@@ -22277,6 +22287,14 @@ async fn handle_turn_start_with_accept(
             }
         }
     };
+    if let Err(error) = task_evidence_input(&params.input) {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params(format!("invalid task evidence: {error}")),
+        );
+        return false;
+    }
 
     let fixture = m9_protocol_fixture_for_prompt(&prompt);
     if fixture.is_none() {
@@ -33100,6 +33118,9 @@ async fn run_standalone_turn(
         // Prompt bounding remains ContextManager's projection responsibility.
         session.messages.clone()
     };
+    let task_evidence = task_evidence_input(&params.input)
+        .expect("task evidence was validated before turn dispatch")
+        .cloned();
     // Resolve a lazily-probed context window before threshold compaction.
     llm_provider.ensure_ready().await;
     let (
@@ -33119,6 +33140,7 @@ async fn run_standalone_turn(
         &session_runtime.sessions_root,
         &session_id,
         &raw_history,
+        task_evidence.as_ref(),
         &llm_provider,
         session_compaction_llm_enabled(&session_id, &state),
         "appui_pre_turn",
@@ -38692,6 +38714,21 @@ fn prompt_text(input: &[InputItem]) -> Option<String> {
         .collect::<Vec<_>>();
 
     (!parts.is_empty()).then(|| parts.join("\n"))
+}
+
+fn task_evidence_input(input: &[InputItem]) -> Result<Option<&TaskEvidenceCapsule>, String> {
+    let mut evidence = None;
+    for item in input {
+        let InputItem::TaskEvidence { capsule } = item else {
+            continue;
+        };
+        if evidence.is_some() {
+            return Err("turn/start accepts at most one task evidence item".to_owned());
+        }
+        capsule.validate()?;
+        evidence = Some(capsule);
+    }
+    Ok(evidence)
 }
 
 fn task_id_field(event: &Value) -> Option<TaskId> {

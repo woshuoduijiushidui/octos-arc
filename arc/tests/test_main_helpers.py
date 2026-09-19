@@ -164,6 +164,58 @@ class AlreadyPassingProbeTests(unittest.TestCase):
         self.assertEqual(flow.already_passing_nodes(["REQ-1", "REQ-2", "REQ-3"]), {"REQ-1"})
 
 
+class TaskEvidenceLifecycleTests(unittest.TestCase):
+    def test_should_record_each_existing_app_probe(self):
+        from acceptance import RunSummary
+        from unittest.mock import Mock
+
+        flow = object.__new__(m.Flow)
+        flow.spec_map = {"REQ-1": ["REQ-1.spec.ts"]}
+        flow.probe_count = 0
+        flow.probe_summaries = {}
+        summary = RunSummary(passed=1, total=1, run_id="acceptance-0001")
+        flow.run_specs = Mock(return_value=summary)
+        flow.activate_task_evidence = Mock()
+        flow.record_task_evidence = Mock()
+
+        self.assertEqual(flow.already_passing_nodes(["REQ-1"]), {"REQ-1"})
+        flow.activate_task_evidence.assert_called_once_with(
+            "REQ-1", "probe", "check whether the existing app already satisfies REQ-1"
+        )
+        flow.record_task_evidence.assert_called_once_with(
+            summary,
+            ["REQ-1.spec.ts"],
+            "probe",
+            "reuse the existing implementation",
+        )
+
+    def test_should_refresh_source_after_restoring_application_files(self):
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "frontend").mkdir()
+            (root / "backend").mkdir()
+            git = Mock()
+            store = Mock()
+            store.capsule = object()
+            flow = object.__new__(m.Flow)
+            flow.output_dir = root
+            flow.runtime = SimpleNamespace(git=git)
+            flow.task_evidence = store
+
+            flow.restore_app("0123456789abcdef")
+
+            store.refresh_source.assert_called_once_with(
+                "restore",
+                "revalidate the restored source before treating prior passes as current",
+            )
+            self.assertEqual(git.run.call_count, 3)
+
+
 class CodegenManifestTests(unittest.TestCase):
     def test_should_write_missing_manifests_once(self):
         import json, tempfile

@@ -401,6 +401,24 @@ class PortOwnershipBoundaryTests(unittest.TestCase):
 
 
 class TerminalAcceptanceReportTests(unittest.TestCase):
+    def test_should_assign_monotonic_run_ids_and_allowlisted_commands(self):
+        from acceptance import AcceptanceRunner
+        runner = AcceptanceRunner(
+            Path("/playwright"),
+            Path("/tests"),
+            Path("/work"),
+            lambda _: None,
+        )
+        first = runner._next_run_metadata(
+            ["REQ-2.spec.ts", "../secret.spec.ts", "/absolute.spec.ts"]
+        )
+        second = runner._next_run_metadata(["nested/REQ-3.spec.ts"])
+        self.assertEqual(first, ("acceptance-0001", "npx playwright test REQ-2.spec.ts"))
+        self.assertEqual(
+            second,
+            ("acceptance-0002", "npx playwright test nested/REQ-3.spec.ts"),
+        )
+
     def test_should_show_verdict_in_terminal_and_preserve_json_report(self):
         import os
         from acceptance import AcceptanceRunner
