@@ -4147,9 +4147,64 @@ fn arc_stdio_typed_task_evidence_survives_pre_turn_and_in_loop_compaction() {
     );
 }
 
-/// H01 M0 characterization: ARC's stdio `turn/start` uses this bridge, and its
-/// default heuristic summary currently loses task evidence below the first
-/// line and treats a non-`Error:` failing tool result as successful.
+#[test]
+fn arc_stdio_compaction_persistence_failure_keeps_the_previous_prompt() {
+    let session_id = SessionKey::new("api", "arc-h01-m3-persist-failure");
+    let history = (0..40)
+        .map(|index| {
+            test_message(
+                MessageRole::User,
+                format!("old request {index}: {}", "x".repeat(400)),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut initial = ContextManager::from_session_history(session_id.to_string(), None, &history);
+    initial
+        .record_task_evidence(h01_task_evidence("keep working"))
+        .unwrap();
+    let generation = initial.generation();
+    let manager = Arc::new(StdMutex::new(initial));
+    let temp = tempfile::tempdir().unwrap();
+    let blocked = temp.path().join("not-a-directory");
+    std::fs::write(&blocked, "block context persistence").unwrap();
+    let bridge = AppUiPromptContextBridge::new(session_id, blocked, manager.clone(), false);
+    let mut prompt = vec![test_message(MessageRole::System, "runtime system")];
+    prompt.extend(
+        manager
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .for_prompt(&PromptBuildPolicy::default())
+            .messages,
+    );
+    prompt.push(test_message(MessageRole::User, "current request"));
+    let original = prompt.clone();
+
+    let report = bridge
+        .prepare_prompt(
+            PromptContextRequest {
+                phase: PromptContextPhase::TurnStart,
+                iteration: 1,
+                provider_name: "test".to_owned(),
+                model_id: "tiny-context".to_owned(),
+                context_window: 300,
+            },
+            &mut prompt,
+        )
+        .expect("persistence failure must fall back without breaking the turn");
+
+    assert!(!report.compaction_performed);
+    assert_eq!(
+        serde_json::to_value(&prompt).unwrap(),
+        serde_json::to_value(&original).unwrap()
+    );
+    let canonical = manager.lock().unwrap_or_else(|error| error.into_inner());
+    assert_eq!(canonical.generation(), generation);
+    assert!(canonical.compactions().is_empty());
+}
+
+/// H01 M0 characterization retained as a regression fixture: untyped
+/// requirement details are lossy, while M3 now recognizes the structured
+/// non-zero tool exit status.
 #[test]
 fn arc_stdio_compaction_characterization_exposes_task_evidence_loss() {
     const REQUIREMENT_DETAIL: &str =
@@ -4219,8 +4274,8 @@ fn arc_stdio_compaction_characterization_exposes_task_evidence_loss() {
         "baseline must expose that requirement lines after the first are lost"
     );
     assert!(
-        summary.content.contains("-> shell: ok"),
-        "baseline must expose the prefix-only tool status classification: {}",
+        summary.content.contains("-> shell: er") && !summary.content.contains("-> shell: ok"),
+        "non-zero exit status must not be reported as success: {}",
         summary.content
     );
     assert!(

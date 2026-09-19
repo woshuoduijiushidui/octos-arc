@@ -3388,12 +3388,10 @@ fn appui_manual_compaction_result(
     record: &ContextCompactionRecord,
     failure_reason: Option<&str>,
 ) -> Value {
-    let status = match record.status {
-        ContextCompactionStatus::Installed => "installed",
-        ContextCompactionStatus::Failed => "failed",
-    };
-    let failed = record.status == ContextCompactionStatus::Failed
+    let failed = failure_reason.is_some()
+        || record.status == ContextCompactionStatus::Failed
         || record.budget_outcome == ContextCompactionBudgetOutcome::RejectedOverBudget;
+    let status = if failed { "failed" } else { "installed" };
     let reason = failed.then(|| {
         failure_reason.unwrap_or(match record.budget_outcome {
             ContextCompactionBudgetOutcome::RejectedOverBudget => "rejected_over_budget",
@@ -3768,12 +3766,13 @@ fn appui_context_open_snapshot(
     let _persist_guard = persist_guard;
     let (mut manager, ledger_status) =
         load_or_rebuild_context_manager(data_dir, session_id.to_string(), None, history);
+    let manager_before_update = manager.clone();
     tracing::debug!(
         session = %session_id.0,
         ledger_status = ?ledger_status,
         "appui context manager loaded for session open"
     );
-    let lifecycle_notifications = match llm_provider {
+    let mut lifecycle_notifications = match llm_provider {
         Some(provider) => appui_compact_context_if_over_threshold(
             &mut manager,
             session_id,
@@ -3783,7 +3782,6 @@ fn appui_context_open_snapshot(
         ),
         None => Vec::new(),
     };
-    publish_appui_context_status(session_id, &manager);
     if let Err(error) =
         persist_context_manager_snapshot(data_dir, &session_id.to_string(), &manager)
     {
@@ -3792,7 +3790,10 @@ fn appui_context_open_snapshot(
             error = %error,
             "failed to persist appui context manager open snapshot"
         );
+        manager = manager_before_update;
+        lifecycle_notifications.clear();
     }
+    publish_appui_context_status(session_id, &manager);
     (
         appui_context_status_value(&manager),
         ui_context_state_for(session_id, &manager),
@@ -3822,6 +3823,7 @@ fn appui_context_history_for_agent(
         .unwrap_or_else(|error| error.into_inner());
     let (mut manager, ledger_status) =
         load_or_rebuild_context_manager(data_dir, session_id.to_string(), None, history);
+    let manager_before_update = manager.clone();
     tracing::debug!(
         session = %session_id.0,
         ledger_status = ?ledger_status,
@@ -3844,7 +3846,6 @@ fn appui_context_history_for_agent(
         llm_compaction_enabled,
         trigger,
     );
-    publish_appui_context_status(session_id, &manager);
     if let Err(error) =
         persist_context_manager_snapshot(data_dir, &session_id.to_string(), &manager)
     {
@@ -3853,7 +3854,10 @@ fn appui_context_history_for_agent(
             error = %error,
             "failed to persist appui context manager snapshot"
         );
+        manager = manager_before_update;
+        lifecycle_notifications.clear();
     }
+    publish_appui_context_status(session_id, &manager);
     let frame = manager.for_prompt(&policy);
     lifecycle_notifications.push(appui_context_normalization_notification(session_id, &frame));
     let manager = Arc::new(StdMutex::new(manager));
@@ -3934,6 +3938,7 @@ fn appui_force_compact_context(
     // this load → compact → persist sequence.
     let (mut manager, ledger_status) =
         load_or_rebuild_context_manager(data_dir, session_id.to_string(), None, history);
+    let manager_before_compaction = manager.clone();
     tracing::debug!(
         session = %session_id.0,
         ledger_status = ?ledger_status,
@@ -3975,7 +3980,7 @@ fn appui_force_compact_context(
     } else {
         summary_messages.compact_summary(summary_budget)
     };
-    let record = manager.compact_context(summary, compact_policy);
+    let mut record = manager.compact_context(summary, compact_policy);
     info!(
         session = %session_id.0,
         compaction_id = %record.compaction_id.as_str(),
@@ -3987,20 +3992,32 @@ fn appui_force_compact_context(
         trigger = TRIGGER,
         "appui manual compact_context finished"
     );
-    let result = appui_manual_compaction_result(session_id, &record, None);
-    lifecycle_notifications.push(appui_context_compaction_notification(
-        session_id, &manager, &record,
-    ));
-    publish_appui_context_status(session_id, &manager);
-    if let Err(error) =
-        persist_context_manager_snapshot(data_dir, &session_id.to_string(), &manager)
-    {
+    let persistence_error =
+        persist_context_manager_snapshot(data_dir, &session_id.to_string(), &manager).err();
+    if let Some(error) = persistence_error.as_ref() {
         warn!(
             session = %session_id.0,
             error = %error,
             "failed to persist appui context manager snapshot after manual compaction"
         );
+        manager = manager_before_compaction;
+        record.status = ContextCompactionStatus::Failed;
+        record.output_generation = None;
+        record.replacement_transcript_hash = None;
+        record.installed_transcript_hash = None;
+        record.summary_item_id = None;
+        record.token_estimate_after = None;
+        record.error = Some(format!("context snapshot persistence failed: {error}"));
     }
+    let result = appui_manual_compaction_result(
+        session_id,
+        &record,
+        persistence_error.as_ref().map(|_| "persistence_failed"),
+    );
+    lifecycle_notifications.push(appui_context_compaction_notification(
+        session_id, &manager, &record,
+    ));
+    publish_appui_context_status(session_id, &manager);
     (lifecycle_notifications, result)
 }
 
@@ -4364,6 +4381,7 @@ impl PromptContextManager for AppUiPromptContextBridge {
         request: PromptContextRequest,
         messages: &mut Vec<Message>,
     ) -> Result<PromptContextReport, String> {
+        let original_messages = messages.clone();
         let messages_before = messages.len();
         let policy = Self::prompt_policy(&request);
         let mut scratch_guard = self
@@ -4407,6 +4425,7 @@ impl PromptContextManager for AppUiPromptContextBridge {
                 .unwrap_or_else(|error| error.into_inner());
             self.adopt_canonical_source_rows(scratch, &canonical);
         }
+        let manager_before_compaction = scratch.manager.clone();
 
         let threshold = Self::threshold_tokens(&request);
         let mut compaction_performed = false;
@@ -4503,8 +4522,8 @@ impl PromptContextManager for AppUiPromptContextBridge {
         // passes so the persisted transcript is never re-recorded from a
         // trimmed view.
         let out_policy = self.outgoing_prompt_policy(&request);
-        let frame = scratch.manager.for_prompt(&out_policy);
-        let prompt_replaced = messages.len() != frame.messages.len()
+        let mut frame = scratch.manager.for_prompt(&out_policy);
+        let mut prompt_replaced = messages.len() != frame.messages.len()
             || messages
                 .iter()
                 .zip(frame.messages.iter())
@@ -4548,12 +4567,12 @@ impl PromptContextManager for AppUiPromptContextBridge {
                 _ => messages.insert(0, system),
             }
         }
-        scratch.observed_messages = messages.len();
-        {
+        let persistence_failed = {
             let mut canonical = self
                 .context_manager
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
+            let canonical_before = canonical.clone();
             self.adopt_canonical_source_rows(scratch, &canonical);
             *canonical = scratch.manager.clone();
             publish_appui_context_status(&self.session_id, &canonical);
@@ -4565,8 +4584,22 @@ impl PromptContextManager for AppUiPromptContextBridge {
                     error = %error,
                     "failed to persist appui prompt context manager snapshot"
                 );
+                *canonical = canonical_before;
+                publish_appui_context_status(&self.session_id, &canonical);
+                true
+            } else {
+                false
             }
+        };
+        if persistence_failed && compaction_performed {
+            scratch.manager = manager_before_compaction;
+            *messages = original_messages;
+            frame = scratch.manager.for_prompt(&out_policy);
+            prompt_replaced = false;
+            compaction_performed = false;
+            lifecycle_events.clear();
         }
+        scratch.observed_messages = messages.len();
         let report = PromptContextReport {
             prompt_replaced,
             compaction_performed,

@@ -23,6 +23,7 @@ const CONTEXT_MANAGER_SCHEMA: &str = "octos.context-manager.v2";
 const DEFAULT_TOOL_OUTPUT_POLICY_ID: &str = "tool-output-v1";
 const DEFAULT_MODEL_VISIBLE_TOOL_OUTPUT_MAX_BYTES: usize = 8 * 1024;
 const TOOL_OUTPUT_UI_PREVIEW_MAX_BYTES: usize = 512;
+const TASK_EVIDENCE_PROMPT_MAX_BYTES: usize = 16 * 1024;
 const SYNTHETIC_MISSING_TOOL_OUTPUT: &str =
     "[tool output missing: aborted before result was recorded]";
 
@@ -324,10 +325,29 @@ pub(crate) enum ToolOutputTruncationReason {
     UnsafeForChildFork,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ToolExecutionStatus {
+    Succeeded,
+    Failed,
+    #[default]
+    Unknown,
+}
+
+impl ToolExecutionStatus {
+    fn is_unknown(&self) -> bool {
+        *self == Self::Unknown
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ToolOutputEnvelope {
     pub(crate) tool_call_id: String,
     pub(crate) tool_name: String,
+    #[serde(default, skip_serializing_if = "ToolExecutionStatus::is_unknown")]
+    pub(crate) execution_status: ToolExecutionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) exit_code: Option<i32>,
     pub(crate) raw_sha256: String,
     pub(crate) raw_artifact_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2478,6 +2498,7 @@ impl ContextManager {
         let tool_call_id = normalize_tool_call_id(&tool_call_id.into());
         let raw_sha256 = sha256_prefixed(raw_output.as_bytes());
         let original_bytes = raw_output.len();
+        let (execution_status, exit_code) = tool_execution_state(raw_output);
         let (model_visible_content, truncation_reason) = truncate_utf8(
             raw_output,
             self.tool_output_policy.model_visible_max_bytes,
@@ -2510,6 +2531,8 @@ impl ContextManager {
                 envelope: ToolOutputEnvelope {
                     tool_call_id,
                     tool_name: tool_name.into(),
+                    execution_status,
+                    exit_code,
                     raw_sha256,
                     raw_artifact_ref,
                     ui_preview,
@@ -2633,6 +2656,9 @@ impl ContextManager {
         let input_item_count = self.items.len();
         let token_estimate_before = estimate_items_tokens(&self.items);
         let policy_fingerprint = hash_json(&json!(&policy));
+        if summary.trim().is_empty() {
+            return self.record_failed_compaction(policy, "compaction summary is empty");
+        }
 
         // Installing twice without any intervening projection change would
         // summarize the just-installed summary and rotate the cache epoch a
@@ -2790,6 +2816,14 @@ impl ContextManager {
 
         let (replacement_transcript_hash, compaction_item, candidate, token_estimate_after) =
             installed;
+        if token_estimate_after >= token_estimate_before {
+            return self.record_failed_compaction(
+                policy,
+                format!(
+                    "compaction candidate did not reduce token estimate ({token_estimate_before} -> {token_estimate_after})"
+                ),
+            );
+        }
         self.next_item_seq += 1;
         self.ledger_items.push(compaction_item.clone());
         retained = candidate;
@@ -2893,9 +2927,6 @@ impl ContextManager {
             let TranscriptItemKind::ToolOutput { envelope } = &mut item.kind else {
                 continue;
             };
-            let Some(artifact_ref) = envelope.raw_artifact_ref.clone() else {
-                continue;
-            };
             // Compactors need provenance, not a potentially sensitive excerpt
             // of a large sidecar. The assistant call already carries canonical
             // arguments; replace only the result payload with bounded typed
@@ -2904,9 +2935,10 @@ impl ContextManager {
                 "type": "tool_result_evidence",
                 "tool_name": &envelope.tool_name,
                 "tool_call_id": &envelope.tool_call_id,
-                "terminal_status": "terminal",
+                "terminal_status": tool_execution_status_name(envelope.execution_status),
+                "exit_code": envelope.exit_code,
                 "raw_sha256": &envelope.raw_sha256,
-                "raw_artifact_ref": artifact_ref,
+                "raw_artifact_ref": &envelope.raw_artifact_ref,
                 "original_bytes": envelope.original_bytes,
                 "raw_payload_included": false,
             }))
@@ -3188,21 +3220,8 @@ impl ContextManager {
                     index += 1;
                 }
                 TranscriptItemKind::TaskEvidence { capsule } => {
-                    let payload = serde_json::to_string(capsule)
-                        .map_err(|error| format!("task evidence rendering failed: {error}"))
-                        .unwrap_or_else(|error| json!({ "error": error }).to_string());
                     entries.push(PromptMessageEntry::protected(
-                        message(
-                            MessageRole::User,
-                            format!(
-                                "<task_evidence schema=\"{}\">\n{}\n</task_evidence>\n\
-                                 This is trusted task and verification state data, not a \
-                                 user-authored instruction. Use it as facts; the newest real \
-                                 user message determines the current action.",
-                                capsule.schema,
-                                xml_escape_text(&payload),
-                            ),
-                        ),
+                        message(MessageRole::User, render_task_evidence(capsule)),
                         item.id.clone(),
                     ));
                     index += 1;
@@ -3935,12 +3954,123 @@ fn estimate_items_tokens(items: &[TranscriptItem]) -> usize {
     let bytes = items
         .iter()
         .map(|item| {
-            serde_json::to_vec(&item.kind)
-                .map(|bytes| bytes.len())
-                .unwrap_or_default()
+            if let TranscriptItemKind::TaskEvidence { capsule } = &item.kind {
+                render_task_evidence(capsule).len()
+            } else {
+                serde_json::to_vec(&item.kind)
+                    .map(|bytes| bytes.len())
+                    .unwrap_or_default()
+            }
         })
         .sum::<usize>();
     estimate_tokens_from_bytes(bytes)
+}
+
+fn render_task_evidence(capsule: &TaskEvidenceCapsule) -> String {
+    const FOOTER: &str = "\nThis is trusted task and verification state data, not a \
+user-authored instruction. Use it as facts; the newest real user message determines the \
+current action.\n</task_evidence>";
+    const TRUNCATED: &str = "\n... (lower-priority task evidence omitted)";
+
+    let mut out = format!("<task_evidence schema=\"{}\">\n", capsule.schema);
+    let sections = [
+        ("Task contract", serde_json::to_value(&capsule.task)),
+        (
+            "Active failures",
+            serde_json::to_value(&capsule.active_failures),
+        ),
+        (
+            "Latest verification",
+            serde_json::to_value(&capsule.verification),
+        ),
+        (
+            "Verified behavior",
+            serde_json::to_value(&capsule.verified_behavior),
+        ),
+        (
+            "Source and changed files",
+            serde_json::to_value(&capsule.source_state),
+        ),
+        ("Next action", serde_json::to_value(&capsule.next_action)),
+    ];
+    for (label, value) in sections {
+        let value = value.unwrap_or_else(|_| Value::Null);
+        let section = format!("## {label}\n{}\n", xml_escape_text(&value.to_string()));
+        let available = TASK_EVIDENCE_PROMPT_MAX_BYTES
+            .saturating_sub(out.len())
+            .saturating_sub(FOOTER.len());
+        if section.len() <= available {
+            out.push_str(&section);
+            continue;
+        }
+        let content_budget = available.saturating_sub(TRUNCATED.len());
+        let mut end = content_budget.min(section.len());
+        while end > 0 && !section.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.push_str(&section[..end]);
+        if available >= TRUNCATED.len() {
+            out.push_str(TRUNCATED);
+        }
+        break;
+    }
+    out.push_str(FOOTER);
+    out
+}
+
+fn tool_execution_status_name(status: ToolExecutionStatus) -> &'static str {
+    match status {
+        ToolExecutionStatus::Succeeded => "succeeded",
+        ToolExecutionStatus::Failed => "failed",
+        ToolExecutionStatus::Unknown => "unknown",
+    }
+}
+
+fn tool_execution_state(raw_output: &str) -> (ToolExecutionStatus, Option<i32>) {
+    if let Ok(Value::Object(fields)) = serde_json::from_str::<Value>(raw_output) {
+        if let Some(code) = fields
+            .get("exit_code")
+            .and_then(Value::as_i64)
+            .and_then(|code| i32::try_from(code).ok())
+        {
+            return (
+                if code == 0 {
+                    ToolExecutionStatus::Succeeded
+                } else {
+                    ToolExecutionStatus::Failed
+                },
+                Some(code),
+            );
+        }
+        if let Some(success) = fields.get("success").and_then(Value::as_bool) {
+            return (
+                if success {
+                    ToolExecutionStatus::Succeeded
+                } else {
+                    ToolExecutionStatus::Failed
+                },
+                None,
+            );
+        }
+    }
+    for line in raw_output.lines().map(str::trim) {
+        if let Some(raw_code) = line.strip_prefix("Process exited with code ")
+            && let Ok(code) = raw_code.trim_end_matches('.').parse::<i32>()
+        {
+            return (
+                if code == 0 {
+                    ToolExecutionStatus::Succeeded
+                } else {
+                    ToolExecutionStatus::Failed
+                },
+                Some(code),
+            );
+        }
+    }
+    if raw_output.trim_start().starts_with("Error:") {
+        return (ToolExecutionStatus::Failed, None);
+    }
+    (ToolExecutionStatus::Unknown, None)
 }
 
 fn transcript_item_kind_name(kind: &TranscriptItemKind) -> &'static str {
@@ -4554,6 +4684,252 @@ mod tests {
                 semantic.record_message(&Message::user("current request 1"));
             }
         }
+    }
+
+    #[test]
+    fn task_evidence_prompt_is_bounded_and_orders_trusted_facts_first() {
+        let mut capsule = task_evidence("inspect the redirect");
+        capsule.task.description = format!(
+            "first line\nCRITICAL SECOND-LINE CONSTRAINT\n{}",
+            "requirement detail ".repeat(100)
+        );
+        capsule.active_failures = vec![
+            serde_json::from_value(json!({
+                "test_id": "REQ-1 login",
+                "location": "REQ-1.spec.ts:71",
+                "status": "failed",
+                "expected": "dashboard visible",
+                "actual": "locator timed out",
+                "signature": format!("sha256:{}", "c".repeat(64)),
+                "occurrences": 3,
+                "run_id": "acceptance-0003",
+                "artifact_ref": null,
+                "artifact_sha256": null,
+                "artifact_bytes": null
+            }))
+            .unwrap(),
+        ];
+        capsule.verification = Some(
+            serde_json::from_value(json!({
+                "run_id": "acceptance-0003",
+                "source_sha256": format!("sha256:{}", "b".repeat(64)),
+                "command": "npx playwright test REQ-1.spec.ts",
+                "exit_code": 1,
+                "passed": 0,
+                "total": 1
+            }))
+            .unwrap(),
+        );
+
+        let mut manager = ContextManager::new("arc-priority", None);
+        manager.record_task_evidence(capsule).unwrap();
+        manager.record_message(&Message::user("current request"));
+        let frame = manager.for_prompt(&PromptBuildPolicy::default());
+        let evidence = frame
+            .messages
+            .iter()
+            .find(|message| {
+                message
+                    .content
+                    .contains("trusted task and verification state data")
+            })
+            .expect("rendered task evidence");
+
+        assert!(evidence.content.len() <= TASK_EVIDENCE_PROMPT_MAX_BYTES);
+        assert!(evidence.content.contains("CRITICAL SECOND-LINE CONSTRAINT"));
+        let task = evidence.content.find("Task contract").unwrap();
+        let failure = evidence.content.find("Active failures").unwrap();
+        let verification = evidence.content.find("Latest verification").unwrap();
+        let source = evidence.content.find("Source and changed files").unwrap();
+        let next = evidence.content.find("Next action").unwrap();
+        assert!(task < failure && failure < verification && verification < source && source < next);
+
+        let mut oversized = task_evidence("lower-priority action");
+        oversized.task.description = "large requirement ".repeat(5_000);
+        manager.record_task_evidence(oversized).unwrap();
+        let bounded = manager
+            .for_prompt(&PromptBuildPolicy::default())
+            .messages
+            .into_iter()
+            .find(|message| {
+                message
+                    .content
+                    .contains("trusted task and verification state data")
+            })
+            .unwrap();
+        assert!(bounded.content.len() <= TASK_EVIDENCE_PROMPT_MAX_BYTES);
+    }
+
+    #[test]
+    fn structured_tool_exit_code_overrides_legacy_text_prefix_heuristic() {
+        let mut manager = ContextManager::new("arc-tools", None);
+        manager.record_message(&assistant_tool_call("call_test"));
+        manager.record_tool_output(
+            "call_test",
+            "shell",
+            "Process exited with code 1\nExpected: dashboard\nActual: timeout",
+        );
+        let envelope = manager
+            .items()
+            .iter()
+            .find_map(|item| match &item.kind {
+                TranscriptItemKind::ToolOutput { envelope } => Some(envelope),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(envelope.execution_status, ToolExecutionStatus::Failed);
+        assert_eq!(envelope.exit_code, Some(1));
+
+        manager.record_message(&Message::user("current request"));
+        let input = manager.compaction_input(
+            &CompactContextPolicy {
+                keep_recent_tokens: Some(1),
+                ..CompactContextPolicy::default()
+            },
+            &PromptBuildPolicy::default(),
+        );
+        let evidence = input
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("call_test"))
+            .unwrap();
+        let evidence: Value = serde_json::from_str(&evidence.content).unwrap();
+        assert_eq!(evidence["terminal_status"], "failed");
+        assert_eq!(evidence["exit_code"], 1);
+        assert!(input.compact_summary(256).contains("-> shell: error"));
+    }
+
+    #[test]
+    fn compaction_candidate_that_is_not_smaller_is_rejected_without_mutation() {
+        let mut manager = ContextManager::new("arc-no-growth", None);
+        manager.record_message(&Message::user("old"));
+        manager.record_message(&Message::assistant("answer"));
+        let generation = manager.generation();
+        let ledger = manager.ledger_items().to_vec();
+        let active = manager.items().to_vec();
+
+        let empty = manager.compact_context("", CompactContextPolicy::default());
+        assert_eq!(empty.status, ContextCompactionStatus::Failed);
+        assert!(empty.error.as_deref().unwrap().contains("summary is empty"));
+        assert_eq!(manager.generation(), generation);
+        assert_eq!(manager.ledger_items(), ledger.as_slice());
+        assert_eq!(manager.items(), active.as_slice());
+
+        let record = manager.compact_context(
+            "larger summary ".repeat(100),
+            CompactContextPolicy::default(),
+        );
+
+        assert_eq!(record.status, ContextCompactionStatus::Failed);
+        assert!(record.error.as_deref().unwrap().contains("did not reduce"));
+        assert_eq!(manager.generation(), generation);
+        assert_eq!(manager.ledger_items(), ledger.as_slice());
+        assert_eq!(manager.items(), active.as_slice());
+    }
+
+    #[test]
+    fn task_evidence_and_plan_fit_separate_budgets_under_the_total_target() {
+        let mut capsule = task_evidence("continue implementation");
+        capsule.task.description = format!(
+            "CRITICAL SECOND-LINE CONSTRAINT\n{}",
+            "requirement detail ".repeat(300)
+        );
+        capsule.active_failures = vec![
+            serde_json::from_value(json!({
+                "test_id": "REQ-1 login",
+                "location": "REQ-1.spec.ts:71",
+                "status": "failed",
+                "expected": "dashboard visible",
+                "actual": "locator timed out",
+                "signature": format!("sha256:{}", "c".repeat(64)),
+                "occurrences": 3,
+                "run_id": "acceptance-0003",
+                "artifact_ref": null,
+                "artifact_sha256": null,
+                "artifact_bytes": null
+            }))
+            .unwrap(),
+        ];
+        let mut manager = ContextManager::new("arc-combined-budget", None);
+        manager.record_task_evidence(capsule).unwrap();
+        manager.record_message(&Message::user("old narrative ".repeat(500)));
+        let mut plan = Message::assistant("");
+        plan.tool_calls = Some(vec![ToolCall {
+            id: "plan-1".to_owned(),
+            name: "update_plan".to_owned(),
+            arguments: json!({
+                "plan": [
+                    {"step": "preserve evidence", "status": "completed"},
+                    {"step": "finish repair", "status": "in_progress"}
+                ]
+            }),
+            metadata: None,
+        }]);
+        manager.record_message(&plan);
+        manager.record_tool_output("plan-1", "update_plan", r#"{"success":true}"#);
+        manager.record_message(&Message::user("current request"));
+        let policy = CompactContextPolicy {
+            keep_recent_tokens: Some(1),
+            target_tokens_after_compaction: Some(3_000),
+            ..CompactContextPolicy::default()
+        };
+        let input = manager.compaction_input(&policy, &PromptBuildPolicy::default());
+        let summary = input.compact_summary(512);
+        let record = manager.compact_context(summary, policy);
+
+        assert_eq!(record.status, ContextCompactionStatus::Installed);
+        assert!(
+            record
+                .token_estimate_after
+                .is_some_and(|tokens| tokens <= 3_000)
+        );
+        let frame = manager.for_prompt(&PromptBuildPolicy::default());
+        let evidence = frame
+            .messages
+            .iter()
+            .find(|message| {
+                message
+                    .content
+                    .contains("trusted task and verification state data")
+            })
+            .unwrap();
+        assert!(evidence.content.len() <= TASK_EVIDENCE_PROMPT_MAX_BYTES);
+        assert!(evidence.content.contains("CRITICAL SECOND-LINE CONSTRAINT"));
+        assert!(evidence.content.contains("REQ-1.spec.ts:71"));
+        assert!(evidence.content.contains("dashboard visible"));
+        assert!(evidence.content.contains("locator timed out"));
+        let summary = frame
+            .messages
+            .iter()
+            .find(|message| message.content.starts_with("[Conversation summary]"))
+            .unwrap();
+        assert_eq!(
+            summary
+                .content
+                .matches("Task plan as last declared")
+                .count(),
+            1
+        );
+        let summary_index = frame
+            .messages
+            .iter()
+            .position(|message| message.content.starts_with("[Conversation summary]"))
+            .unwrap();
+        let evidence_index = frame
+            .messages
+            .iter()
+            .position(|message| {
+                message
+                    .content
+                    .contains("trusted task and verification state data")
+            })
+            .unwrap();
+        let current_index = frame
+            .messages
+            .iter()
+            .position(|message| message.content == "current request")
+            .unwrap();
+        assert!(summary_index < evidence_index && evidence_index < current_index);
     }
 
     #[test]
@@ -5905,6 +6281,8 @@ mod tests {
                 envelope: ToolOutputEnvelope {
                     tool_call_id: String::new(),
                     tool_name: String::new(),
+                    execution_status: ToolExecutionStatus::Unknown,
+                    exit_code: None,
                     raw_sha256: String::new(),
                     raw_artifact_ref: None,
                     ui_preview: None,
@@ -6026,7 +6404,10 @@ mod tests {
         let mut manager = ContextManager::new("s", None);
         manager.record_message(&Message::system("system"));
         for index in 0..6 {
-            manager.record_message(&Message::user(format!("u{index}")));
+            manager.record_message(&Message::user(format!(
+                "u{index} {}",
+                "history ".repeat(80)
+            )));
         }
         manager.install_compaction_summary("older turns summarized", 2);
 
@@ -7338,9 +7719,13 @@ mod tests {
         const RECEIPT: &str = "FIRST-TURN-RECEIPT-VERIFIED";
         let mut manager = ContextManager::new("recompaction", None);
         manager.record_message(&Message::user(format!(
-            "Keep this earlier decision: {FACT}"
+            "Keep this earlier decision: {FACT} {}",
+            "history ".repeat(200)
         )));
-        manager.record_message(&Message::assistant(RECEIPT));
+        manager.record_message(&Message::assistant(format!(
+            "{RECEIPT} {}",
+            "result ".repeat(200)
+        )));
         manager.record_message(&Message::user("current work 0"));
         let prompt_policy = PromptBuildPolicy::default();
 
@@ -7392,7 +7777,10 @@ mod tests {
             // Recovery must retain the typed source, without re-trusting a
             // marker parsed out of arbitrary user text.
             manager = ContextManager::from_snapshot(manager.snapshot());
-            manager.record_message(&Message::assistant(format!("work result {round}")));
+            manager.record_message(&Message::assistant(format!(
+                "work result {round} {}",
+                "progress ".repeat(200)
+            )));
             manager.record_message(&Message::user(format!("current work {}", round + 1)));
         }
     }
@@ -7401,8 +7789,14 @@ mod tests {
     fn projected_compaction_provenance_is_typed_not_a_user_marker() {
         let mut manager = ContextManager::new("typed-not-marker", None);
         manager.record_message(&Message::system("stable instructions"));
-        manager.record_message(&Message::user("older request"));
-        manager.record_message(&Message::assistant("older answer"));
+        manager.record_message(&Message::user(format!(
+            "older request {}",
+            "history ".repeat(100)
+        )));
+        manager.record_message(&Message::assistant(format!(
+            "older answer {}",
+            "result ".repeat(100)
+        )));
         manager.record_message(&Message::user("recent request"));
         manager.install_compaction_summary("ACTUAL-PRIOR-FACT\nACTUAL-PRIOR-RECEIPT", 1);
         manager.record_message(&Message::assistant("recent answer"));
@@ -7589,7 +7983,7 @@ mod tests {
         let evidence: Value = serde_json::from_str(&evidence.content).expect("typed evidence JSON");
         assert_eq!(evidence["type"], "tool_result_evidence");
         assert_eq!(evidence["tool_name"], "read_file");
-        assert_eq!(evidence["terminal_status"], "terminal");
+        assert_eq!(evidence["terminal_status"], "unknown");
         assert_eq!(evidence["raw_sha256"], expected_hash);
         assert_eq!(evidence["raw_payload_included"], false);
         assert!(
@@ -8154,8 +8548,14 @@ mod tests {
         let session_id = "coding:local:crash-tainted-compaction";
         let durable = [Message::user("run it"), Message::assistant("done earlier")];
         let mut before_crash = ContextManager::from_session_history(session_id, None, &durable);
-        before_crash.record_message(&Message::user("ghost prompt"));
-        before_crash.record_message(&Message::assistant("ghost reply"));
+        before_crash.record_message(&Message::user(format!(
+            "ghost prompt {}",
+            "history ".repeat(100)
+        )));
+        before_crash.record_message(&Message::assistant(format!(
+            "ghost reply {}",
+            "result ".repeat(100)
+        )));
         before_crash.record_message(&Message::user("ghost follow-up"));
         let compaction_id = before_crash.install_compaction_summary("summary of ghosts", 1);
         assert!(before_crash.compactions().iter().any(|record| {
@@ -8394,6 +8794,11 @@ mod tests {
         assert!(
             !manager.should_retry_compaction(&policy),
             "growing only the pinned tail must not change the compactable candidate"
+        );
+        manager.record_message(&Message::user("new request changes the compactable prefix"));
+        assert!(
+            manager.should_retry_compaction(&policy),
+            "retry is allowed only after the compactable input identity changes"
         );
     }
 

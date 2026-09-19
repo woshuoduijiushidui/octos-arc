@@ -100,6 +100,13 @@ fn task_evidence_validation_rejects_schema_size_path_and_hash_errors() {
     let mut stale_failure = task_evidence_wire("repair login");
     stale_failure["capsule"]["active_failures"][0]["run_id"] = json!("acceptance-0000");
     assert!(decode(stale_failure).validate().is_err());
+
+    let mut missing_required = task_evidence_wire("repair login");
+    missing_required["capsule"]
+        .as_object_mut()
+        .unwrap()
+        .remove("task");
+    assert!(serde_json::from_value::<InputItem>(missing_required).is_err());
 }
 
 #[test]
