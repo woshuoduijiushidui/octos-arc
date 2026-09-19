@@ -3299,7 +3299,43 @@ async fn appui_context_status_snapshot_for_state(
     appui_context_status_snapshot_for_session(session_id)
 }
 
-fn ui_context_compaction_record_for(record: &ContextCompactionRecord) -> UiContextCompactionRecord {
+fn compaction_candidate_observation(
+    record: &ContextCompactionRecord,
+) -> (&'static str, &'static str) {
+    if record.status == ContextCompactionStatus::Installed {
+        let reason = match record.budget_outcome {
+            ContextCompactionBudgetOutcome::NotEnforced => "accepted_no_target",
+            ContextCompactionBudgetOutcome::Met => "accepted_within_budget",
+            ContextCompactionBudgetOutcome::InfeasiblePinnedTail => "accepted_pinned_tail_required",
+            ContextCompactionBudgetOutcome::InfeasibleRequiredEnvelope => {
+                "accepted_required_envelope"
+            }
+            ContextCompactionBudgetOutcome::RejectedOverBudget => "rejected_over_budget",
+        };
+        return ("accepted", reason);
+    }
+    let error = record.error.as_deref().unwrap_or_default();
+    let reason = if record.budget_outcome == ContextCompactionBudgetOutcome::RejectedOverBudget {
+        "rejected_over_budget"
+    } else if error.contains("summary is empty") {
+        "rejected_empty_summary"
+    } else if error.contains("no closed semantic prefix") {
+        "rejected_no_safe_prefix"
+    } else if error.contains("did not reduce token estimate") {
+        "rejected_not_smaller"
+    } else if error.contains("persistence failed") {
+        "rejected_persistence"
+    } else {
+        "rejected_internal_error"
+    };
+    ("rejected", reason)
+}
+
+fn ui_context_compaction_record_for(
+    record: &ContextCompactionRecord,
+    summarizer_kind: &str,
+) -> UiContextCompactionRecord {
+    let (candidate_decision, candidate_reason) = compaction_candidate_observation(record);
     UiContextCompactionRecord {
         compaction_id: record.compaction_id.as_str().to_owned(),
         checkpoint_id: record.checkpoint_id.as_str().to_owned(),
@@ -3320,6 +3356,9 @@ fn ui_context_compaction_record_for(record: &ContextCompactionRecord) -> UiConte
             .map(|id| id.as_str().to_owned()),
         token_estimate_before: record.token_estimate_before,
         token_estimate_after: record.token_estimate_after,
+        summarizer_kind: summarizer_kind.to_owned(),
+        candidate_decision: candidate_decision.to_owned(),
+        candidate_reason: candidate_reason.to_owned(),
         error: record.error.clone(),
     }
 }
@@ -3328,11 +3367,12 @@ fn appui_context_compaction_notification(
     session_id: &SessionKey,
     manager: &ContextManager,
     record: &ContextCompactionRecord,
+    summarizer_kind: &str,
 ) -> UiNotification {
     UiNotification::ContextCompactionCompleted(ContextCompactionCompletedEvent {
         session_id: session_id.clone(),
         context_state: ui_context_state_for(session_id, manager),
-        compaction: ui_context_compaction_record_for(record),
+        compaction: ui_context_compaction_record_for(record, summarizer_kind),
     })
 }
 
@@ -3598,12 +3638,12 @@ fn session_compaction_mode_str(session_id: &SessionKey, state: &AppState) -> &'s
 /// summary errors, times out, or the runtime is unsupported — so it can never
 /// break a turn. Only invoked when the `--llm-compaction` serve flag is on
 /// (`AppState::llm_compaction`); the flag-off path calls the heuristic directly.
-/// Returns a plain `String` for the unchanged `compact_context`.
+/// Returns the summary and the path that actually produced it.
 fn appui_compaction_summary(
     llm_provider: &Arc<dyn octos_llm::LlmProvider>,
     frame: &crate::context_manager::PromptFrame,
     budget_tokens: u32,
-) -> String {
+) -> (String, &'static str) {
     if let Some(summary) = octos_agent::compaction::llm_compaction_summary_with_budget(
         llm_provider,
         &frame.messages,
@@ -3612,10 +3652,10 @@ fn appui_compaction_summary(
             octos_agent::compaction::DEFAULT_LLM_COMPACTION_TIMEOUT_SECS,
         ),
     ) {
-        return summary;
+        return (summary, "llm");
     }
     // Heuristic fallback still uses the summary-size budget (correct there).
-    frame.compact_summary(budget_tokens)
+    (frame.compact_summary(budget_tokens), "extractive_fallback")
 }
 
 /// Route identity for the prompt-cache epoch: the `ProviderMetadata`
@@ -3685,14 +3725,17 @@ fn appui_compact_context_if_over_threshold(
             "no closed semantic prefix is safe to compact",
         );
         lifecycle_notifications.push(appui_context_compaction_notification(
-            session_id, manager, &record,
+            session_id, manager, &record, "none",
         ));
         return lifecycle_notifications;
     }
-    let summary = if llm_compaction_enabled {
+    let (summary, summarizer_kind) = if llm_compaction_enabled {
         appui_compaction_summary(llm_provider, &summary_messages, summary_budget)
     } else {
-        summary_messages.compact_summary(summary_budget)
+        (
+            summary_messages.compact_summary(summary_budget),
+            "extractive",
+        )
     };
     let record = manager.compact_context(summary, compact_policy);
     info!(
@@ -3710,7 +3753,10 @@ fn appui_compact_context_if_over_threshold(
         "appui context manager compact_context finished before model prompt"
     );
     lifecycle_notifications.push(appui_context_compaction_notification(
-        session_id, manager, &record,
+        session_id,
+        manager,
+        &record,
+        summarizer_kind,
     ));
     lifecycle_notifications
 }
@@ -3967,7 +4013,7 @@ fn appui_force_compact_context(
             "no closed semantic prefix is safe to compact",
         );
         lifecycle_notifications.push(appui_context_compaction_notification(
-            session_id, &manager, &record,
+            session_id, &manager, &record, "none",
         ));
         let result =
             appui_manual_compaction_result(session_id, &record, Some("no_safe_semantic_boundary"));
@@ -3975,10 +4021,13 @@ fn appui_force_compact_context(
         let _ = persist_context_manager_snapshot(data_dir, &session_id.to_string(), &manager);
         return (lifecycle_notifications, result);
     }
-    let summary = if llm_compaction_enabled {
+    let (summary, summarizer_kind) = if llm_compaction_enabled {
         appui_compaction_summary(llm_provider, &summary_messages, summary_budget)
     } else {
-        summary_messages.compact_summary(summary_budget)
+        (
+            summary_messages.compact_summary(summary_budget),
+            "extractive",
+        )
     };
     let mut record = manager.compact_context(summary, compact_policy);
     info!(
@@ -4015,7 +4064,10 @@ fn appui_force_compact_context(
         persistence_error.as_ref().map(|_| "persistence_failed"),
     );
     lifecycle_notifications.push(appui_context_compaction_notification(
-        session_id, &manager, &record,
+        session_id,
+        &manager,
+        &record,
+        summarizer_kind,
     ));
     publish_appui_context_status(session_id, &manager);
     (lifecycle_notifications, result)
@@ -4462,18 +4514,23 @@ impl PromptContextManager for AppUiPromptContextBridge {
                 ));
             }
             let summary_messages = scratch.manager.compaction_input(&compact_policy, &policy);
+            let mut summarizer_kind = "none";
             let record = if summary_messages.messages.is_empty() {
                 scratch.manager.record_failed_compaction(
                     compact_policy,
                     "no closed semantic prefix is safe to compact",
                 )
             } else {
-                let summary = match &self.llm_compaction_provider {
+                let (summary, actual_kind) = match &self.llm_compaction_provider {
                     Some(provider) => {
                         appui_compaction_summary(provider, &summary_messages, summary_budget)
                     }
-                    None => summary_messages.compact_summary(summary_budget),
+                    None => (
+                        summary_messages.compact_summary(summary_budget),
+                        "extractive",
+                    ),
                 };
+                summarizer_kind = actual_kind;
                 let record = scratch.manager.compact_context(summary, compact_policy);
                 compaction_performed = record.output_generation.is_some();
                 record
@@ -4483,6 +4540,7 @@ impl PromptContextManager for AppUiPromptContextBridge {
                     &self.session_id,
                     &scratch.manager,
                     &record,
+                    summarizer_kind,
                 ));
             }
             info!(
@@ -38759,7 +38817,7 @@ fn task_evidence_input(input: &[InputItem]) -> Result<Option<&TaskEvidenceCapsul
             return Err("turn/start accepts at most one task evidence item".to_owned());
         }
         capsule.validate()?;
-        evidence = Some(capsule);
+        evidence = Some(capsule.as_ref());
     }
     Ok(evidence)
 }

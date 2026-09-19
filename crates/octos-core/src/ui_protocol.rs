@@ -2193,7 +2193,7 @@ pub enum InputItem {
         text: String,
     },
     TaskEvidence {
-        capsule: TaskEvidenceCapsule,
+        capsule: Box<TaskEvidenceCapsule>,
     },
     /// Forward-compat fallback for input item kinds not yet known to this
     /// client. The original `kind` tag and any sibling fields are dropped on
@@ -6488,6 +6488,12 @@ pub struct UiContextCompactionRecord {
     pub token_estimate_before: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_estimate_after: Option<usize>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub summarizer_kind: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub candidate_decision: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub candidate_reason: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }

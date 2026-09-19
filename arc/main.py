@@ -49,6 +49,7 @@ Environment (all optional):
     OCTOS_ARC_MAX_TOKENS      minimum max_tokens the proxy enforces on chat requests (32768; kernel arc.11 sends 4096)
     OCTOS_ARC_CODEGEN         "0" disables one-request codegen turns for one-node tasks (default on)
     OCTOS_SESSION_SCOPE       turn (default) | node | run — when a fresh octos session starts
+    OCTOS_H01_VARIANT         A | B (default) | C observation label
     OCTOS_ARC_INSTALL_PLAYWRIGHT  "0" never installs Playwright on the fly
     OCTOS_ARC_ALIAS_SPEC_IDS  "0" stops mirroring node states onto spec ids
     OCTOS_PERF_CONTRACT       "0" drops the performance rules from prompts
@@ -721,6 +722,70 @@ class PermanentProviderError(RuntimeError):
     """Account failures require external action, not another generation attempt."""
 
 
+_REDACTED_EVENT_KEYS = {
+    "api_key",
+    "arguments",
+    "authorization",
+    "command",
+    "content",
+    "credentials",
+    "env",
+    "error",
+    "input",
+    "message",
+    "output",
+    "output_preview",
+    "password",
+    "prompt",
+    "response",
+    "secret",
+    "text",
+}
+
+
+def _event_value_bytes(value) -> int:
+    try:
+        return len(
+            json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        )
+    except (TypeError, ValueError):
+        return len(str(value).encode("utf-8", errors="replace"))
+
+
+def _bounded_event_string(value: str, limit: int = 512) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= limit:
+        return value
+    end = limit
+    while end > 0:
+        try:
+            return encoded[:end].decode("utf-8")
+        except UnicodeDecodeError:
+            end -= 1
+    return ""
+
+
+def _safe_event_value(value):
+    if isinstance(value, dict):
+        safe = {}
+        for key, item in value.items():
+            normalized_key = str(key).lower()
+            if normalized_key in _REDACTED_EVENT_KEYS:
+                safe[f"{key}_bytes"] = _event_value_bytes(item)
+                continue
+            safe[str(key)] = _safe_event_value(item)
+        return safe
+    if isinstance(value, list):
+        return [_safe_event_value(item) for item in value[:32]]
+    if isinstance(value, str):
+        return _bounded_event_string(value)
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return _bounded_event_string(str(value))
+
+
 def permanent_provider_error(text: str) -> bool:
     lowered = text.lower()
     codes = re.findall(r"\bhttp(?:/\d(?:\.\d)?)?\s+(\d{3})\b", lowered)
@@ -737,8 +802,16 @@ class OctosDriver:
     (system prompt + tool schemas) is what the provider's prefix cache keys on.
     """
 
-    def __init__(self, octos_bin: str, cwd: Path, env: dict, data_dir: Path,
-                 max_iterations: int, events_log: Path) -> None:
+    def __init__(
+        self,
+        octos_bin: str,
+        cwd: Path,
+        env: dict,
+        data_dir: Path,
+        max_iterations: int,
+        events_log: Path,
+        h01_observer=None,
+    ) -> None:
         self.mode = os.environ.get("OCTOS_DRIVER", "stdio")
         # "turn": new session every turn; "node": one session per requirement
         # node (design -> implement -> repairs share context); "run": one session.
@@ -755,6 +828,9 @@ class OctosDriver:
         self.data_dir = data_dir
         self.max_iterations = max_iterations
         self.events_log = events_log
+        self.h01_observer = h01_observer
+        self.h01_compaction_count = 0
+        self._h01_artifact_reads: dict[str, str] = {}
         self._session = None
         self.monitor: TurnMonitor | None = None
         self.hooks: list = []  # profile hooks (protected-directory deny), set by the flow
@@ -774,6 +850,106 @@ class OctosDriver:
                 self.close()
             self.tools_disabled = previous
 
+    def _observe_h01(self, kind: str, fields: dict) -> None:
+        if self.h01_observer is None:
+            return
+        try:
+            self.h01_observer(kind, fields)
+        except Exception:
+            pass
+
+    def _acceptance_artifact_ref(self, arguments: dict) -> str | None:
+        raw = str(arguments.get("path") or arguments.get("file_path") or "")
+        if not raw or "\\" in raw:
+            return None
+        path = Path(raw)
+        if path.is_absolute():
+            try:
+                path = path.relative_to(Path(self.cwd))
+            except ValueError:
+                return None
+        if (
+            len(path.parts) != 3
+            or path.parts[:2] != (".arc", "evidence")
+            or any(part in ("", ".", "..") for part in path.parts)
+        ):
+            return None
+        return path.as_posix()
+
+    def _observe_h01_transport_event(self, method: str, params: dict) -> None:
+        if method == "h01/capsule":
+            self._observe_h01(
+                "capsule",
+                {
+                    "status": params.get("status"),
+                    "schema": params.get("schema"),
+                    "bytes": int(params.get("bytes") or 0),
+                    "estimated_tokens": int(params.get("estimated_tokens") or 0),
+                },
+            )
+            return
+        if method == "context/compaction_completed":
+            compaction = params.get("compaction") or {}
+            self.h01_compaction_count += 1
+            self._observe_h01(
+                "compaction",
+                {
+                    "compaction_count": self.h01_compaction_count,
+                    "tokens_before": int(
+                        compaction.get("token_estimate_before") or 0
+                    ),
+                    "tokens_after": (
+                        int(compaction["token_estimate_after"])
+                        if compaction.get("token_estimate_after") is not None
+                        else None
+                    ),
+                    "summarizer_kind": str(
+                        compaction.get("summarizer_kind") or "unknown"
+                    ),
+                    "candidate_decision": str(
+                        compaction.get("candidate_decision")
+                        or (
+                            "accepted"
+                            if compaction.get("status") == "installed"
+                            else "rejected"
+                        )
+                    ),
+                    "candidate_reason": str(
+                        compaction.get("candidate_reason")
+                        or (
+                            "accepted_legacy"
+                            if compaction.get("status") == "installed"
+                            else "rejected_legacy"
+                        )
+                    ),
+                },
+            )
+            return
+        if method == "tool/started" and params.get("tool_name") == "read_file":
+            artifact_ref = self._acceptance_artifact_ref(
+                params.get("arguments") or {}
+            )
+            if artifact_ref:
+                self._h01_artifact_reads[str(params.get("tool_call_id") or "")] = (
+                    artifact_ref
+                )
+            return
+        if method == "tool/completed":
+            artifact_ref = self._h01_artifact_reads.pop(
+                str(params.get("tool_call_id") or ""), None
+            )
+            if artifact_ref:
+                self._observe_h01(
+                    "artifact",
+                    {
+                        "operation": "recall",
+                        "status": (
+                            "found" if params.get("success") is not False else "failed"
+                        ),
+                        "artifact_ref": artifact_ref,
+                    },
+                )
+
     def _log_event(self, method: str, params: dict) -> None:
         if method == "core/marker":
             log(f"[core-mod] {params.get('line', '')}")
@@ -782,9 +958,16 @@ class OctosDriver:
                 self.monitor.observe(method, params)
             except Exception:  # noqa: BLE001 - guard must never break a turn
                 pass
+        self._observe_h01_transport_event(method, params)
         try:
             with self.events_log.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps({"method": method, "params": params}, ensure_ascii=False) + "\n")
+                fh.write(
+                    json.dumps(
+                        {"method": method, "params": _safe_event_value(params)},
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
         except OSError:
             pass
 
@@ -1277,6 +1460,11 @@ class Flow:
         self.alias_states = os.environ.get("OCTOS_ARC_ALIAS_SPEC_IDS", "1") != "0"
         self.perf_contract = os.environ.get("OCTOS_PERF_CONTRACT", "1") != "0"
         self.guard_enabled = os.environ.get("OCTOS_GUARD", "1") != "0"
+        self.h01_variant = os.environ.get("OCTOS_H01_VARIANT", "B").strip().upper()
+        if self.h01_variant not in {"A", "B", "C"}:
+            raise ValueError(
+                f"OCTOS_H01_VARIANT must be A, B, or C; got {self.h01_variant!r}"
+            )
         self.t_start = time.time()
         self.runtime = None
         self.events = None
@@ -1324,6 +1512,12 @@ class Flow:
             for alias, target in self.aliases.items():
                 if target == node_id:
                     fn(alias, message)
+
+    def record_h01_observation(self, kind: str, fields: dict) -> None:
+        events = getattr(self, "events", None)
+        if events is None:
+            return
+        events.record_h01_observation(self.h01_variant, kind, fields)
 
     def activate_task_evidence(
         self, node_id: str, phase: str, next_action: str = ""
@@ -2622,10 +2816,23 @@ class Flow:
                     tree,
                     ordered,
                     self.folder_children,
+                    observer=self.record_h01_observation,
                 )
             except TaskEvidenceError as exc:
                 self.task_evidence = None
                 log(f"[evidence] task evidence disabled: {exc}")
+            self.record_h01_observation(
+                "run",
+                {
+                    "compaction_count": 0,
+                    "h01e_extra_requests": 0,
+                    "h01e_extra_tokens": 0,
+                    "typed_input_enabled": (
+                        self.task_evidence is not None
+                        and os.environ.get("OCTOS_DRIVER", "stdio") != "chat"
+                    ),
+                },
+            )
             if not self.budget_explicit:
                 # 32-node trees need hours, not the 1-hour smoke default.
                 self.budget = max(self.budget, self.seconds_per_node * len(ordered))
@@ -2692,7 +2899,8 @@ class Flow:
             env["PORT"] = str(self.smoke_port)  # a bare `npm start` inside a turn must not hit the grading port
             self.driver = DryRunDriver() if dry_run else OctosDriver(
                 octos_bin, self.output_dir, env, data_dir, int(os.environ.get("OCTOS_MAX_ITERATIONS", "500")),
-                events_log=self.output_dir / ".arc" / "octos-events.jsonl")
+                events_log=self.output_dir / ".arc" / "octos-events.jsonl",
+                h01_observer=self.record_h01_observation)
             self.driver.hooks = protected_hooks(protected)
             threading.Thread(target=_port_watchdog, args=(self.web_port, self.output_dir, watchdog_stop),
                              daemon=True).start()

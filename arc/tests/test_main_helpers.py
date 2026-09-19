@@ -65,6 +65,132 @@ class TransientTests(unittest.TestCase):
         self.assertTrue(OctosDriver._transient("failed to send streaming request"))
 
 
+class H01ObservationTests(unittest.TestCase):
+    def test_should_write_allowlisted_run_observation_without_sensitive_fields(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from arcbench_agent_runtime.context import RuntimePaths
+        from arcbench_agent_runtime.events import EventClient
+
+        with tempfile.TemporaryDirectory() as tmp:
+            events = EventClient(RuntimePaths.from_env(project_dir=tmp))
+            events.record_h01_observation(
+                "B",
+                "run",
+                {
+                    "compaction_count": 0,
+                    "h01e_extra_requests": 0,
+                    "h01e_extra_tokens": 0,
+                    "typed_input_enabled": True,
+                    "api_key": "must-not-be-logged",
+                    "command": "printenv",
+                },
+            )
+
+            record = json.loads(
+                (Path(tmp) / ".arc" / "runner-events.jsonl").read_text()
+            )
+            self.assertEqual(record["type"], "h01_observation")
+            self.assertEqual(record["variant"], "B")
+            self.assertEqual(record["kind"], "run")
+            self.assertEqual(record["h01e_extra_requests"], 0)
+            self.assertEqual(record["h01e_extra_tokens"], 0)
+            self.assertNotIn("api_key", record)
+            self.assertNotIn("command", record)
+            self.assertNotIn("must-not-be-logged", json.dumps(record))
+
+    def test_should_reduce_compaction_and_artifact_recall_events_to_safe_metadata(self):
+        import tempfile
+        from pathlib import Path
+
+        observations = []
+        with tempfile.TemporaryDirectory() as tmp:
+            driver = OctosDriver(
+                "octos",
+                Path(tmp),
+                {},
+                Path(tmp) / "data",
+                10,
+                Path(tmp) / "octos-events.jsonl",
+                h01_observer=lambda kind, fields: observations.append((kind, fields)),
+            )
+            compaction = {
+                "status": "installed",
+                "token_estimate_before": 1200,
+                "token_estimate_after": 400,
+                "summarizer_kind": "extractive",
+                "candidate_decision": "accepted",
+                "candidate_reason": "accepted_within_budget",
+                "error": "raw error must not be copied",
+            }
+            driver._log_event(
+                "context/compaction_completed",
+                {"compaction": compaction},
+            )
+            driver._log_event(
+                "tool/started",
+                {
+                    "tool_call_id": "call-1",
+                    "tool_name": "read_file",
+                    "arguments": {
+                        "path": ".arc/evidence/acceptance-0001.json",
+                        "api_key": "must-not-be-logged",
+                    },
+                },
+            )
+            driver._log_event(
+                "tool/completed",
+                {
+                    "tool_call_id": "call-1",
+                    "tool_name": "read_file",
+                    "success": True,
+                    "output_preview": "raw acceptance log must not be copied",
+                },
+            )
+            driver._log_event(
+                "tool/started",
+                {
+                    "tool_call_id": "call-2",
+                    "tool_name": "shell",
+                    "arguments": {"command": "echo must-not-be-logged"},
+                },
+            )
+            event_log = (Path(tmp) / "octos-events.jsonl").read_text()
+
+        self.assertEqual(
+            observations[0],
+            (
+                "compaction",
+                {
+                    "compaction_count": 1,
+                    "tokens_before": 1200,
+                    "tokens_after": 400,
+                    "summarizer_kind": "extractive",
+                    "candidate_decision": "accepted",
+                    "candidate_reason": "accepted_within_budget",
+                },
+            ),
+        )
+        self.assertEqual(
+            observations[1],
+            (
+                "artifact",
+                {
+                    "operation": "recall",
+                    "status": "found",
+                    "artifact_ref": ".arc/evidence/acceptance-0001.json",
+                },
+            ),
+        )
+        self.assertNotIn("must-not-be-logged", repr(observations))
+        self.assertNotIn("raw acceptance log", repr(observations))
+        self.assertNotIn("must-not-be-logged", event_log)
+        self.assertNotIn("raw acceptance log", event_log)
+        self.assertNotIn('"command"', event_log)
+
+
 class FolderDescendantTests(unittest.TestCase):
     def test_should_map_every_folder_to_its_atomic_leaves(self):
         tree = {"id": "ROOT", "type": "FOLDER", "children": [

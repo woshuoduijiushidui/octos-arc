@@ -42,10 +42,26 @@ class TaskEvidenceInputTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             session = object.__new__(OctosStdioSession)
             session.cwd = tmp
+            observations = []
+            session.on_event = lambda method, params: observations.append((method, params))
 
             self.assertEqual(
                 session._turn_input_items("exact user prompt"),
                 [{"kind": "text", "text": "exact user prompt"}],
+            )
+            self.assertEqual(
+                observations,
+                [
+                    (
+                        "h01/capsule",
+                        {
+                            "status": "absent",
+                            "schema": None,
+                            "bytes": 0,
+                            "estimated_tokens": 0,
+                        },
+                    )
+                ],
             )
 
     def test_should_append_current_capsule_without_changing_text(self):
@@ -57,6 +73,8 @@ class TaskEvidenceInputTests(unittest.TestCase):
             path.write_text(json.dumps(capsule), encoding="utf-8")
             session = object.__new__(OctosStdioSession)
             session.cwd = str(root)
+            observations = []
+            session.on_event = lambda method, params: observations.append((method, params))
 
             items = session._turn_input_items("exact user prompt")
 
@@ -64,6 +82,16 @@ class TaskEvidenceInputTests(unittest.TestCase):
             self.assertEqual(
                 items[1],
                 {"kind": "task_evidence", "capsule": capsule},
+            )
+            self.assertEqual(observations[0][0], "h01/capsule")
+            self.assertEqual(observations[0][1]["status"], "injected")
+            self.assertEqual(
+                observations[0][1]["bytes"],
+                path.stat().st_size,
+            )
+            self.assertEqual(
+                observations[0][1]["estimated_tokens"],
+                (path.stat().st_size + 3) // 4,
             )
 
     def test_should_reject_an_unreadable_capsule_instead_of_sending_empty_evidence(self):

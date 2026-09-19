@@ -191,12 +191,26 @@ class OctosStdioSession:
             params["profile_id"] = self.profile_id
         self._send("session/open", params, want_response=True, timeout=timeout)
 
+    def _report_capsule(self, status: str, schema: str | None, size: int) -> None:
+        observer = getattr(self, "on_event", None)
+        if observer is not None:
+            observer(
+                "h01/capsule",
+                {
+                    "status": status,
+                    "schema": schema,
+                    "bytes": size,
+                    "estimated_tokens": (size + 3) // 4,
+                },
+            )
+
     def _turn_input_items(self, text: str) -> list[dict]:
         items = [{"kind": "text", "text": text}]
         path = Path(self.cwd) / TASK_EVIDENCE_RELATIVE_PATH
         try:
             data = path.read_bytes()
         except FileNotFoundError:
+            self._report_capsule("absent", None, 0)
             return items
         except OSError as exc:
             raise OctosProtocolError(f"could not read task evidence {path}: {exc}") from exc
@@ -210,6 +224,7 @@ class OctosStdioSession:
             raise OctosProtocolError(f"invalid task evidence {path}: {exc}") from exc
         if not isinstance(capsule, dict) or capsule.get("schema") != TASK_EVIDENCE_SCHEMA:
             raise OctosProtocolError(f"invalid task evidence schema in {path}")
+        self._report_capsule("injected", capsule["schema"], len(data))
         items.append({"kind": "task_evidence", "capsule": capsule})
         return items
 

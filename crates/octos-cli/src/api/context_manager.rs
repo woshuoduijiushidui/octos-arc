@@ -267,7 +267,7 @@ pub(crate) enum TranscriptItemKind {
         content: String,
     },
     TaskEvidence {
-        capsule: TaskEvidenceCapsule,
+        capsule: Box<TaskEvidenceCapsule>,
     },
     ChildResultSummary {
         child_agent_id: String,
@@ -1900,12 +1900,14 @@ impl ContextManager {
     ) -> Result<Option<TranscriptItemId>, String> {
         capsule.validate()?;
         if self.items.iter().rev().any(
-            |item| matches!(&item.kind, TranscriptItemKind::TaskEvidence { capsule: current } if current == &capsule),
+            |item| matches!(&item.kind, TranscriptItemKind::TaskEvidence { capsule: current } if current.as_ref() == &capsule),
         ) {
             return Ok(None);
         }
         let id = self.record_item(
-            TranscriptItemKind::TaskEvidence { capsule },
+            TranscriptItemKind::TaskEvidence {
+                capsule: Box::new(capsule),
+            },
             TranscriptItemSource::Supervisor,
         );
         self.items.retain(|item| {

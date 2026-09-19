@@ -3966,6 +3966,9 @@ fn in_loop_compaction_emits_lifecycle_notifications() {
     };
     assert_eq!(done.session_id, session_id);
     assert_eq!(done.compaction.trigger, "agent_loop:turn_start");
+    assert_eq!(done.compaction.summarizer_kind, "extractive");
+    assert_eq!(done.compaction.candidate_decision, "accepted");
+    assert!(done.compaction.candidate_reason.starts_with("accepted_"));
     let epoch_after = bridge
         .prompt_cache_epoch_id()
         .expect("compaction keeps an initialized epoch");
@@ -3980,6 +3983,21 @@ fn in_loop_compaction_emits_lifecycle_notifications() {
     );
     assert!(done.context_state.semantic_head_id.is_some());
     assert!(done.context_state.semantic_head_kind.is_some());
+}
+
+#[test]
+fn compaction_observation_uses_enumerated_rejection_reason() {
+    let mut manager = ContextManager::new("observation", None);
+    let record = manager.record_failed_compaction(
+        CompactContextPolicy::default(),
+        "compaction summary is empty",
+    );
+
+    let observed = ui_context_compaction_record_for(&record, "none");
+
+    assert_eq!(observed.summarizer_kind, "none");
+    assert_eq!(observed.candidate_decision, "rejected");
+    assert_eq!(observed.candidate_reason, "rejected_empty_summary");
 }
 
 fn h01_task_evidence(next_action: &str) -> TaskEvidenceCapsule {
@@ -4017,16 +4035,18 @@ fn arc_turn_start_accepts_only_one_valid_task_evidence_item() {
             text: "continue".to_owned(),
         },
         InputItem::TaskEvidence {
-            capsule: current.clone(),
+            capsule: Box::new(current.clone()),
         },
     ];
     assert_eq!(task_evidence_input(&input).unwrap(), Some(&current));
 
     let duplicates = vec![
         InputItem::TaskEvidence {
-            capsule: current.clone(),
+            capsule: Box::new(current.clone()),
         },
-        InputItem::TaskEvidence { capsule: current },
+        InputItem::TaskEvidence {
+            capsule: Box::new(current),
+        },
     ];
     assert!(task_evidence_input(&duplicates).is_err());
 }
@@ -26879,6 +26899,9 @@ fn context_compaction_completed_for(session: &SessionKey) -> UiNotification {
             summary_item_id: Some("item-summary".into()),
             token_estimate_before: 1200,
             token_estimate_after: Some(400),
+            summarizer_kind: "extractive".into(),
+            candidate_decision: "accepted".into(),
+            candidate_reason: "accepted_within_budget".into(),
             error: None,
         },
     })

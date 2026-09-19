@@ -59,7 +59,7 @@ def requirement_tree():
     }
 
 
-def create_store(root: Path) -> TaskEvidenceStore:
+def create_store(root: Path, observer=None) -> TaskEvidenceStore:
     requirements = root / "requirements.yaml"
     requirements.write_text("id: ROOT\n", encoding="utf-8")
     app = root / "app"
@@ -74,10 +74,11 @@ def create_store(root: Path) -> TaskEvidenceStore:
         requirement_tree=tree,
         ordered_nodes=tree["children"],
         folder_children={"ROOT": ["REQ-1", "REQ-2"]},
+        observer=observer,
     )
 
 
-def reopen_store(root: Path) -> TaskEvidenceStore:
+def reopen_store(root: Path, observer=None) -> TaskEvidenceStore:
     tree = requirement_tree()
     return TaskEvidenceStore(
         output_dir=root / "app",
@@ -85,6 +86,7 @@ def reopen_store(root: Path) -> TaskEvidenceStore:
         requirement_tree=tree,
         ordered_nodes=tree["children"],
         folder_children={"ROOT": ["REQ-1", "REQ-2"]},
+        observer=observer,
     )
 
 
@@ -549,6 +551,39 @@ class AcceptanceArtifactTests(unittest.TestCase):
             )
             self.assertEqual(first_path.read_bytes(), first_data)
             self.assertTrue((store.output_dir / second_failure.artifact_ref).is_file())
+
+    def test_should_observe_artifact_write_and_replay_without_raw_content(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            observations = []
+            observer = lambda kind, fields: observations.append((kind, fields))
+            store = create_store(root, observer=observer)
+            store.activate("REQ-2", "implement")
+            capsule = store.record_verification(
+                self.failed_summary("secret raw failure"),
+                ["REQ-2.spec.ts"],
+                "repair",
+            )
+
+            write = next(
+                fields
+                for kind, fields in observations
+                if kind == "artifact" and fields["operation"] == "write"
+            )
+            self.assertEqual(write["status"], "stored")
+            self.assertEqual(write["artifact_ref"], capsule.active_failures[0].artifact_ref)
+            self.assertNotIn("secret raw failure", repr(observations))
+
+            observations.clear()
+            replayed = reopen_store(root, observer=observer)
+            self.assertIsNotNone(replayed.capsule)
+            replay = next(
+                fields
+                for kind, fields in observations
+                if kind == "artifact" and fields["operation"] == "replay"
+            )
+            self.assertEqual(replay["status"], "found")
+            self.assertNotIn("secret raw failure", repr(observations))
 
 
 if __name__ == "__main__":

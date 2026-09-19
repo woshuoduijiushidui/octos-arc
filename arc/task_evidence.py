@@ -9,7 +9,7 @@ import re
 import tempfile
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from acceptance import RunSummary, TestOutcome, failure_signature
 
@@ -677,6 +677,19 @@ def _validate_capsule_artifacts(
         validated.add(metadata)
 
 
+def _artifact_failure_reason(error: Exception) -> str:
+    message = str(error).lower()
+    if "missing" in message:
+        return "missing"
+    if "hash mismatch" in message:
+        return "hash_mismatch"
+    if "byte count mismatch" in message:
+        return "byte_count_mismatch"
+    if "reference" in message or "escapes" in message:
+        return "invalid_reference"
+    return "io_error"
+
+
 def _capsule_from_dict(data: Any) -> TaskEvidenceCapsule:
     if not isinstance(data, dict) or data.get("schema") != TASK_EVIDENCE_SCHEMA:
         raise TaskEvidenceError("invalid task evidence schema")
@@ -777,12 +790,14 @@ class TaskEvidenceStore:
         requirement_tree: dict,
         ordered_nodes: list[dict],
         folder_children: dict[str, list[str]] | None = None,
+        observer: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
         self.output_dir = Path(output_dir)
         self.requirement_file = Path(requirement_file)
         self.requirement_tree = requirement_tree
         self.ordered_nodes = list(ordered_nodes)
         self.folder_children = folder_children or {}
+        self.observer = observer
         self.path = self.output_dir / TASK_EVIDENCE_RELATIVE_PATH
         try:
             self.requirement_file.read_bytes()
@@ -793,15 +808,72 @@ class TaskEvidenceStore:
         self.capsule: TaskEvidenceCapsule | None = None
         if self.path.exists():
             try:
+                capsule_data = self.path.read_bytes()
                 self.capsule = _capsule_from_dict(
-                    json.loads(self.path.read_text(encoding="utf-8"))
+                    json.loads(capsule_data.decode("utf-8"))
                 )
-                _validate_capsule_artifacts(self.output_dir, self.capsule)
             except (OSError, UnicodeError, json.JSONDecodeError) as exc:
                 raise TaskEvidenceError(
                     f"cannot load task evidence {self.path}: {exc}"
                 ) from exc
+            try:
+                _validate_capsule_artifacts(self.output_dir, self.capsule)
+            except TaskEvidenceError as exc:
+                self._observe_artifacts(
+                    self.capsule,
+                    operation="replay",
+                    status="failed",
+                    reason=_artifact_failure_reason(exc),
+                )
+                raise
+            self._observe_artifacts(
+                self.capsule,
+                operation="replay",
+                status="found",
+            )
+            self._observe(
+                "capsule",
+                {
+                    "status": "replayed",
+                    "schema": self.capsule.schema,
+                    "bytes": len(capsule_data),
+                    "estimated_tokens": (len(capsule_data) + 3) // 4,
+                },
+            )
         self._task_baseline_files = _source_files(self.output_dir)
+
+    def _observe(self, kind: str, fields: dict[str, Any]) -> None:
+        if self.observer is None:
+            return
+        try:
+            self.observer(kind, fields)
+        except Exception:
+            pass
+
+    def _observe_artifacts(
+        self,
+        capsule: TaskEvidenceCapsule,
+        *,
+        operation: str,
+        status: str,
+        reason: str | None = None,
+    ) -> None:
+        seen = set()
+        for failure in capsule.active_failures:
+            if not failure.artifact_ref or failure.artifact_ref in seen:
+                continue
+            seen.add(failure.artifact_ref)
+            self._observe(
+                "artifact",
+                {
+                    "operation": operation,
+                    "status": status,
+                    "artifact_ref": failure.artifact_ref,
+                    "artifact_sha256": failure.artifact_sha256,
+                    "artifact_bytes": failure.artifact_bytes,
+                    "reason": reason,
+                },
+            )
 
     def activate(
         self,
@@ -944,16 +1016,41 @@ class TaskEvidenceStore:
             artifact_sha256 = _sha256_bytes(artifact_data)
             artifact_bytes = len(artifact_data)
             artifact_path = _artifact_path(self.output_dir, artifact_ref)
-            _write_atomic_bytes(
-                artifact_path,
-                artifact_data,
-                "acceptance evidence artifact",
-            )
-            _validate_artifact(
-                self.output_dir,
-                artifact_ref,
-                artifact_sha256,
-                artifact_bytes,
+            try:
+                _write_atomic_bytes(
+                    artifact_path,
+                    artifact_data,
+                    "acceptance evidence artifact",
+                )
+                _validate_artifact(
+                    self.output_dir,
+                    artifact_ref,
+                    artifact_sha256,
+                    artifact_bytes,
+                )
+            except TaskEvidenceError as exc:
+                self._observe(
+                    "artifact",
+                    {
+                        "operation": "write",
+                        "status": "failed",
+                        "artifact_ref": artifact_ref,
+                        "artifact_sha256": artifact_sha256,
+                        "artifact_bytes": artifact_bytes,
+                        "reason": _artifact_failure_reason(exc),
+                    },
+                )
+                raise
+            self._observe(
+                "artifact",
+                {
+                    "operation": "write",
+                    "status": "stored",
+                    "artifact_ref": artifact_ref,
+                    "artifact_sha256": artifact_sha256,
+                    "artifact_bytes": artifact_bytes,
+                    "reason": None,
+                },
             )
         previous = {item.signature: item for item in current.active_failures}
         failures_by_signature: dict[str, ActiveFailure] = {}
@@ -1055,5 +1152,15 @@ class TaskEvidenceStore:
 
     def _persist(self, candidate: TaskEvidenceCapsule) -> None:
         _validate_capsule_artifacts(self.output_dir, candidate)
-        write_capsule_atomic(self.path, candidate)
+        data = serialize_capsule(candidate)
+        _write_atomic_bytes(self.path, data, "task evidence")
         self.capsule = candidate
+        self._observe(
+            "capsule",
+            {
+                "status": "persisted",
+                "schema": candidate.schema,
+                "bytes": len(data),
+                "estimated_tokens": (len(data) + 3) // 4,
+            },
+        )
