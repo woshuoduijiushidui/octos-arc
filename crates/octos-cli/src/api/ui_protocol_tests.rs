@@ -43318,3 +43318,43 @@ fn standalone_turn_reapplies_hook_context() {
         "hook context must be re-applied alongside the hook executor wiring"
     );
 }
+
+#[test]
+fn h02_m0_characterization_oup_and_mcp_agents_omit_file_cache_wiring() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    let session =
+        std::fs::read_to_string(manifest.join("src/runtime/session.rs")).expect("read session.rs");
+    assert!(
+        session.contains(".with_file_state_cache(file_state_cache)"),
+        "the bootstrap SessionRuntime agent must remain the control showing cache wiring exists"
+    );
+
+    let transport = std::fs::read_to_string(manifest.join("src/api/ui_protocol_transport.rs"))
+        .expect("read ui_protocol_transport.rs");
+    let oup_start = transport
+        .find("let request_agent = Agent::new_shared(")
+        .expect("OUP per-turn Agent constructor");
+    let oup_end = transport[oup_start..]
+        .find("request_agent.wire_mofa_make_dispatcher();")
+        .map(|offset| oup_start + offset)
+        .expect("end of OUP per-turn Agent builder");
+    assert!(
+        !transport[oup_start..oup_end].contains("with_file_state_cache"),
+        "M0 records that the OUP per-turn Agent does not inherit the bootstrap cache"
+    );
+
+    let mcp = std::fs::read_to_string(manifest.join("src/commands/mcp_serve.rs"))
+        .expect("read mcp_serve");
+    let mcp_start = mcp
+        .find("let mut agent = Agent::new_shared(")
+        .expect("MCP run_session Agent constructor");
+    let mcp_end = mcp[mcp_start..]
+        .find("// Run the task")
+        .map(|offset| mcp_start + offset)
+        .expect("end of MCP Agent builder");
+    assert!(
+        !mcp[mcp_start..mcp_end].contains("with_file_state_cache"),
+        "M0 records that each MCP run_session Agent starts without a file cache"
+    );
+}

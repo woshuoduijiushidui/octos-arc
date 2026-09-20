@@ -107,12 +107,14 @@ impl Tool for CtxProbeTool {
 
 struct MockLlm {
     responses: Mutex<Vec<ChatResponse>>,
+    requests: Mutex<Vec<Vec<Message>>>,
 }
 
 impl MockLlm {
     fn new(responses: Vec<ChatResponse>) -> Self {
         Self {
             responses: Mutex::new(responses),
+            requests: Mutex::new(Vec::new()),
         }
     }
 }
@@ -121,10 +123,11 @@ impl MockLlm {
 impl LlmProvider for MockLlm {
     async fn chat(
         &self,
-        _messages: &[Message],
+        messages: &[Message],
         _tools: &[ToolSpec],
         _config: &ChatConfig,
     ) -> eyre::Result<ChatResponse> {
+        self.requests.lock().unwrap().push(messages.to_vec());
         let mut responses = self.responses.lock().unwrap();
         if responses.is_empty() {
             eyre::bail!("MockLlm: no more scripted responses");
@@ -238,11 +241,11 @@ async fn threads_agent_definitions_into_spawn_tool_after_m8_8_scheduler() {
 }
 
 #[tokio::test]
-async fn threads_file_state_cache_into_read_file_after_m8_8_scheduler() {
-    // Read the same file twice through a real Agent loop; the second read
-    // must hit the [FILE_UNCHANGED] short-circuit. That requires the
-    // foreground ToolContext built by the M8.8 executor to carry the cache
-    // forward from `Agent::file_state_cache`.
+async fn h02_m0_characterization_cache_stub_follows_body_dispatch() {
+    // Read the same file twice through a real Agent loop. Unlike the direct
+    // tool contract, this path performs a successful provider request after
+    // the first read; capture that request so the test does not treat cache
+    // wiring alone as proof that the model saw the body.
     let workspace = TempDir::new().unwrap();
     let memory_dir = TempDir::new().unwrap();
     std::fs::write(workspace.path().join("notes.txt"), "alpha\nbeta\ngamma\n").unwrap();
@@ -265,13 +268,14 @@ async fn threads_file_state_cache_into_read_file_after_m8_8_scheduler() {
         "read_file",
         serde_json::json!({"path": "notes.txt"}),
     );
-    let llm: Arc<dyn LlmProvider> = Arc::new(MockLlm::new(vec![
+    let llm = Arc::new(MockLlm::new(vec![
         tool_use(vec![read_call_1]),
         tool_use(vec![read_call_2]),
         end("done"),
     ]));
+    let provider: Arc<dyn LlmProvider> = llm.clone();
 
-    let agent = Agent::new(AgentId::new("m8-fix-cache"), llm, tools, memory)
+    let agent = Agent::new(AgentId::new("m8-fix-cache"), provider, tools, memory)
         .with_config(AgentConfig {
             save_episodes: false,
             ..Default::default()
@@ -307,10 +311,17 @@ async fn threads_file_state_cache_into_read_file_after_m8_8_scheduler() {
         "first read should return file body, got: {}",
         tool_outputs[0]
     );
+    let requests = llm.requests.lock().unwrap();
+    assert!(
+        requests.get(1).is_some_and(|messages| messages
+            .iter()
+            .any(|message| message.role == octos_core::MessageRole::Tool
+                && message.content.contains("alpha"))),
+        "the provider request before the second read must contain the first file body"
+    );
     assert!(
         tool_outputs[1].contains("[FILE_UNCHANGED]"),
-        "second read must short-circuit via the file_state_cache after \
-         M8.8 reconciliation, got: {}",
+        "the baseline cache returns a stub after the body-bearing dispatch, got: {}",
         tool_outputs[1]
     );
     assert_eq!(
