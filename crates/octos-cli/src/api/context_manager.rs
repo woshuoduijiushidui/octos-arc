@@ -4537,6 +4537,102 @@ mod tests {
         assert_eq!(manager.tool_output_by_call_id("call_missing"), None);
     }
 
+    #[test]
+    fn h03_m0_cold_reload_keeps_artifact_but_loses_recall_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let session = "h03:baseline:cold";
+        let mut manager = ContextManager::new(session, None);
+        manager.record_message(&assistant_tool_call("call_cold"));
+        let source = "retained source line\n".repeat(2000);
+        manager.record_tool_output("call_cold", "shell", &source);
+        let artifact = manager.tool_output_artifacts.keys().next().unwrap().clone();
+        let snapshot_path =
+            persist_context_manager_snapshot(temp.path(), session, &manager).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(context_ledger_artifact_path(temp.path(), &artifact).unwrap())
+                .unwrap(),
+            source
+        );
+        assert_eq!(manager.tool_output_by_call_id("call_cold"), Some(source));
+        let snapshot = serde_json::from_slice(&std::fs::read(snapshot_path).unwrap()).unwrap();
+        let restored = ContextManager::from_snapshot(snapshot);
+        assert!(restored.items().iter().any(|item| matches!(
+            &item.kind,
+            TranscriptItemKind::ToolOutput { envelope }
+                if envelope.raw_artifact_ref.as_deref() == Some(artifact.as_str())
+        )));
+        assert_eq!(restored.tool_output_by_call_id("call_cold"), None);
+        let loaded = load_context_manager_snapshot(temp.path(), session)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.tool_output_by_call_id("call_cold"), None);
+    }
+
+    #[test]
+    fn h03_m0_reused_call_id_recalls_latest_instead_of_reporting_ambiguity() {
+        let mut manager = ContextManager::new("h03:baseline:reused", None);
+        for source in ["first command output", "second command output"] {
+            manager.record_message(&Message::user("run command"));
+            manager.record_message(&assistant_tool_call("call_reused"));
+            manager.record_tool_output("call_reused", "shell", source);
+            manager.record_message(&Message::assistant("done"));
+        }
+        let frame = manager.for_prompt(&PromptBuildPolicy::default());
+        assert_eq!(
+            frame
+                .messages
+                .iter()
+                .filter(|message| message.role == MessageRole::Tool)
+                .count(),
+            2
+        );
+        assert_eq!(
+            manager.tool_output_by_call_id("call_reused").as_deref(),
+            Some("second command output")
+        );
+    }
+
+    #[tokio::test]
+    async fn h03_m0_recall_page_is_cut_again_by_prompt_projection() {
+        use octos_agent::Tool;
+        use std::sync::Arc;
+
+        struct Ledger(ContextManager);
+        impl octos_agent::tools::ToolOutputLedger for Ledger {
+            fn fetch(&self, id: &str) -> Option<String> {
+                self.0.tool_output_by_call_id(id)
+            }
+        }
+        let mut manager = ContextManager::new("h03:baseline:page", None);
+        manager.record_message(&assistant_tool_call("call_source"));
+        let source = format!(
+            "{}MIDDLE_SENTINEL\n{}",
+            "line\n".repeat(3000),
+            "tail\n".repeat(10000)
+        );
+        manager.record_tool_output("call_source", "shell", &source);
+        let recall = octos_agent::tools::RecallTool::new(Arc::new(Ledger(manager.clone())));
+        let page = recall
+            .execute(&json!({"tool_call_id": "call_source", "page": 0}))
+            .await
+            .unwrap();
+        assert!(page.success);
+        assert!(page.output.contains("MIDDLE_SENTINEL"));
+        assert!(page.output.contains("[recall page 1/"));
+        manager.record_message(&assistant_tool_call("call_recall"));
+        manager.record_tool_output("call_recall", "recall", &page.output);
+        let frame = manager.for_prompt(&PromptBuildPolicy::default());
+        let visible = frame
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("call_recall"))
+            .unwrap();
+        assert_eq!(visible.content.len(), 8192 + "\n[truncated]".len());
+        assert!(!visible.content.contains("MIDDLE_SENTINEL"));
+        assert!(!visible.content.contains("[recall page"));
+        assert_eq!(manager.tool_output_artifacts.len(), 2);
+    }
+
     /// #2131 P2 (review): the case recall EXISTS for — once an output is
     /// evicted, `compact_context` prunes its transcript envelope, but recall
     /// must still resolve it via the compaction-surviving `recall_index`.
