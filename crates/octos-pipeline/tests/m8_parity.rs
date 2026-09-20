@@ -17,6 +17,7 @@ use octos_agent::cost_ledger::{
     CostAccountant, CostBudgetPolicy, CostLedger, PersistentCostLedger,
 };
 use octos_agent::file_state_cache::FileStateCache;
+use octos_agent::task_file_state::TaskFileState;
 use octos_agent::task_supervisor::TaskSupervisor;
 use octos_pipeline::host_context::PipelineHostContext;
 use octos_pipeline::{CodergenHandler, HandlerRegistry};
@@ -68,8 +69,11 @@ async fn host_context_with_cache_and_supervisor() -> (
         Arc::new(PersistentCostLedger::open(ledger_dir.path()).await.unwrap());
     let policy = CostBudgetPolicy::default().with_per_contract_usd(100.0);
     let accountant = Arc::new(CostAccountant::new(ledger, Some(policy)));
+    let task_file_state =
+        TaskFileState::with_ledger_for_local_workspace(ledger_dir.path(), cache.clone()).unwrap();
     let host = PipelineHostContext {
         file_state_cache: Some(cache.clone()),
+        task_file_state: Some(task_file_state),
         subagent_output_router: None,
         subagent_summary_generator: None,
         task_supervisor: Some(supervisor.clone()),
@@ -102,6 +106,10 @@ async fn pipeline_worker_handler_carries_file_state_cache_from_host() {
     assert!(
         observed.file_state_cache.is_some(),
         "CodergenHandler must propagate FileStateCache from host context"
+    );
+    assert!(
+        observed.task_file_state.is_some(),
+        "CodergenHandler must propagate complete task file state from host context"
     );
     assert_eq!(
         observed.parent_tool_call_id.as_deref(),

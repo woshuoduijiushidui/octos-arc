@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use octos_agent::{
     Agent, AgentConfig, FileStateCache, HookConfig, HookEvent, HookExecutor, ModelReadReceiptStore,
     PromptContextManager, PromptContextReport, PromptContextRequest, ReadFileTool,
-    ReadReceiptOwner, Tool, ToolRegistry, tools::ToolContext,
+    ReadReceiptOwner, TaskFileState, Tool, ToolRegistry, tools::ToolContext,
 };
 use octos_core::{AgentId, Message, MessageRole, ToolCall};
 use octos_llm::{
@@ -266,6 +266,80 @@ async fn successful_provider_dispatch_enables_next_matching_read_stub() {
         scripted.requests.lock().unwrap()[1]
             .iter()
             .any(|message| message.role == MessageRole::Tool && message.content.contains("alpha"))
+    );
+}
+
+#[tokio::test]
+async fn rebuilt_agent_reuses_same_branch_receipt_when_source_remains_visible() {
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("notes.txt"), "alpha\nbeta\n").unwrap();
+    let file_state = TaskFileState::for_local_workspace(workspace.path())
+        .unwrap()
+        .for_branch("task", "session", "root")
+        .unwrap();
+    let memory = Arc::new(
+        EpisodeStore::open(workspace.path().join(".octos"))
+            .await
+            .unwrap(),
+    );
+
+    let mut first_tools = ToolRegistry::new();
+    first_tools.register(ReadFileTool::new(workspace.path()));
+    let first_provider: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider::new(vec![
+        tool_use(vec![tool_call(
+            "call_1",
+            serde_json::json!({"path": "notes.txt"}),
+        )]),
+        end_turn(),
+    ]));
+    let first_agent = Agent::new(
+        AgentId::new("h02-m5-turn-1"),
+        first_provider,
+        first_tools,
+        memory.clone(),
+    )
+    .with_config(AgentConfig {
+        save_episodes: false,
+        ..Default::default()
+    })
+    .with_file_state(file_state.clone());
+    let first = first_agent
+        .process_message("read once", &[], vec![])
+        .await
+        .unwrap();
+    assert!(tool_outputs(&first)[0].contains("alpha"));
+    assert_eq!(file_state.receipts().active_len(), 1);
+
+    let mut second_tools = ToolRegistry::new();
+    second_tools.register(ReadFileTool::new(workspace.path()));
+    let second_provider: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider::new(vec![
+        tool_use(vec![tool_call(
+            "call_2",
+            serde_json::json!({"path": "notes.txt"}),
+        )]),
+        end_turn(),
+    ]));
+    let second_agent = Agent::new(
+        AgentId::new("h02-m5-turn-2"),
+        second_provider,
+        second_tools,
+        memory,
+    )
+    .with_config(AgentConfig {
+        save_episodes: false,
+        ..Default::default()
+    })
+    .with_file_state(file_state);
+    let second = second_agent
+        .process_message("read again", &first.messages, vec![])
+        .await
+        .unwrap();
+
+    assert!(
+        tool_outputs(&second)
+            .last()
+            .expect("second read output")
+            .starts_with("[FILE_UNCHANGED]")
     );
 }
 

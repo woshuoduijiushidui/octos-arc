@@ -43,6 +43,7 @@ use crate::model_read_receipts::ModelReadReceiptStore;
 use crate::progress::{ProgressReporter, SilentReporter};
 use crate::prompt_context::PromptContextManager;
 use crate::session::{SessionLimits, SessionUsage};
+use crate::task_file_state::ModelBranchFileState;
 use crate::tools::ToolRegistry;
 use verifier::AgentVerifierConfig;
 
@@ -439,6 +440,9 @@ pub struct Agent {
     pub(super) file_state_cache: Option<Arc<FileStateCache>>,
     /// Branch-local proof that this model received exact `read_file` output.
     pub(super) model_read_receipts: Option<Arc<ModelReadReceiptStore>>,
+    /// Complete task/branch file state. Kept explicitly so child builders can
+    /// share only the ledger and mint their own receipt store.
+    pub(super) task_file_state: Option<ModelBranchFileState>,
     /// M8.3 profile envelope applied at bootstrap. Recorded so callers can
     /// introspect the active profile name, compaction overrides, and model
     /// preferences. `None` means no profile was explicitly applied — the
@@ -657,6 +661,7 @@ impl Agent {
             agent_definitions: Arc::new(crate::agents::AgentDefinitions::new()),
             file_state_cache: None,
             model_read_receipts: None,
+            task_file_state: None,
             profile: None,
             tiered_compaction: None,
             append_only_audit: Default::default(),
@@ -745,6 +750,7 @@ impl Agent {
             agent_definitions: Arc::new(crate::agents::AgentDefinitions::new()),
             file_state_cache: None,
             model_read_receipts: None,
+            task_file_state: None,
             profile: None,
             tiered_compaction: None,
             append_only_audit: Default::default(),
@@ -983,6 +989,8 @@ impl Agent {
     /// alone never suppresses content; a separate receipt store is required.
     pub fn with_file_state_cache(mut self, cache: Arc<FileStateCache>) -> Self {
         self.file_state_cache = Some(cache);
+        self.model_read_receipts = None;
+        self.task_file_state = None;
         self
     }
 
@@ -991,10 +999,29 @@ impl Agent {
         self.file_state_cache.as_ref()
     }
 
+    /// Attach a complete task-local ledger and branch-local receipt store.
+    pub fn with_file_state(mut self, state: ModelBranchFileState) -> Self {
+        self.file_state_cache = Some(state.ledger().clone());
+        self.model_read_receipts = Some(state.receipts().clone());
+        self.task_file_state = Some(state);
+        self
+    }
+
+    /// Access the complete file state when the agent was wired atomically.
+    pub fn file_state(&self) -> Option<&ModelBranchFileState> {
+        self.task_file_state.as_ref()
+    }
+
     /// Attach model-visible read state owned by this model branch.
     pub fn with_model_read_receipts(mut self, receipts: Arc<ModelReadReceiptStore>) -> Self {
         self.model_read_receipts = Some(receipts);
+        self.task_file_state = None;
         self
+    }
+
+    /// Access the branch-local receipt store, if configured.
+    pub fn model_read_receipts(&self) -> Option<&Arc<ModelReadReceiptStore>> {
+        self.model_read_receipts.as_ref()
     }
 
     /// Wire an M8.7 [`crate::subagent_output::SubAgentOutputRouter`] so the

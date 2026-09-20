@@ -36,6 +36,60 @@ fn frame_subagent_task_leads_with_identity_and_directive() {
 }
 
 #[test]
+fn child_workers_share_ledger_but_mint_independent_receipts() {
+    let workspace = tempfile::tempdir().unwrap();
+    let task_state = crate::TaskFileState::for_local_workspace(workspace.path()).unwrap();
+    let parent = task_state
+        .for_branch("parent-task", "parent-session", "root")
+        .unwrap();
+    let worker_a = AgentId::new("subagent-0");
+    let worker_b = AgentId::new("subagent-1");
+
+    let child_a = child_file_state(
+        parent.task_state(),
+        workspace.path(),
+        Some("child-task-a"),
+        Some("child-session-a"),
+        Some("parent-session"),
+        &worker_a,
+    )
+    .unwrap();
+    let child_b = child_file_state(
+        parent.task_state(),
+        workspace.path(),
+        Some("child-task-b"),
+        Some("child-session-b"),
+        Some("parent-session"),
+        &worker_b,
+    )
+    .unwrap();
+
+    assert!(Arc::ptr_eq(parent.ledger(), child_a.ledger()));
+    assert!(Arc::ptr_eq(child_a.ledger(), child_b.ledger()));
+    assert!(!Arc::ptr_eq(parent.receipts(), child_a.receipts()));
+    assert!(!Arc::ptr_eq(child_a.receipts(), child_b.receipts()));
+    assert_ne!(child_a.receipts().owner(), child_b.receipts().owner());
+}
+
+#[test]
+fn child_without_a_session_owner_gets_no_receipt_store() {
+    let workspace = tempfile::tempdir().unwrap();
+    let task_state = crate::TaskFileState::for_local_workspace(workspace.path()).unwrap();
+
+    assert!(
+        child_file_state(
+            &task_state,
+            workspace.path(),
+            None,
+            None,
+            None,
+            &AgentId::new("subagent-0"),
+        )
+        .is_none()
+    );
+}
+
+#[test]
 fn role_task_warning_fires_for_readonly_role_with_clone_and_write_task() {
     // The mini4 reviewer case: read-only allow-list + "clone and write".
     let reviewer = [
@@ -379,7 +433,7 @@ async fn test_spawn_returns_immediately() {
         mcp_agent_backend: None,
         mcp_agent_tool_name: None,
         cost_accountant: None,
-        parent_file_state_cache: None,
+        parent_file_state: None,
         parent_subagent_output_router: None,
         child_stream_callback: None,
         parent_subagent_summary_generator: None,

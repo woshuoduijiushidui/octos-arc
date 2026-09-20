@@ -489,6 +489,10 @@ impl Agent {
             agent_definitions: self.agent_definitions.clone(),
             file_state_cache: self.file_state_cache.clone(),
             model_read_receipts: self.model_read_receipts.clone(),
+            task_file_state: self
+                .task_file_state
+                .as_ref()
+                .map(|state| state.task_state().clone()),
             permissions: self
                 .profile
                 .as_deref()
@@ -638,6 +642,10 @@ impl Agent {
         let agent_definitions = self.agent_definitions.clone();
         let file_state_cache = self.file_state_cache.clone();
         let model_read_receipts = self.model_read_receipts.clone();
+        let task_file_state = self
+            .task_file_state
+            .as_ref()
+            .map(|state| state.task_state().clone());
         // M8 fix-first item 8 (gap 4b): if the agent carries a resolved
         // profile envelope, derive a ToolPermissions record once per turn
         // and clone it into every ToolContext. Today's pre-M8 default
@@ -1005,6 +1013,7 @@ impl Agent {
                 // does not silently zero them out.
                 let bg_agent_definitions = agent_definitions.clone();
                 let bg_file_state_cache = file_state_cache.clone();
+                let bg_task_file_state = task_file_state.clone();
                 let bg_permissions = permissions.clone();
                 // M8.7 (item 4): clone the optional router/generator so
                 // the background branch can mark_terminal on completion
@@ -1097,6 +1106,7 @@ impl Agent {
                         file_attachment_paths: bg_attachment_ctx.file_attachment_paths.clone(),
                         agent_definitions: bg_agent_definitions.clone(),
                         file_state_cache: bg_file_state_cache.clone(),
+                        task_file_state: bg_task_file_state.clone(),
                         // M8 fix-first item 8 (gap 4b): carry the
                         // profile-derived permissions so spawn_only
                         // background tools see the same gate the
@@ -2108,6 +2118,7 @@ impl Agent {
                 agent_definitions: agent_definitions.clone(),
                 file_state_cache: file_state_cache.clone(),
                 model_read_receipts: model_read_receipts.clone(),
+                task_file_state: task_file_state.clone(),
                 // M8 fix-first item 8 (gap 4b): consult the profile
                 // envelope so deny-list profiles actually block tools at
                 // the call boundary (read_file already checks

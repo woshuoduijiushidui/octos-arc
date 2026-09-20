@@ -3265,6 +3265,14 @@ impl ActorFactory {
                 "failed to create per-user workspace: {e}, falling back to shared cwd"
             );
         }
+        let task_file_state = octos_agent::TaskFileState::with_ledger_for_local_workspace(
+            &user_workspace,
+            file_state_cache.clone(),
+        )
+        .ok()
+        .and_then(|task_state| {
+            task_state.for_branch(session_key.to_string(), session_key.to_string(), "root")
+        });
         let (initial_context_manager, context_ledger_status) = load_or_rebuild_context_manager(
             &self.data_dir,
             session_key.to_string(),
@@ -3580,9 +3588,11 @@ impl ActorFactory {
         // Without these the spawned child Agent observes
         // `file_state_cache: None` and `subagent_output_router: None`
         // and the post-M8.4 / M8.7 contracts are silently bypassed.
-        .with_parent_file_state_cache(file_state_cache.clone())
         .with_parent_subagent_output_router(self.subagent_output_router.clone())
         .with_parent_subagent_summary_generator(subagent_summary_generator_for_spawn);
+        if let Some(file_state) = task_file_state.as_ref() {
+            spawn_tool = spawn_tool.with_parent_file_state(file_state.task_state().clone());
+        }
         if let Some(ref prompt) = self.worker_prompt {
             spawn_tool = spawn_tool.with_worker_prompt(prompt.clone());
         }
@@ -3967,14 +3977,14 @@ impl ActorFactory {
             .with_shutdown(cancelled.clone())
             .with_prompt_context_manager(prompt_context_bridge)
             .with_system_prompt(system_prompt)
-            // Wire the empty task-local version ledger. Stable reads populate
-            // it from the current workspace; resume history cannot seed it.
-            .with_file_state_cache(file_state_cache.clone())
             // M8 fix-first item 8 (gap 2): wire the M8.7 disk router and
             // periodic summary generator so spawn_only background tasks
             // surface output and status to dashboards.
             .with_subagent_output_router(self.subagent_output_router.clone())
             .with_subagent_summary_generator(subagent_summary_generator);
+        if let Some(file_state) = task_file_state {
+            agent = agent.with_file_state(file_state);
+        }
         if let Some(scope) = session_scope_arc.clone() {
             agent = agent.with_session_scope(scope);
         }

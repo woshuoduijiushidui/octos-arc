@@ -58,7 +58,7 @@ use octos_agent::validators::{
 };
 use octos_agent::{
     Agent, AgentConfig, ApprovalPolicy, EffectivePermissions, HarnessEvent, SandboxConfig,
-    SandboxMode, ToolPolicy, ToolRegistry, create_sandbox,
+    SandboxMode, TaskFileState, ToolPolicy, ToolRegistry, create_sandbox,
 };
 use octos_core::{AgentId, Task, TaskContext, TaskKind};
 use octos_llm::LlmProvider;
@@ -603,6 +603,25 @@ impl McpSessionDispatch for RealSessionDispatch {
             memory,
         )
         .with_config(agent_config);
+        let invocation_id = format!("mcp-{}", uuid::Uuid::now_v7());
+        match TaskFileState::for_local_workspace(&self.config.cwd).and_then(|task_state| {
+            task_state
+                .for_branch(&invocation_id, &invocation_id, "root")
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "incomplete MCP file-state owner",
+                    )
+                })
+        }) {
+            Ok(file_state) => agent = agent.with_file_state(file_state),
+            Err(error) => tracing::warn!(
+                invocation = %invocation_id,
+                workspace = %self.config.cwd.display(),
+                error = %error,
+                "MCP file state initialization failed; read deduplication remains disabled",
+            ),
+        }
         if let Some(request) = &arc_request {
             agent = agent.with_system_prompt(request.task.system_prompt.clone());
         }

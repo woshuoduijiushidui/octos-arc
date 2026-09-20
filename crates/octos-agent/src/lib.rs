@@ -61,6 +61,7 @@ mod subprocess_env;
 pub use subprocess_env::{register_secret_env_names, sanitize_default_subprocess_env};
 pub mod summarizer;
 pub mod swarm;
+pub mod task_file_state;
 pub mod task_supervisor;
 pub mod tools;
 pub mod turn;
@@ -200,6 +201,7 @@ pub use swarm::{
     FileMailbox, InProcessMailbox, MAILBOX_SCHEMA_VERSION, MailboxBackend, MailboxEnvelope,
     MailboxMessage, MailboxRecovery,
 };
+pub use task_file_state::{ModelBranchFileState, TaskFileState};
 pub use task_supervisor::{
     BackgroundTask, RegisterTaskError, RelaunchOpts, RelaunchRequest, SpawnOnlyFailureSignal,
     TaskCancelError, TaskCancelToken, TaskLifecycleState, TaskLivenessLease, TaskRelaunchError,

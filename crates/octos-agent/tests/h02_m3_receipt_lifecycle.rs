@@ -287,8 +287,8 @@ async fn task_session_branch_and_workspace_stores_do_not_share_receipts() {
         workspace_a.path(),
         restored_provider,
         restored_receipts.clone(),
-        shared_ledger,
-        memory,
+        shared_ledger.clone(),
+        memory.clone(),
     )
     .await;
     let response = restored
@@ -299,4 +299,49 @@ async fn task_session_branch_and_workspace_stores_do_not_share_receipts() {
     assert!(last_tool_output(&response).contains("same body"));
     assert!(!last_tool_output(&response).contains("[FILE_UNCHANGED]"));
     assert_eq!(restored_receipts.active_len(), 1);
+
+    let child_first_receipts = store(
+        workspace_a.path(),
+        "task-child-first",
+        "session-child-first",
+        "child",
+    );
+    let child_first = agent(
+        workspace_a.path(),
+        Arc::new(ScriptedProvider {
+            responses: Mutex::new(vec![tool_use("call_child_first"), end_turn()]),
+        }),
+        child_first_receipts,
+        shared_ledger.clone(),
+        memory.clone(),
+    )
+    .await;
+    child_first
+        .process_message("child reads first", &[], vec![])
+        .await
+        .unwrap();
+
+    let fresh_parent_receipts = store(
+        workspace_a.path(),
+        "task-parent-after-child",
+        "session-parent-after-child",
+        "parent",
+    );
+    let fresh_parent = agent(
+        workspace_a.path(),
+        Arc::new(ScriptedProvider {
+            responses: Mutex::new(vec![tool_use("call_parent_after_child"), end_turn()]),
+        }),
+        fresh_parent_receipts,
+        shared_ledger,
+        memory,
+    )
+    .await;
+    let response = fresh_parent
+        .process_message("parent reads after child", &[], vec![])
+        .await
+        .unwrap();
+
+    assert!(last_tool_output(&response).contains("same body"));
+    assert!(!last_tool_output(&response).contains("[FILE_UNCHANGED]"));
 }

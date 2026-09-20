@@ -1,7 +1,7 @@
 //! Handler trait and built-in handler implementations.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -23,6 +23,21 @@ use crate::graph::{HandlerKind, NodeOutcome, OutcomeStatus, PipelineNode};
 
 const DEFAULT_PIPELINE_MAX_OUTPUT_TOKENS: u32 = 4096;
 const PIPELINE_INPUT_COMPACTION_RESERVE_TOKENS: u32 = 1024;
+
+fn pipeline_worker_file_state(
+    parent: &octos_agent::TaskFileState,
+    workspace: &Path,
+    parent_session_key: Option<&str>,
+    node_id: &str,
+    worker_id: &AgentId,
+) -> Option<octos_agent::ModelBranchFileState> {
+    let session_key = parent_session_key?;
+    parent.for_workspace(workspace).ok()?.for_branch(
+        format!("pipeline:{node_id}:{worker_id}"),
+        session_key,
+        worker_id.to_string(),
+    )
+}
 
 /// Cached snapshot of plugin tools loaded from `plugin_dirs`.
 ///
@@ -895,7 +910,21 @@ impl Handler for CodergenHandler {
         // periodic LLM digests for any background task the worker
         // triggers. Each handle is optional so legacy callers (no host
         // context) keep their pre-M8 behaviour bitwise identical.
-        if let Some(cache) = self.host_context.file_state_cache.clone() {
+        if let Some(task_state) = self.host_context.task_file_state.as_ref() {
+            worker = worker.with_file_state_cache(task_state.ledger().clone());
+            let branch_state = pipeline_worker_file_state(
+                task_state,
+                &self.working_dir,
+                self.host_context.parent_session_key.as_deref(),
+                &node.id,
+                &worker_id,
+            );
+            if let Some(branch_state) = branch_state {
+                worker = worker.with_file_state(branch_state);
+            }
+        } else if let Some(cache) = self.host_context.file_state_cache.clone() {
+            // Legacy callers may still provide only the disk-version ledger.
+            // That is intentionally insufficient to authorize read stubs.
             worker = worker.with_file_state_cache(cache);
         }
         if let Some(router) = self.host_context.subagent_output_router.clone() {
@@ -2136,5 +2165,51 @@ mod tests {
         assert!(compacted.ends_with(":TAIL"));
         assert!(compacted.contains("pipeline input compacted"));
         assert!(compacted.len() < input.len());
+    }
+
+    #[test]
+    fn pipeline_workers_mint_independent_branch_receipts() {
+        let workspace = tempfile::tempdir().unwrap();
+        let task_state = octos_agent::TaskFileState::for_local_workspace(workspace.path()).unwrap();
+        let worker_a = AgentId::new("pipeline-analyze-1");
+        let worker_b = AgentId::new("pipeline-analyze-2");
+
+        let state_a = pipeline_worker_file_state(
+            &task_state,
+            workspace.path(),
+            Some("session"),
+            "analyze",
+            &worker_a,
+        )
+        .unwrap();
+        let state_b = pipeline_worker_file_state(
+            &task_state,
+            workspace.path(),
+            Some("session"),
+            "analyze",
+            &worker_b,
+        )
+        .unwrap();
+
+        assert!(Arc::ptr_eq(state_a.ledger(), state_b.ledger()));
+        assert!(!Arc::ptr_eq(state_a.receipts(), state_b.receipts()));
+        assert_ne!(state_a.receipts().owner(), state_b.receipts().owner());
+    }
+
+    #[test]
+    fn pipeline_worker_without_session_owner_has_no_receipts() {
+        let workspace = tempfile::tempdir().unwrap();
+        let task_state = octos_agent::TaskFileState::for_local_workspace(workspace.path()).unwrap();
+
+        assert!(
+            pipeline_worker_file_state(
+                &task_state,
+                workspace.path(),
+                None,
+                "analyze",
+                &AgentId::new("pipeline-analyze-1"),
+            )
+            .is_none()
+        );
     }
 }

@@ -23,6 +23,7 @@ use octos_agent::cost_ledger::CostAccountant;
 use octos_agent::file_state_cache::FileStateCache;
 use octos_agent::subagent_output::SubAgentOutputRouter;
 use octos_agent::subagent_summary::AgentSummaryGenerator;
+use octos_agent::task_file_state::TaskFileState;
 use octos_agent::task_supervisor::TaskSupervisor;
 use octos_agent::tools::ToolContext;
 use octos_core::SessionScope;
@@ -35,6 +36,9 @@ pub struct PipelineHostContext {
     /// Parent task's [`FileStateCache`]. Pipeline nodes share disk versions;
     /// model-visible read receipts remain separate state.
     pub file_state_cache: Option<Arc<FileStateCache>>,
+    /// Complete parent task state. Each pipeline node mints a fresh branch
+    /// receipt store from this carrier when its worker is created.
+    pub task_file_state: Option<TaskFileState>,
     /// Parent session's [`SubAgentOutputRouter`]. Threaded onto every
     /// pipeline node worker so background output is routed through the
     /// shared on-disk router, not a per-node copy.
@@ -77,6 +81,7 @@ impl PipelineHostContext {
     pub fn from_tool_context(ctx: &ToolContext) -> Self {
         Self {
             file_state_cache: ctx.file_state_cache.clone(),
+            task_file_state: ctx.task_file_state.clone(),
             subagent_output_router: ctx.subagent_output_router.clone(),
             subagent_summary_generator: ctx.subagent_summary_generator.clone(),
             task_supervisor: ctx.task_supervisor.clone(),
@@ -96,6 +101,7 @@ impl PipelineHostContext {
     /// pre-M8 path.
     pub fn is_empty(&self) -> bool {
         self.file_state_cache.is_none()
+            && self.task_file_state.is_none()
             && self.subagent_output_router.is_none()
             && self.subagent_summary_generator.is_none()
             && self.task_supervisor.is_none()
@@ -110,6 +116,7 @@ impl std::fmt::Debug for PipelineHostContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PipelineHostContext")
             .field("file_state_cache", &self.file_state_cache.is_some())
+            .field("task_file_state", &self.task_file_state.is_some())
             .field(
                 "subagent_output_router",
                 &self.subagent_output_router.is_some(),
@@ -159,6 +166,20 @@ mod tests {
         tool_ctx.file_state_cache = Some(Arc::new(FileStateCache::new()));
         let host = PipelineHostContext::from_tool_context(&tool_ctx);
         assert!(host.file_state_cache.is_some());
+        assert!(!host.is_empty());
+    }
+
+    #[test]
+    fn from_tool_context_picks_up_complete_task_file_state() {
+        let workspace = tempfile::tempdir().unwrap();
+        let state = TaskFileState::for_local_workspace(workspace.path()).unwrap();
+        let mut tool_ctx = ToolContext::zero();
+        tool_ctx.file_state_cache = Some(state.ledger().clone());
+        tool_ctx.task_file_state = Some(state);
+
+        let host = PipelineHostContext::from_tool_context(&tool_ctx);
+
+        assert!(host.task_file_state.is_some());
         assert!(!host.is_empty());
     }
 
