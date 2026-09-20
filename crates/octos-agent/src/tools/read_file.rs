@@ -1,6 +1,7 @@
 //! Read file tool.
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use eyre::Result;
@@ -9,10 +10,211 @@ use serde::Deserialize;
 use super::{Tool, ToolContext, ToolResult};
 #[cfg(test)]
 use crate::file_state_cache::FileStateCache;
-use crate::model_read_receipts::FileView;
+use crate::file_state_cache::{FileTarget, FileVersion};
+use crate::model_read_receipts::{FileView, ModelReadReceipt, ReadReceiptMissReason};
 use crate::policy::FilesystemScope;
 
 const MAX_FILE_BYTES: u64 = 10_000_000;
+/// Set to `0`, `false`, or `off` to return file bodies without disabling
+/// version tracking and mutation freshness checks.
+pub const FILE_READ_DEDUP_ENV: &str = "OCTOS_FILE_READ_DEDUP";
+
+fn dedup_enabled_from_value(value: Option<&str>) -> bool {
+    !value.is_some_and(|value| {
+        let value = value.trim();
+        value == "0" || value.eq_ignore_ascii_case("false") || value.eq_ignore_ascii_case("off")
+    })
+}
+
+fn file_read_dedup_enabled() -> bool {
+    dedup_enabled_from_value(std::env::var(FILE_READ_DEDUP_ENV).ok().as_deref())
+}
+
+struct ReadObservation {
+    reason: &'static str,
+    view_kind: &'static str,
+    source_bytes: usize,
+    version: Option<FileVersion>,
+    receipt: Option<ModelReadReceipt>,
+}
+
+impl ReadObservation {
+    fn new(args: &serde_json::Value) -> Self {
+        let view_kind = if args.get("byte_offset").is_some() || args.get("byte_limit").is_some() {
+            "bytes"
+        } else if args.get("start_line").is_some()
+            || args.get("offset").is_some()
+            || args.get("end_line").is_some()
+            || args.get("limit").is_some()
+        {
+            "lines"
+        } else {
+            "full"
+        };
+        Self {
+            reason: "invalid_request",
+            view_kind,
+            source_bytes: 0,
+            version: None,
+            receipt: None,
+        }
+    }
+
+    fn observe_version(&mut self, meta: &super::ReadMeta) {
+        if let Some(version) = meta.file_version.as_ref() {
+            self.source_bytes = version.size() as usize;
+            self.version = Some(version.clone());
+        }
+    }
+
+    fn miss(&mut self, reason: ReadReceiptMissReason) {
+        self.reason = reason.as_str();
+    }
+
+    fn hit(&mut self, receipt: ModelReadReceipt) {
+        self.reason = "receipt_match";
+        self.receipt = Some(receipt);
+    }
+
+    fn record(&self, ctx: &ToolContext, result: Option<&ToolResult>, elapsed: Duration) {
+        let outcome = match result {
+            Some(result) if !result.success => "error",
+            Some(_) if self.receipt.is_some() => "file_unchanged",
+            Some(_) => "full_body",
+            None => "error",
+        };
+        let response_bytes = result.map(|result| result.output.len()).unwrap_or_default();
+
+        metrics::counter!(
+            "octos_file_read_results_total",
+            "outcome" => outcome.to_string(),
+            "reason" => self.reason.to_string(),
+            "view" => self.view_kind.to_string(),
+        )
+        .increment(1);
+        metrics::histogram!(
+            "octos_file_read_response_bytes",
+            "outcome" => outcome.to_string(),
+        )
+        .record(response_bytes as f64);
+        metrics::histogram!(
+            "octos_file_read_source_bytes",
+            "outcome" => outcome.to_string(),
+        )
+        .record(self.source_bytes as f64);
+        metrics::histogram!("octos_file_read_duration_seconds").record(elapsed.as_secs_f64());
+        if outcome == "full_body"
+            && matches!(
+                self.reason,
+                "source_not_visible"
+                    | "source_truncated"
+                    | "projection_changed"
+                    | "lifecycle_cleared"
+            )
+        {
+            metrics::counter!(
+                "octos_file_read_visibility_rereads_total",
+                "reason" => self.reason.to_string(),
+            )
+            .increment(1);
+        }
+        if !tracing::enabled!(target: "octos::file_read", tracing::Level::DEBUG) {
+            return;
+        }
+
+        let owner = ctx
+            .model_read_receipts
+            .as_ref()
+            .and_then(|receipts| receipts.owner());
+        let owner_workspace = owner
+            .map(|owner| short_id(owner.workspace_id()))
+            .unwrap_or_else(|| "none".to_string());
+        let owner_task = owner
+            .map(|owner| short_id(owner.task_id()))
+            .unwrap_or_else(|| "none".to_string());
+        let owner_session = owner
+            .map(|owner| short_id(owner.logical_session_id()))
+            .unwrap_or_else(|| "none".to_string());
+        let owner_branch = owner
+            .map(|owner| short_id(owner.model_branch_id()))
+            .unwrap_or_else(|| "none".to_string());
+        let target = self
+            .version
+            .as_ref()
+            .map(|version| short_target_id(version.target()))
+            .unwrap_or_else(|| "none".to_string());
+        let version = self
+            .version
+            .as_ref()
+            .map(|version| short_digest(version.content_sha256()))
+            .unwrap_or_else(|| "none".to_string());
+        let source = self
+            .receipt
+            .as_ref()
+            .map(ModelReadReceipt::candidate_id)
+            .unwrap_or("none");
+        let source_occurrence = self
+            .receipt
+            .as_ref()
+            .map(ModelReadReceipt::source_occurrence)
+            .unwrap_or_default();
+        let projection_policy = self
+            .receipt
+            .as_ref()
+            .map(ModelReadReceipt::projection_policy_id)
+            .unwrap_or("none");
+        let receipt_generation = self
+            .receipt
+            .as_ref()
+            .map(ModelReadReceipt::context_generation)
+            .unwrap_or_default();
+        let receipt_age_ms = self
+            .receipt
+            .as_ref()
+            .map(ModelReadReceipt::age_millis)
+            .unwrap_or_default();
+        tracing::debug!(
+            target: "octos::file_read",
+            outcome,
+            reason = self.reason,
+            view = self.view_kind,
+            source_bytes = self.source_bytes,
+            response_bytes,
+            elapsed_ms = elapsed.as_millis() as u64,
+            owner_workspace,
+            owner_task,
+            owner_session,
+            owner_branch,
+            target_id = target,
+            version,
+            source,
+            source_occurrence,
+            projection_policy,
+            receipt_generation,
+            receipt_age_ms,
+            "read_file observation",
+        );
+    }
+}
+
+fn short_id(value: &str) -> String {
+    short_digest(&FileVersion::sha256(value.as_bytes()))
+}
+
+fn short_target_id(target: &FileTarget) -> String {
+    short_digest(&FileVersion::sha256(
+        target.target_key().as_os_str().as_encoded_bytes(),
+    ))
+}
+
+fn short_digest(digest: &str) -> String {
+    digest
+        .strip_prefix("sha256:")
+        .unwrap_or(digest)
+        .chars()
+        .take(12)
+        .collect()
+}
 
 /// Tool for reading file contents.
 pub struct ReadFileTool {
@@ -25,6 +227,8 @@ pub struct ReadFileTool {
     /// changes output, so tests must not arm process-globally (see
     /// `read_window::armed_from_env`).
     window_enforcement: Option<bool>,
+    /// Per-instance test override for the read dedup kill switch.
+    deduplication: Option<bool>,
 }
 
 impl ReadFileTool {
@@ -34,6 +238,7 @@ impl ReadFileTool {
             base_dir: base_dir.into(),
             filesystem_scope: FilesystemScope::Workspace,
             window_enforcement: None,
+            deduplication: None,
         }
     }
 
@@ -57,6 +262,16 @@ impl ReadFileTool {
     fn window_armed(&self) -> bool {
         self.window_enforcement
             .unwrap_or_else(super::read_window::armed_from_env)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_deduplication(mut self, enabled: bool) -> Self {
+        self.deduplication = Some(enabled);
+        self
+    }
+
+    fn dedup_enabled(&self) -> bool {
+        self.deduplication.unwrap_or_else(file_read_dedup_enabled)
     }
 }
 
@@ -234,7 +449,15 @@ impl Tool for ReadFileTool {
         ctx: &ToolContext,
         args: &serde_json::Value,
     ) -> Result<ToolResult> {
-        let mut result = self.execute_capped_inner(ctx, args).await?;
+        let started_at = Instant::now();
+        let mut observation = ReadObservation::new(args);
+        let mut result = match self.execute_capped_inner(ctx, args, &mut observation).await {
+            Ok(result) => result,
+            Err(error) => {
+                observation.record(ctx, None, started_at.elapsed());
+                return Err(error);
+            }
+        };
         // #2193 R4: ONE release-enforced cap over every armed return (success
         // and early errors), so no caller-controlled path or message can slip
         // past the loop's blind head/tail cut. Byte-mode also clamps to the
@@ -246,6 +469,7 @@ impl Tool for ReadFileTool {
                 "",
             );
         }
+        observation.record(ctx, Some(&result), started_at.elapsed());
         Ok(result)
     }
 }
@@ -255,6 +479,7 @@ impl ReadFileTool {
         &self,
         ctx: &ToolContext,
         args: &serde_json::Value,
+        observation: &mut ReadObservation,
     ) -> Result<ToolResult> {
         let input: ReadFileInput =
             super::args::parse_tool_args(self.name(), &self.input_schema(), args)?;
@@ -263,6 +488,7 @@ impl ReadFileTool {
         // so the hook is in place before M8.3 wires real allow lists. Today
         // `ToolPermissions::default()` returns allow-all.
         if !ctx.permissions.is_tool_allowed(self.name()) {
+            observation.reason = "permission_denied";
             return Ok(ToolResult {
                 output: "read_file is not permitted in this context".to_string(),
                 success: false,
@@ -276,6 +502,7 @@ impl ReadFileTool {
             match resolve_line_range(input.start_line, input.end_line, input.limit) {
                 Ok(range) => range,
                 Err(message) => {
+                    observation.reason = "invalid_range";
                     return Ok(ToolResult {
                         output: message,
                         success: false,
@@ -288,6 +515,7 @@ impl ReadFileTool {
         // once here so the schema/description gating and the execution gating
         // agree.
         let window_armed = self.window_armed();
+        let dedup_enabled = self.dedup_enabled();
 
         // #1638: raw byte mode is a distinct coordinate system — mixing it
         // with line parameters is ambiguous and rejected, like end_line+limit.
@@ -320,6 +548,7 @@ impl ReadFileTool {
                 None
             };
             if let Some(message) = message {
+                observation.reason = "invalid_range";
                 return Ok(ToolResult {
                     output: message,
                     success: false,
@@ -341,6 +570,7 @@ impl ReadFileTool {
             Some(scope) => match super::resolve_path_for_session_scope_read(scope, &input.path) {
                 Ok(p) => p,
                 Err(reason) => {
+                    observation.reason = "path_rejected";
                     return Ok(ToolResult {
                         output: format!("{reason}: {}", input.path),
                         success: false,
@@ -355,6 +585,7 @@ impl ReadFileTool {
             ) {
                 Ok(p) => p,
                 Err(_) => {
+                    observation.reason = "path_rejected";
                     return Ok(ToolResult {
                         output: format!("Path outside working directory: {}", input.path),
                         success: false,
@@ -368,6 +599,7 @@ impl ReadFileTool {
         // anyway, and reading a multi-GB file just to slice a few lines is wasteful).
         let file_size = match tokio::fs::symlink_metadata(&path).await {
             Ok(meta) if meta.len() > MAX_FILE_BYTES => {
+                observation.reason = "too_large";
                 return Ok(ToolResult {
                     output: format!(
                         "File too large ({} bytes, max {}). Use start_line/end_line on smaller files.",
@@ -401,11 +633,16 @@ impl ReadFileTool {
             .await
             {
                 Ok(cm) => cm,
-                Err(error) => return Ok(stable_read_error(error, &input.path)),
+                Err(error) => {
+                    observation.reason = stable_read_error_reason(&error);
+                    return Ok(stable_read_error(error, &input.path));
+                }
             };
+            observation.observe_version(&read_meta);
             record_file_version(ctx, &read_meta);
             let total = content.len();
             if requested_offset >= total {
+                observation.reason = "out_of_range";
                 return Ok(ToolResult {
                     output: format!(
                         "byte_offset {requested_offset} is beyond the end of file ({total} bytes)"
@@ -439,8 +676,12 @@ impl ReadFileTool {
                 start: start_b as u64,
                 end: end_b as u64,
             };
-            if let Some(result) = unchanged_result(ctx, &read_meta, &view) {
-                return Ok(result);
+            match unchanged_result(ctx, &read_meta, &view, dedup_enabled) {
+                Ok((result, receipt)) => {
+                    observation.hit(receipt);
+                    return Ok(result);
+                }
+                Err(reason) => observation.miss(reason),
             }
             let mut output = content[start_b..end_b].to_string();
             if end_b < total {
@@ -468,7 +709,15 @@ impl ReadFileTool {
                 tainted,
                 read_meta.transformed,
             );
-            stage_read_candidate(ctx, args, &read_meta, view.clone(), view, &output);
+            stage_read_candidate(
+                ctx,
+                args,
+                &read_meta,
+                view.clone(),
+                view,
+                &output,
+                dedup_enabled,
+            );
             return Ok(ToolResult {
                 output,
                 success: true,
@@ -486,6 +735,7 @@ impl ReadFileTool {
         if start_line.is_none() && end_line.is_none() && !window_armed {
             let budget = octos_core::tool_output_limit("read_file");
             if file_size > budget {
+                observation.reason = "too_large";
                 return Ok(ToolResult {
                     output: format!(
                         "{} is {} bytes — larger than the ~{}-byte tool-output budget, so an \
@@ -506,8 +756,12 @@ impl ReadFileTool {
         let (content, read_meta) =
             match super::read_no_follow_with_meta(&path, workspace_root, MAX_FILE_BYTES).await {
                 Ok(observation) => observation,
-                Err(error) => return Ok(stable_read_error(error, &input.path)),
+                Err(error) => {
+                    observation.reason = stable_read_error_reason(&error);
+                    return Ok(stable_read_error(error, &input.path));
+                }
             };
+        observation.observe_version(&read_meta);
         record_file_version(ctx, &read_meta);
 
         let lines: Vec<&str> = content.lines().collect();
@@ -537,6 +791,7 @@ impl ReadFileTool {
         let end = end_line.unwrap_or(total_lines).min(total_lines);
 
         if start >= total_lines {
+            observation.reason = "out_of_range";
             return Ok(ToolResult {
                 output: format!(
                     "Start line {} is beyond file length ({} lines)",
@@ -554,6 +809,7 @@ impl ReadFileTool {
         // taking its in-process sub-agents down with it (mini5 soak). Return a
         // clear, recoverable error instead of slicing.
         if start >= end {
+            observation.reason = "invalid_range";
             return Ok(ToolResult {
                 output: format!(
                     "Invalid line range: start_line {} is past end_line {}",
@@ -614,6 +870,7 @@ impl ReadFileTool {
                         ));
                     }
                     advice.push(']');
+                    observation.reason = ReadReceiptMissReason::SourceTruncated.as_str();
                     // R5: real runtime clamp (release builds drop
                     // debug_assert). The advice interpolates no unbounded
                     // caller input, so it is already short; the clamp is the
@@ -694,10 +951,16 @@ impl ReadFileTool {
                 end: included_end as u64,
             }
         };
-        if !tool_output_truncated
-            && let Some(result) = unchanged_result(ctx, &read_meta, &requested_view)
-        {
-            return Ok(result);
+        if tool_output_truncated {
+            observation.reason = ReadReceiptMissReason::SourceTruncated.as_str();
+        } else {
+            match unchanged_result(ctx, &read_meta, &requested_view, dedup_enabled) {
+                Ok((result, receipt)) => {
+                    observation.hit(receipt);
+                    return Ok(result);
+                }
+                Err(reason) => observation.miss(reason),
+            }
         }
 
         // #1638 (c): feed the view ledger that backs write_file's fail-closed
@@ -737,6 +1000,7 @@ impl ReadFileTool {
                 requested_view,
                 returned_view,
                 &output,
+                dedup_enabled,
             );
         }
 
@@ -787,26 +1051,41 @@ fn unchanged_result(
     ctx: &ToolContext,
     read_meta: &super::ReadMeta,
     requested_view: &FileView,
-) -> Option<ToolResult> {
-    ctx.file_state_cache.as_ref()?;
-    let receipts = ctx.model_read_receipts.as_ref()?;
-    let version = read_meta.file_version.as_ref()?;
-    let receipt = receipts.receipt_for(version, requested_view)?;
+    dedup_enabled: bool,
+) -> Result<(ToolResult, ModelReadReceipt), ReadReceiptMissReason> {
+    if !dedup_enabled {
+        return Err(ReadReceiptMissReason::FeatureDisabled);
+    }
+    ctx.file_state_cache
+        .as_ref()
+        .ok_or(ReadReceiptMissReason::MissingState)?;
+    let receipts = ctx
+        .model_read_receipts
+        .as_ref()
+        .ok_or(ReadReceiptMissReason::MissingState)?;
+    let version = read_meta
+        .file_version
+        .as_ref()
+        .ok_or(ReadReceiptMissReason::MissingState)?;
+    let receipt = receipts.lookup_receipt(version, requested_view)?;
     let digest = version.content_sha256();
     let display_version = digest.get(..23).unwrap_or(digest);
-    Some(ToolResult {
-        output: format!(
-            "[FILE_UNCHANGED] target={} version={} view={} source={}#{}. \
-             Reuse the prior visible read_file result.",
-            version.target().target_key().display(),
-            display_version,
-            receipt.model_visible_view(),
-            receipt.candidate_id(),
-            receipt.source_occurrence(),
-        ),
-        success: true,
-        ..Default::default()
-    })
+    Ok((
+        ToolResult {
+            output: format!(
+                "[FILE_UNCHANGED] target={} version={} view={} source={}#{}. \
+                 Reuse the prior visible read_file result.",
+                version.target().target_key().display(),
+                display_version,
+                receipt.model_visible_view(),
+                receipt.candidate_id(),
+                receipt.source_occurrence(),
+            ),
+            success: true,
+            ..Default::default()
+        },
+        receipt,
+    ))
 }
 
 fn stage_read_candidate(
@@ -816,8 +1095,9 @@ fn stage_read_candidate(
     requested_view: FileView,
     returned_view: FileView,
     output: &str,
+    dedup_enabled: bool,
 ) {
-    if ctx.file_state_cache.is_none() {
+    if !dedup_enabled || ctx.file_state_cache.is_none() {
         return;
     }
     let (Some(receipts), Some(version)) = (
@@ -834,6 +1114,14 @@ fn stage_read_candidate(
         returned_view,
         output,
     );
+}
+
+fn stable_read_error_reason(error: &super::StableReadError) -> &'static str {
+    match error {
+        super::StableReadError::ConcurrentChange => "unstable_observation",
+        super::StableReadError::TooLarge { .. } => "too_large",
+        super::StableReadError::Io(_) => "read_error",
+    }
 }
 
 fn stable_read_error(error: super::StableReadError, input_path: &str) -> ToolResult {
@@ -901,6 +1189,110 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tool = ReadFileTool::new(dir.path());
         assert_eq!(tool.concurrency_class(), ConcurrencyClass::Safe);
+    }
+
+    #[test]
+    fn dedup_kill_switch_values_are_stable() {
+        assert!(dedup_enabled_from_value(None));
+        assert!(dedup_enabled_from_value(Some("1")));
+        assert!(dedup_enabled_from_value(Some("true")));
+        assert!(!dedup_enabled_from_value(Some("0")));
+        assert!(!dedup_enabled_from_value(Some("false")));
+        assert!(!dedup_enabled_from_value(Some(" OFF ")));
+    }
+
+    #[test]
+    fn observability_identifiers_do_not_expose_paths_or_owner_values() {
+        let target = FileTarget::new(
+            "local:/Users/private/workspace",
+            "/Users/private/workspace/secret.txt",
+        );
+        let target_id = short_target_id(&target);
+        let owner_id = short_id("customer-session-secret");
+
+        assert_eq!(target_id.len(), 12);
+        assert_eq!(owner_id.len(), 12);
+        assert!(!target_id.contains("secret"));
+        assert!(!owner_id.contains("customer"));
+    }
+
+    #[tokio::test]
+    async fn disabled_dedup_returns_body_without_disabling_version_tracking() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join("notes.txt");
+        std::fs::write(&path, "alpha\nbeta\n").unwrap();
+        let ledger = Arc::new(FileStateCache::new());
+        let target =
+            crate::file_state_cache::FileTarget::for_local_workspace(workspace.path(), &path)
+                .unwrap();
+        let receipts = Arc::new(
+            crate::model_read_receipts::ModelReadReceiptStore::for_owner(
+                crate::model_read_receipts::ReadReceiptOwner::new(
+                    target.workspace_id(),
+                    "task",
+                    "session",
+                    "root",
+                )
+                .unwrap(),
+            ),
+        );
+        let args = serde_json::json!({"path": "notes.txt"});
+        let mut ctx = ToolContext::zero();
+        ctx.tool_id = "call-1".to_string();
+        ctx.file_state_cache = Some(ledger.clone());
+        ctx.model_read_receipts = Some(receipts.clone());
+
+        let enabled = ReadFileTool::new(workspace.path()).with_deduplication(true);
+        let first = enabled.execute_with_context(&ctx, &args).await.unwrap();
+        let messages = vec![
+            octos_core::Message {
+                role: octos_core::MessageRole::Assistant,
+                content: String::new(),
+                media: Vec::new(),
+                tool_calls: Some(vec![octos_core::ToolCall {
+                    id: "call-1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: args.clone(),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            },
+            octos_core::Message {
+                role: octos_core::MessageRole::Tool,
+                content: first.output,
+                media: Vec::new(),
+                tool_calls: None,
+                tool_call_id: Some("call-1".to_string()),
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            },
+        ];
+        let pending = receipts.prepare_dispatch(&messages, "read-output-exact-v1:test");
+        receipts.activate(pending);
+        assert_eq!(receipts.active_len(), 1);
+
+        ctx.tool_id = "call-2".to_string();
+        let disabled = ReadFileTool::new(workspace.path()).with_deduplication(false);
+        let second = disabled.execute_with_context(&ctx, &args).await.unwrap();
+
+        assert!(second.output.contains("alpha"));
+        assert!(!second.output.contains("[FILE_UNCHANGED]"));
+        assert_eq!(
+            ledger.len(),
+            1,
+            "the kill switch must not disable mutation freshness state"
+        );
+        assert_eq!(
+            receipts.active_len(),
+            1,
+            "a disabled lookup must not mutate receipt state"
+        );
     }
 
     #[tokio::test]
