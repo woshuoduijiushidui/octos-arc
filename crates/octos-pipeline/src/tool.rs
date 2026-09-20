@@ -971,7 +971,7 @@ impl Tool for RunPipelineTool {
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // M8 parity (W1.A1/A3/A4): pull the parent session's shared
-        // FileStateCache, SubAgentOutputRouter, AgentSummaryGenerator,
+        // file-version ledger, SubAgentOutputRouter, AgentSummaryGenerator,
         // TaskSupervisor, and CostAccountant from TOOL_CTX so pipeline
         // workers inherit them via the M8 contract instead of
         // constructing fresh per-run handles. Falls back to whatever

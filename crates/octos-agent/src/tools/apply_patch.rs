@@ -496,6 +496,11 @@ impl ApplyPatchTool {
                 }
                 PlannedChange::Move { from, to, .. } => vec![from.clone(), to.clone()],
             };
+            if let Some(ledger) = ctx.file_state_cache.as_ref() {
+                for path in &candidates {
+                    ledger.invalidate_path(path);
+                }
+            }
 
             let outcome: Result<AppliedOp, SectionFailure> =
                 match &section.change {
@@ -566,12 +571,6 @@ impl ApplyPatchTool {
                         .await
                     }
                 };
-
-            if let Some(cache) = ctx.file_state_cache.as_ref() {
-                for path in &candidates {
-                    cache.invalidate(path);
-                }
-            }
 
             match outcome {
                 Ok(op) => applied.push(op),
@@ -2116,9 +2115,8 @@ mod tests {
 
     #[tokio::test]
     async fn should_invalidate_file_state_cache_when_patch_touches_files() {
-        use crate::file_state_cache::{CacheEntry, FileStateCache};
+        use crate::file_state_cache::{FileMetadataHint, FileStateCache, FileTarget, FileVersion};
         use std::sync::Arc;
-        use std::time::SystemTime;
 
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("upd.txt"), "old\n").unwrap();
@@ -2128,13 +2126,12 @@ mod tests {
 
         let cache = Arc::new(FileStateCache::new());
         for p in [&upd_path, &del_path] {
-            cache.put(CacheEntry::new(
-                p.clone(),
-                SystemTime::now(),
-                0xABCD,
-                1,
-                false,
+            let target = FileTarget::for_local_workspace(temp.path(), p).unwrap();
+            cache.record(FileVersion::from_bytes(
+                target,
                 None,
+                b"x",
+                FileMetadataHint::new(1, None, None, None, None),
             ));
         }
         assert_eq!(cache.len(), 2);
@@ -2152,8 +2149,7 @@ mod tests {
             .await
             .expect("apply");
         assert!(result.success, "{}", result.output);
-        assert!(cache.peek(&upd_path).is_none(), "update must invalidate");
-        assert!(cache.peek(&del_path).is_none(), "delete must invalidate");
+        assert_eq!(cache.len(), 0, "update and delete must invalidate");
     }
 
     #[tokio::test]

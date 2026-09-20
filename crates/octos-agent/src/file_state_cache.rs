@@ -1,19 +1,14 @@
-//! File-state cache with LRU eviction and mtime-based invalidation (M8.4).
-//!
-//! Mirrors Claude Code's `fileStateCache.ts`: file-read tools put file contents
-//! into the cache; later invocations that hit the same `(path, mtime)` pair
-//! can return a typed [`FILE_UNCHANGED_STUB`] placeholder instead of
-//! re-emitting the full file. In long coding sessions this reduces token cost
-//! by 30-60 %.
+//! Task-local file version ledger with LRU eviction.
 //!
 //! # Invariants
 //!
-//! - LRU ordering is maintained per `get` / `put` — the most recently accessed
+//! - LRU ordering is maintained per `get` / `record` — the most recently accessed
 //!   entry moves to the back.
-//! - `put` evicts until both `max_entries` and `max_total_bytes` are respected.
-//! - `get` returns `None` if the cached entry's `mtime` disagrees with the
-//!   caller-supplied `current_mtime`.
-//! - `invalidate` drops an entry and recovers its byte allotment.
+//! - `record` evicts until both `max_entries` and `max_total_bytes` are respected.
+//! - A key contains both the workspace owner and canonical provider target.
+//! - A version is derived from bytes and metadata captured by one stable read.
+//! - The ledger never decides whether a model has seen file contents.
+//! - `invalidate_path` drops every workspace-owned version for a target.
 //! - `clear` drops every entry and resets `total_size_bytes` to 0.
 //! - `clone_for_subagent` produces an independent snapshot so parent and
 //!   delegate agents cannot race.
@@ -24,91 +19,222 @@
 //! small and easy to reason about; the critical sections are short.
 
 use std::collections::{HashMap, VecDeque};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+#[cfg(not(unix))]
 use std::time::SystemTime;
 
-/// Default maximum number of cached entries. Matches Claude Code's 100.
+use sha2::{Digest, Sha256};
+
+/// Default maximum number of file versions retained by Octos.
 pub const DEFAULT_MAX_ENTRIES: usize = 100;
 
-/// Default maximum total cached bytes. Matches Claude Code's 25 MB.
+/// Default maximum sum of observed file sizes retained by Octos.
 pub const DEFAULT_MAX_TOTAL_BYTES: usize = 25 * 1024 * 1024;
 
-/// Prefix used for the typed "file unchanged" tool-result placeholder.
+/// Provider-scoped identity of a file.
 ///
-/// Callers that want to emit the stub should format it as:
-/// `"[FILE_UNCHANGED] No changes since last read: {path} (cached view
-/// {start}..{end}). Use the previous tool result."` — see
-/// [`format_file_unchanged_stub`].
-pub const FILE_UNCHANGED_STUB_PREFIX: &str = "[FILE_UNCHANGED]";
+/// Local files use the canonical workspace root as `workspace_id` and the
+/// canonical absolute path as `target_key`. Other providers may supply their
+/// own stable owner and target identifiers.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FileTarget {
+    workspace_id: String,
+    target_key: PathBuf,
+}
 
-/// Format the canonical `FILE_UNCHANGED_STUB` output used by file tools.
-///
-/// `view_range` is optional — pass `None` for a full-file view.
-pub fn format_file_unchanged_stub(path: &Path, view_range: Option<(u64, u64)>) -> String {
-    match view_range {
-        Some((start, end)) => format!(
-            "{} No changes since last read: {} (cached view {}..{}). Use the previous tool result.",
-            FILE_UNCHANGED_STUB_PREFIX,
-            path.display(),
-            start,
-            end,
-        ),
-        None => format!(
-            "{} No changes since last read: {} (full file cached). Use the previous tool result.",
-            FILE_UNCHANGED_STUB_PREFIX,
-            path.display(),
-        ),
+impl FileTarget {
+    /// Create an identity for a provider-owned target.
+    pub fn new(workspace_id: impl Into<String>, target_key: impl Into<PathBuf>) -> Self {
+        Self {
+            workspace_id: workspace_id.into(),
+            target_key: target_key.into(),
+        }
+    }
+
+    /// Canonicalize a local workspace and target into one stable identity.
+    pub fn for_local_workspace(workspace_root: &Path, target: &Path) -> io::Result<Self> {
+        let workspace_root = dunce::canonicalize(workspace_root)?;
+        let target_key = dunce::canonicalize(target)?;
+        Ok(Self::new(
+            format!("local:{}", workspace_root.display()),
+            target_key,
+        ))
+    }
+
+    /// Stable owner of the target.
+    pub fn workspace_id(&self) -> &str {
+        &self.workspace_id
+    }
+
+    /// Canonical provider-specific target key.
+    pub fn target_key(&self) -> &Path {
+        &self.target_key
     }
 }
 
-/// Per-file record stored in [`FileStateCache`].
+/// Cheap metadata used to reject stale observations before comparing content.
+///
+/// Metadata is only a hint. Equality never substitutes for the SHA-256 digest
+/// in [`FileVersion`].
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CacheEntry {
-    /// Absolute path to the cached file.
-    pub path: PathBuf,
-    /// File modification time at the moment we read it.
-    pub mtime: SystemTime,
-    /// Stable content hash (FNV-1a or similar 64-bit hash) of the cached
-    /// content. Used as a secondary check so cache consumers can detect edits
-    /// that preserved mtime (e.g. touch-and-restore attacks).
-    pub content_hash: u64,
-    /// Byte size of the cached content.
-    pub size: usize,
-    /// Whether the cached content reflects a partial view (line range).
-    pub is_partial_view: bool,
-    /// The (start, end) line range (1-indexed, inclusive) the caller viewed,
-    /// or `None` for a full-file read.
-    pub view_range: Option<(u64, u64)>,
+pub struct FileMetadataHint {
+    size: u64,
+    mtime_ns: Option<i128>,
+    ctime_ns: Option<i128>,
+    device: Option<u64>,
+    inode: Option<u64>,
 }
 
-impl CacheEntry {
-    /// Create a new entry.
+impl FileMetadataHint {
+    /// Create a metadata hint. These fields are never sufficient for equality
+    /// without a content digest or trusted provider revision.
     pub fn new(
-        path: PathBuf,
-        mtime: SystemTime,
-        content_hash: u64,
-        size: usize,
-        is_partial_view: bool,
-        view_range: Option<(u64, u64)>,
+        size: u64,
+        mtime_ns: Option<i128>,
+        ctime_ns: Option<i128>,
+        device: Option<u64>,
+        inode: Option<u64>,
     ) -> Self {
         Self {
-            path,
-            mtime,
-            content_hash,
             size,
-            is_partial_view,
-            view_range,
+            mtime_ns,
+            ctime_ns,
+            device,
+            inode,
         }
+    }
+
+    pub(crate) fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        let (mtime_ns, ctime_ns, device, inode) = metadata_identity(metadata);
+        Self::new(metadata.len(), mtime_ns, ctime_ns, device, inode)
+    }
+
+    /// Observed file size in bytes.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Observed modification time as nanoseconds from the Unix epoch.
+    pub fn mtime_ns(&self) -> Option<i128> {
+        self.mtime_ns
+    }
+
+    /// Observed inode change time as nanoseconds from the Unix epoch.
+    pub fn ctime_ns(&self) -> Option<i128> {
+        self.ctime_ns
+    }
+
+    /// Observed device identifier when the platform exposes it.
+    pub fn device(&self) -> Option<u64> {
+        self.device
+    }
+
+    /// Observed inode identifier when the platform exposes it.
+    pub fn inode(&self) -> Option<u64> {
+        self.inode
+    }
+}
+
+#[cfg(unix)]
+fn metadata_identity(
+    metadata: &std::fs::Metadata,
+) -> (Option<i128>, Option<i128>, Option<u64>, Option<u64>) {
+    use std::os::unix::fs::MetadataExt;
+
+    let mtime_ns = i128::from(metadata.mtime()) * 1_000_000_000 + i128::from(metadata.mtime_nsec());
+    let ctime_ns = i128::from(metadata.ctime()) * 1_000_000_000 + i128::from(metadata.ctime_nsec());
+    (
+        Some(mtime_ns),
+        Some(ctime_ns),
+        Some(metadata.dev()),
+        Some(metadata.ino()),
+    )
+}
+
+#[cfg(not(unix))]
+fn metadata_identity(
+    metadata: &std::fs::Metadata,
+) -> (Option<i128>, Option<i128>, Option<u64>, Option<u64>) {
+    let mtime_ns = metadata.modified().ok().and_then(system_time_nanos);
+    (mtime_ns, None, None, None)
+}
+
+#[cfg(not(unix))]
+fn system_time_nanos(time: SystemTime) -> Option<i128> {
+    match time.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(duration) => i128::try_from(duration.as_nanos()).ok(),
+        Err(error) => i128::try_from(error.duration().as_nanos())
+            .ok()
+            .map(|nanos| -nanos),
+    }
+}
+
+/// Strong identity of bytes observed for one provider-scoped target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileVersion {
+    target: FileTarget,
+    provider_version: Option<String>,
+    content_sha256: String,
+    size: u64,
+    metadata_hint: FileMetadataHint,
+}
+
+impl FileVersion {
+    /// Build a strong version from raw provider bytes.
+    pub fn from_bytes(
+        target: FileTarget,
+        provider_version: Option<String>,
+        bytes: &[u8],
+        metadata_hint: FileMetadataHint,
+    ) -> Self {
+        Self {
+            target,
+            provider_version,
+            content_sha256: Self::sha256(bytes),
+            size: bytes.len() as u64,
+            metadata_hint,
+        }
+    }
+
+    /// Return a prefixed lowercase SHA-256 digest.
+    pub fn sha256(bytes: &[u8]) -> String {
+        format!("sha256:{:x}", Sha256::digest(bytes))
+    }
+
+    /// Provider-scoped target this version belongs to.
+    pub fn target(&self) -> &FileTarget {
+        &self.target
+    }
+
+    /// Opaque provider revision when one was supplied.
+    pub fn provider_version(&self) -> Option<&str> {
+        self.provider_version.as_deref()
+    }
+
+    /// SHA-256 digest of the raw bytes read from the provider.
+    pub fn content_sha256(&self) -> &str {
+        &self.content_sha256
+    }
+
+    /// Number of raw bytes in this version.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Metadata hint captured with the same stable observation.
+    pub fn metadata_hint(&self) -> &FileMetadataHint {
+        &self.metadata_hint
     }
 }
 
 #[derive(Debug)]
 struct Inner {
-    entries: HashMap<PathBuf, CacheEntry>,
+    entries: HashMap<FileTarget, FileVersion>,
     /// Order of keys from least recently used (front) to most recently used
-    /// (back). On every `get`/`put` we bump the touched key to the back.
-    order: VecDeque<PathBuf>,
+    /// (back). On every `get`/`record` we bump the touched key to the back.
+    order: VecDeque<FileTarget>,
     total_size_bytes: usize,
 }
 
@@ -121,8 +247,8 @@ impl Inner {
         }
     }
 
-    fn bump_to_back(&mut self, path: &Path) {
-        if let Some(pos) = self.order.iter().position(|p| p == path) {
+    fn bump_to_back(&mut self, target: &FileTarget) {
+        if let Some(pos) = self.order.iter().position(|candidate| candidate == target) {
             if let Some(key) = self.order.remove(pos) {
                 self.order.push_back(key);
             }
@@ -130,7 +256,7 @@ impl Inner {
     }
 }
 
-/// LRU cache of file-state entries with mtime-based invalidation.
+/// LRU ledger of strong file versions.
 ///
 /// Cloning (or [`FileStateCache::clone_for_subagent`]) yields a **deep copy**
 /// so parent and subagent cannot race each other's entries.
@@ -186,46 +312,40 @@ impl FileStateCache {
         inner.entries.is_empty()
     }
 
-    /// Look up `path` and return the cached entry if the stored `mtime`
-    /// matches `current_mtime`. On HIT, bumps the entry to the most-recent
-    /// position. Mismatched mtime returns `None` without evicting — the next
-    /// `put` is expected to overwrite.
-    pub fn get(&self, path: &Path, current_mtime: SystemTime) -> Option<CacheEntry> {
+    /// Return the latest observed version for `target`.
+    ///
+    /// This is historical disk state, not proof that any model saw the bytes.
+    pub fn get(&self, target: &FileTarget) -> Option<FileVersion> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let stored = inner.entries.get(path)?;
-        if stored.mtime != current_mtime {
-            return None;
-        }
+        let stored = inner.entries.get(target)?;
         let entry = stored.clone();
-        inner.bump_to_back(path);
+        inner.bump_to_back(target);
         Some(entry)
     }
 
-    /// Look up `path` without mtime validation.
-    ///
-    /// Useful for diagnostics and for the "did we ever see this file" check
-    /// an integration test needs. Most callers should prefer [`Self::get`]
-    /// which enforces the mtime invariant.
-    pub fn peek(&self, path: &Path) -> Option<CacheEntry> {
+    /// Look up `target` without updating LRU order.
+    pub fn peek(&self, target: &FileTarget) -> Option<FileVersion> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.entries.get(path).cloned()
+        inner.entries.get(target).cloned()
     }
 
-    /// Insert or update an entry, bumping it to the most-recent LRU slot and
+    /// Record a stable observation, bumping it to the most-recent LRU slot and
     /// evicting stale entries until both caps hold.
-    pub fn put(&self, entry: CacheEntry) {
+    pub fn record(&self, version: FileVersion) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let key = entry.path.clone();
+        let key = version.target.clone();
 
         if let Some(old) = inner.entries.remove(&key) {
-            inner.total_size_bytes = inner.total_size_bytes.saturating_sub(old.size);
+            inner.total_size_bytes = inner.total_size_bytes.saturating_sub(version_size(&old));
             if let Some(pos) = inner.order.iter().position(|p| p == &key) {
                 inner.order.remove(pos);
             }
         }
 
-        inner.total_size_bytes = inner.total_size_bytes.saturating_add(entry.size);
-        inner.entries.insert(key.clone(), entry);
+        inner.total_size_bytes = inner
+            .total_size_bytes
+            .saturating_add(version_size(&version));
+        inner.entries.insert(key.clone(), version);
         inner.order.push_back(key);
 
         // Evict until within caps.
@@ -237,25 +357,41 @@ impl FileStateCache {
                 break;
             };
             if let Some(dropped) = inner.entries.remove(&oldest) {
-                inner.total_size_bytes = inner.total_size_bytes.saturating_sub(dropped.size);
+                inner.total_size_bytes = inner
+                    .total_size_bytes
+                    .saturating_sub(version_size(&dropped));
             }
         }
     }
 
-    /// Drop the entry for `path` (e.g. after a successful write).
-    pub fn invalidate(&self, path: &Path) {
+    /// Drop every version for a canonical target across workspace owners.
+    pub fn invalidate_path(&self, path: &Path) {
+        let target_key = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(dropped) = inner.entries.remove(path) {
-            inner.total_size_bytes = inner.total_size_bytes.saturating_sub(dropped.size);
-        }
-        if let Some(pos) = inner.order.iter().position(|p| p == path) {
-            inner.order.remove(pos);
+        let targets = inner
+            .entries
+            .keys()
+            .filter(|target| target.target_key == target_key)
+            .cloned()
+            .collect::<Vec<_>>();
+        for target in targets {
+            if let Some(dropped) = inner.entries.remove(&target) {
+                inner.total_size_bytes = inner
+                    .total_size_bytes
+                    .saturating_sub(version_size(&dropped));
+            }
+            if let Some(pos) = inner
+                .order
+                .iter()
+                .position(|candidate| candidate == &target)
+            {
+                inner.order.remove(pos);
+            }
         }
     }
 
-    /// Clear every entry. Call at compaction boundaries (M8.5 tier-3) so
-    /// file-identity claims from an un-summarised read do not leak across the
-    /// compaction line.
+    /// Clear every recorded version. Losing ledger state only causes later
+    /// reads to establish a fresh version.
     pub fn clear(&self) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.entries.clear();
@@ -263,54 +399,7 @@ impl FileStateCache {
         inner.total_size_bytes = 0;
     }
 
-    /// M8.4/M8.6 fix-first item 7: seed the cache from recovered
-    /// resume refs.
-    ///
-    /// The legacy session-actor hand-off consumed
-    /// [`octos_bus::ReplacementStateRef`] entries but did nothing with
-    /// them — the TODO(M8.4) comment explicitly flagged this as a
-    /// gap. The recovered refs carry the file path + optional content
-    /// hash the transcript claimed was last read. We can NOT fully
-    /// reconstruct the cache from a ref alone (the content bytes live
-    /// only in the original tool result, which has been pruned), but
-    /// we can record a best-effort entry with the ref's hash so a
-    /// later `read_file` can at least detect a changed mtime.
-    ///
-    /// When `content_hash` is missing on the ref (the pre-M8.4
-    /// transcript-only path) we skip that entry — a placeholder with a
-    /// zero hash would turn every subsequent read into a false
-    /// [FILE_UNCHANGED]. Returns the number of entries actually seeded.
-    pub fn seed_from_replacement_refs<'a, I>(&self, refs: I) -> usize
-    where
-        I: IntoIterator<Item = &'a octos_bus::ReplacementStateRef>,
-    {
-        let mut seeded = 0_usize;
-        for r in refs {
-            let Some(hash_str) = r.content_hash.as_deref() else {
-                continue;
-            };
-            let Ok(hash) = hash_str.parse::<u64>() else {
-                continue;
-            };
-            // Build a "best guess" CacheEntry: no mtime yet (set to
-            // UNIX_EPOCH so the first real read will always miss and
-            // repopulate); hash comes from the recovered ref; file size
-            // is unknown (0).
-            let entry = CacheEntry::new(
-                r.path.clone(),
-                std::time::SystemTime::UNIX_EPOCH,
-                hash,
-                0,
-                false,
-                None,
-            );
-            self.put(entry);
-            seeded += 1;
-        }
-        seeded
-    }
-
-    /// Return a deep-copied cache for a subagent.
+    /// Return a deep-copied version ledger for a subagent.
     ///
     /// The child's writes/invalidations do not race the parent. The caps are
     /// copied verbatim. Use this at spawn/delegate boundaries.
@@ -327,55 +416,10 @@ impl FileStateCache {
             inner: Mutex::new(snapshot),
         }
     }
+}
 
-    /// Cheap 64-bit FNV-1a hash of a byte slice.
-    ///
-    /// Good enough for cache identity — we're not protecting against
-    /// adversarial collisions, just defending against accidental mismatches.
-    pub fn content_hash(bytes: &[u8]) -> u64 {
-        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-        const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
-        let mut hash = FNV_OFFSET;
-        for &b in bytes {
-            hash ^= u64::from(b);
-            hash = hash.wrapping_mul(FNV_PRIME);
-        }
-        hash
-    }
-
-    /// Heuristically decide whether `content` looks like text that is safe to
-    /// cache. Returns `false` for obvious binary blobs (images, PDFs,
-    /// archives) so those do not occupy cache space.
-    ///
-    /// The check is deliberately cheap: if the first 4 KB is valid UTF-8 and
-    /// contains no `\0` byte, we treat it as text.
-    pub fn is_text_cacheable(content: &[u8]) -> bool {
-        let prefix_len = content.len().min(4096);
-        let prefix = &content[..prefix_len];
-        if prefix.contains(&0u8) {
-            return false;
-        }
-        std::str::from_utf8(prefix).is_ok()
-    }
-
-    /// File extensions we never cache even if UTF-8 validation slips through
-    /// (e.g. JSON blobs that wrap base64 images).
-    const NON_TEXT_EXTS: &'static [&'static str] = &[
-        "png", "jpg", "jpeg", "gif", "bmp", "webp", "ico", "tiff", "svg", "pdf", "mp3", "mp4",
-        "wav", "flac", "ogg", "mov", "zip", "tar", "gz", "bz2", "xz", "7z", "exe", "dll", "so",
-        "dylib", "class", "jar",
-    ];
-
-    /// Whether `path`'s extension is in the known-binary deny list.
-    pub fn has_binary_extension(path: &Path) -> bool {
-        path.extension()
-            .and_then(|e| e.to_str())
-            .map(|ext| {
-                let lower = ext.to_ascii_lowercase();
-                Self::NON_TEXT_EXTS.iter().any(|&b| b == lower)
-            })
-            .unwrap_or(false)
-    }
+fn version_size(version: &FileVersion) -> usize {
+    usize::try_from(version.size).unwrap_or(usize::MAX)
 }
 
 impl Clone for FileStateCache {
@@ -426,291 +470,213 @@ impl FileStateCacheBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
-    fn mk_entry(path: &str, mtime: SystemTime, size: usize) -> CacheEntry {
-        CacheEntry::new(
-            PathBuf::from(path),
-            mtime,
-            FileStateCache::content_hash(path.as_bytes()),
-            size,
-            false,
-            None,
-        )
+    fn target(workspace: &str, path: &str) -> FileTarget {
+        FileTarget::new(workspace, PathBuf::from(path))
     }
 
-    fn mk_partial_entry(
-        path: &str,
-        mtime: SystemTime,
-        size: usize,
-        range: (u64, u64),
-    ) -> CacheEntry {
-        CacheEntry::new(
-            PathBuf::from(path),
-            mtime,
-            FileStateCache::content_hash(path.as_bytes()),
-            size,
-            true,
-            Some(range),
+    fn version(workspace: &str, path: &str, bytes: &[u8]) -> FileVersion {
+        FileVersion::from_bytes(
+            target(workspace, path),
+            None,
+            bytes,
+            FileMetadataHint::new(bytes.len() as u64, None, None, None, None),
         )
     }
 
     #[test]
-    fn should_hit_when_mtime_unchanged() {
-        let cache = FileStateCache::new();
-        let mtime = SystemTime::now();
-        cache.put(mk_entry("/tmp/a.txt", mtime, 10));
+    fn should_record_and_get_strong_version() {
+        let ledger = FileStateCache::new();
+        let version = version("workspace", "/tmp/a.txt", b"content");
+        let target = version.target().clone();
+        ledger.record(version.clone());
 
-        let hit = cache.get(Path::new("/tmp/a.txt"), mtime);
-        assert!(hit.is_some(), "same mtime must return HIT");
-        let hit = hit.unwrap();
-        assert_eq!(hit.size, 10);
-        assert!(!hit.is_partial_view);
+        assert_eq!(ledger.get(&target), Some(version));
     }
 
     #[test]
-    fn h02_m0_characterization_get_ignores_content_hash_when_mtime_matches() {
-        let cache = FileStateCache::new();
-        let mtime = SystemTime::now();
-        let path = PathBuf::from("/tmp/same-metadata.txt");
-        let stale_hash = FileStateCache::content_hash(b"old");
-        let current_hash = FileStateCache::content_hash(b"new");
-        assert_ne!(stale_hash, current_hash);
+    fn should_distinguish_content_with_identical_metadata_hints() {
+        let target = target("workspace", "/tmp/same-metadata.txt");
+        let hint = FileMetadataHint::new(4, Some(1), Some(2), Some(3), Some(4));
+        let old = FileVersion::from_bytes(target.clone(), None, b"AAAA", hint.clone());
+        let current = FileVersion::from_bytes(target, None, b"BBBB", hint);
 
-        cache.put(CacheEntry::new(
-            path.clone(),
-            mtime,
-            stale_hash,
-            3,
-            false,
-            None,
-        ));
-
-        let hit = cache
-            .get(&path, mtime)
-            .expect("baseline lookup accepts matching mtime");
-        assert_eq!(hit.content_hash, stale_hash);
-        assert_ne!(
-            hit.content_hash, current_hash,
-            "M0 records that get() never receives or verifies the current content hash"
-        );
-    }
-
-    #[test]
-    fn should_miss_when_mtime_changed() {
-        let cache = FileStateCache::new();
-        let mtime_old = SystemTime::now();
-        cache.put(mk_entry("/tmp/a.txt", mtime_old, 10));
-
-        let mtime_new = mtime_old + Duration::from_secs(1);
-        assert!(
-            cache.get(Path::new("/tmp/a.txt"), mtime_new).is_none(),
-            "changed mtime must return MISS"
-        );
-        // The entry must remain — only the lookup said MISS.
-        assert_eq!(cache.len(), 1);
+        assert_eq!(old.metadata_hint(), current.metadata_hint());
+        assert_eq!(old.size(), current.size());
+        assert_ne!(old.content_sha256(), current.content_sha256());
     }
 
     #[test]
     fn should_evict_lru_when_max_entries_exceeded() {
-        let cache = FileStateCache::builder().max_entries(2).build();
-        let mtime = SystemTime::now();
+        let ledger = FileStateCache::builder().max_entries(2).build();
+        let a = target("workspace", "/a");
+        let b = target("workspace", "/b");
+        let c = target("workspace", "/c");
 
-        cache.put(mk_entry("/a", mtime, 10));
-        cache.put(mk_entry("/b", mtime, 10));
-        cache.put(mk_entry("/c", mtime, 10));
+        ledger.record(version("workspace", "/a", b"aaaaaaaaaa"));
+        ledger.record(version("workspace", "/b", b"bbbbbbbbbb"));
+        ledger.record(version("workspace", "/c", b"cccccccccc"));
 
-        assert_eq!(cache.len(), 2);
-        assert!(
-            cache.peek(Path::new("/a")).is_none(),
-            "oldest entry must be evicted"
-        );
-        assert!(cache.peek(Path::new("/b")).is_some());
-        assert!(cache.peek(Path::new("/c")).is_some());
+        assert_eq!(ledger.len(), 2);
+        assert!(ledger.peek(&a).is_none(), "oldest entry must be evicted");
+        assert!(ledger.peek(&b).is_some());
+        assert!(ledger.peek(&c).is_some());
     }
 
     #[test]
     fn should_evict_lru_when_max_bytes_exceeded() {
-        let cache = FileStateCache::builder()
+        let ledger = FileStateCache::builder()
             .max_entries(100)
             .max_total_bytes(30)
             .build();
-        let mtime = SystemTime::now();
+        let a = target("workspace", "/a");
+        let b = target("workspace", "/b");
+        let c = target("workspace", "/c");
 
-        cache.put(mk_entry("/a", mtime, 20));
-        cache.put(mk_entry("/b", mtime, 10));
-        // /a + /b = 30 — within cap.
-        assert_eq!(cache.len(), 2);
-        assert_eq!(cache.total_size_bytes(), 30);
+        ledger.record(version("workspace", "/a", &[b'a'; 20]));
+        ledger.record(version("workspace", "/b", &[b'b'; 10]));
+        assert_eq!(ledger.len(), 2);
+        assert_eq!(ledger.total_size_bytes(), 30);
 
-        cache.put(mk_entry("/c", mtime, 20));
-        // Must evict /a (oldest) to stay at <=30 bytes.
-        assert!(cache.peek(Path::new("/a")).is_none());
-        assert!(cache.peek(Path::new("/b")).is_some());
-        assert!(cache.peek(Path::new("/c")).is_some());
-        assert_eq!(cache.total_size_bytes(), 30);
+        ledger.record(version("workspace", "/c", &[b'c'; 20]));
+        assert!(ledger.peek(&a).is_none());
+        assert!(ledger.peek(&b).is_some());
+        assert!(ledger.peek(&c).is_some());
+        assert_eq!(ledger.total_size_bytes(), 30);
     }
 
     #[test]
     fn should_bump_lru_position_on_hit() {
-        let cache = FileStateCache::builder().max_entries(2).build();
-        let mtime = SystemTime::now();
+        let ledger = FileStateCache::builder().max_entries(2).build();
+        let a = target("workspace", "/a");
+        let b = target("workspace", "/b");
+        let c = target("workspace", "/c");
 
-        cache.put(mk_entry("/a", mtime, 10));
-        cache.put(mk_entry("/b", mtime, 10));
+        ledger.record(version("workspace", "/a", b"a"));
+        ledger.record(version("workspace", "/b", b"b"));
 
-        // Touch /a so it becomes the most-recent.
-        assert!(cache.get(Path::new("/a"), mtime).is_some());
+        assert!(ledger.get(&a).is_some());
+        ledger.record(version("workspace", "/c", b"c"));
 
-        // Insert /c: must evict /b (now the oldest) not /a.
-        cache.put(mk_entry("/c", mtime, 10));
-
-        assert!(cache.peek(Path::new("/a")).is_some(), "/a was touched");
-        assert!(cache.peek(Path::new("/b")).is_none(), "/b was evicted");
-        assert!(cache.peek(Path::new("/c")).is_some());
+        assert!(ledger.peek(&a).is_some(), "/a was touched");
+        assert!(ledger.peek(&b).is_none(), "/b was evicted");
+        assert!(ledger.peek(&c).is_some());
     }
 
     #[test]
-    fn should_invalidate_on_put_to_same_path() {
-        let cache = FileStateCache::new();
-        let mtime = SystemTime::now();
-        cache.put(mk_entry("/a", mtime, 100));
-        assert_eq!(cache.total_size_bytes(), 100);
+    fn should_replace_version_for_same_target() {
+        let ledger = FileStateCache::new();
+        let target = target("workspace", "/a");
+        ledger.record(version("workspace", "/a", &[b'a'; 100]));
+        ledger.record(version("workspace", "/a", &[b'b'; 25]));
 
-        // Overwrite with a smaller entry: total_size must adjust.
-        let new_mtime = mtime + Duration::from_secs(1);
-        cache.put(mk_entry("/a", new_mtime, 25));
-
-        assert_eq!(cache.len(), 1);
-        assert_eq!(cache.total_size_bytes(), 25);
-        let peek = cache.peek(Path::new("/a")).unwrap();
-        assert_eq!(peek.mtime, new_mtime);
-        assert_eq!(peek.size, 25);
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger.total_size_bytes(), 25);
+        assert_eq!(ledger.peek(&target).unwrap().size(), 25);
     }
 
     #[test]
-    fn should_invalidate_explicit_path() {
-        let cache = FileStateCache::new();
-        let mtime = SystemTime::now();
-        cache.put(mk_entry("/a", mtime, 10));
-        cache.put(mk_entry("/b", mtime, 20));
-        assert_eq!(cache.total_size_bytes(), 30);
+    fn should_isolate_same_target_across_workspaces() {
+        let ledger = FileStateCache::new();
+        let a = target("workspace-a", "/same");
+        let b = target("workspace-b", "/same");
+        ledger.record(version("workspace-a", "/same", b"aaaa"));
+        ledger.record(version("workspace-b", "/same", b"bbbb"));
 
-        cache.invalidate(Path::new("/a"));
-        assert_eq!(cache.len(), 1);
-        assert_eq!(cache.total_size_bytes(), 20);
-        assert!(cache.peek(Path::new("/a")).is_none());
-        assert!(cache.peek(Path::new("/b")).is_some());
+        assert_ne!(
+            ledger.get(&a).unwrap().content_sha256(),
+            ledger.get(&b).unwrap().content_sha256()
+        );
+        assert_eq!(ledger.len(), 2);
+    }
 
-        // Invalidating a missing path is a no-op.
-        cache.invalidate(Path::new("/does-not-exist"));
-        assert_eq!(cache.len(), 1);
+    #[cfg(unix)]
+    #[test]
+    fn local_target_canonicalizes_ancestor_symlink_alias() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let real_dir = root.path().join("real");
+        let alias_dir = root.path().join("alias");
+        std::fs::create_dir(&real_dir).unwrap();
+        std::fs::write(real_dir.join("same.txt"), "content").unwrap();
+        symlink(&real_dir, &alias_dir).unwrap();
+
+        let direct =
+            FileTarget::for_local_workspace(root.path(), &real_dir.join("same.txt")).unwrap();
+        let aliased =
+            FileTarget::for_local_workspace(root.path(), &alias_dir.join("same.txt")).unwrap();
+
+        assert_eq!(direct, aliased);
+    }
+
+    #[test]
+    fn should_invalidate_target_path_across_workspace_owners() {
+        let ledger = FileStateCache::new();
+        let a = target("workspace-a", "/same");
+        let b = target("workspace-b", "/same");
+        let other = target("workspace-a", "/other");
+        ledger.record(version("workspace-a", "/same", b"aaaa"));
+        ledger.record(version("workspace-b", "/same", b"bbbb"));
+        ledger.record(version("workspace-a", "/other", b"other"));
+
+        ledger.invalidate_path(Path::new("/same"));
+
+        assert!(ledger.peek(&a).is_none());
+        assert!(ledger.peek(&b).is_none());
+        assert!(ledger.peek(&other).is_some());
     }
 
     #[test]
     fn should_clone_for_subagent_produces_independent_copy() {
         let parent = FileStateCache::new();
-        let mtime = SystemTime::now();
-        parent.put(mk_entry("/a", mtime, 10));
-        parent.put(mk_entry("/b", mtime, 20));
+        let c = target("workspace", "/c");
+        parent.record(version("workspace", "/a", b"aaaaaaaaaa"));
+        parent.record(version("workspace", "/b", &[b'b'; 20]));
 
         let child = parent.clone_for_subagent();
         assert_eq!(child.len(), 2);
         assert_eq!(child.total_size_bytes(), 30);
 
-        // Writes in the child do not affect the parent.
-        child.invalidate(Path::new("/a"));
+        child.invalidate_path(Path::new("/a"));
         assert_eq!(child.len(), 1);
         assert_eq!(parent.len(), 2);
 
-        // And writes in the parent do not reflect in the child.
-        parent.put(mk_entry("/c", mtime, 5));
-        assert!(parent.peek(Path::new("/c")).is_some());
-        assert!(child.peek(Path::new("/c")).is_none());
+        parent.record(version("workspace", "/c", b"ccccc"));
+        assert!(parent.peek(&c).is_some());
+        assert!(child.peek(&c).is_none());
     }
 
     #[test]
     fn should_clear_drops_all_entries() {
-        let cache = FileStateCache::new();
-        let mtime = SystemTime::now();
-        cache.put(mk_entry("/a", mtime, 10));
-        cache.put(mk_entry("/b", mtime, 20));
-        cache.put(mk_entry("/c", mtime, 30));
-        assert_eq!(cache.len(), 3);
-        assert_eq!(cache.total_size_bytes(), 60);
+        let ledger = FileStateCache::new();
+        let a = target("workspace", "/a");
+        ledger.record(version("workspace", "/a", b"a"));
+        ledger.record(version("workspace", "/b", b"bb"));
+        ledger.record(version("workspace", "/c", b"ccc"));
+        assert_eq!(ledger.len(), 3);
+        assert_eq!(ledger.total_size_bytes(), 6);
 
-        cache.clear();
+        ledger.clear();
 
-        assert!(cache.is_empty());
-        assert_eq!(cache.total_size_bytes(), 0);
-        assert!(cache.peek(Path::new("/a")).is_none());
+        assert!(ledger.is_empty());
+        assert_eq!(ledger.total_size_bytes(), 0);
+        assert!(ledger.peek(&a).is_none());
     }
 
     #[test]
-    fn should_handle_partial_view_entries() {
-        let cache = FileStateCache::new();
-        let mtime = SystemTime::now();
-        let entry = mk_partial_entry("/big.rs", mtime, 500, (10, 30));
-        cache.put(entry.clone());
+    fn poisoned_lock_only_loses_optimization_not_ledger_availability() {
+        let ledger = FileStateCache::new();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ledger.inner.lock().unwrap();
+            panic!("poison test");
+        }));
 
-        let fetched = cache.get(Path::new("/big.rs"), mtime).unwrap();
-        assert!(fetched.is_partial_view);
-        assert_eq!(fetched.view_range, Some((10, 30)));
-        assert_eq!(fetched.size, 500);
-    }
+        let version = version("workspace", "/after-poison", b"body");
+        let target = version.target().clone();
+        ledger.record(version.clone());
 
-    #[test]
-    fn should_not_hit_when_view_range_differs() {
-        // Cache consumers are expected to compare `view_range` themselves —
-        // the cache's job is to return the stored view. Verify the entry
-        // surfaces its range so the caller can see it does not match.
-        let cache = FileStateCache::new();
-        let mtime = SystemTime::now();
-        cache.put(mk_partial_entry("/f.rs", mtime, 100, (1, 50)));
-
-        let entry = cache.get(Path::new("/f.rs"), mtime).unwrap();
-        // Caller asked for (1, 100) but we cached (1, 50): the entry's range
-        // is what tells the caller to ignore this hit.
-        assert_ne!(entry.view_range, Some((1, 100)));
-        assert_eq!(entry.view_range, Some((1, 50)));
-    }
-
-    #[test]
-    fn should_reject_binary_extensions() {
-        assert!(FileStateCache::has_binary_extension(Path::new("img.png")));
-        assert!(FileStateCache::has_binary_extension(Path::new("doc.PDF")));
-        assert!(FileStateCache::has_binary_extension(Path::new(
-            "archive.tar.gz"
-        )));
-        assert!(!FileStateCache::has_binary_extension(Path::new("src.rs")));
-        assert!(!FileStateCache::has_binary_extension(Path::new(
-            "README.md"
-        )));
-        assert!(!FileStateCache::has_binary_extension(Path::new("noext")));
-    }
-
-    #[test]
-    fn should_detect_text_vs_binary_content() {
-        assert!(FileStateCache::is_text_cacheable(b"hello world\n"));
-        assert!(FileStateCache::is_text_cacheable(
-            "// comment\nfn main() {}".as_bytes()
-        ));
-        assert!(!FileStateCache::is_text_cacheable(b"\x00\x01\x02binary"));
-        let big = vec![b'a'; 8192];
-        assert!(FileStateCache::is_text_cacheable(&big));
-    }
-
-    #[test]
-    fn should_format_file_unchanged_stub() {
-        let full = format_file_unchanged_stub(Path::new("/tmp/foo.rs"), None);
-        assert!(full.starts_with(FILE_UNCHANGED_STUB_PREFIX));
-        assert!(full.contains("/tmp/foo.rs"));
-        assert!(full.contains("full file cached"));
-
-        let partial = format_file_unchanged_stub(Path::new("/tmp/bar.rs"), Some((3, 12)));
-        assert!(partial.starts_with(FILE_UNCHANGED_STUB_PREFIX));
-        assert!(partial.contains("/tmp/bar.rs"));
-        assert!(partial.contains("3..12"));
+        assert_eq!(ledger.get(&target), Some(version));
     }
 
     #[test]
@@ -724,11 +690,15 @@ mod tests {
     }
 
     #[test]
-    fn content_hash_is_stable_for_same_input() {
-        let a = FileStateCache::content_hash(b"hello");
-        let b = FileStateCache::content_hash(b"hello");
+    fn sha256_is_stable_for_same_input() {
+        let a = FileVersion::sha256(b"hello");
+        let b = FileVersion::sha256(b"hello");
         assert_eq!(a, b);
-        let c = FileStateCache::content_hash(b"hello\n");
+        let c = FileVersion::sha256(b"hello\n");
         assert_ne!(a, c);
+        assert_eq!(
+            a,
+            "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
     }
 }

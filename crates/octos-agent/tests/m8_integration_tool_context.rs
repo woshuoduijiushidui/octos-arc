@@ -10,8 +10,8 @@
 //! - `spawn` calls with `agent_definition_id` resolve against the live
 //!   registry instead of seeing an empty zero-value default.
 //! - `read_file` called twice through the agent path can return the
-//!   `[FILE_UNCHANGED]` short-circuit (proof that the cache reached the
-//!   tool).
+//! - `read_file` called twice through the agent path returns both bodies while
+//!   retaining one latest strong disk version.
 //! - spawn-only background tools see a `ToolContext` with the same M8 fields
 //!   populated as the foreground path (proof the M8.8 reorganisation did
 //!   not silently zero them in the background branch).
@@ -241,11 +241,9 @@ async fn threads_agent_definitions_into_spawn_tool_after_m8_8_scheduler() {
 }
 
 #[tokio::test]
-async fn h02_m0_characterization_cache_stub_follows_body_dispatch() {
-    // Read the same file twice through a real Agent loop. Unlike the direct
-    // tool contract, this path performs a successful provider request after
-    // the first read; capture that request so the test does not treat cache
-    // wiring alone as proof that the model saw the body.
+async fn h02_m1_repeated_agent_reads_return_body_and_record_one_version() {
+    // M1 keeps dedup disabled. Both model requests receive the body while the
+    // task-local ledger retains one latest strong version for the target.
     let workspace = TempDir::new().unwrap();
     let memory_dir = TempDir::new().unwrap();
     std::fs::write(workspace.path().join("notes.txt"), "alpha\nbeta\ngamma\n").unwrap();
@@ -288,11 +286,7 @@ async fn h02_m0_characterization_cache_stub_follows_body_dispatch() {
         .expect("agent loop must succeed");
     assert_eq!(resp.content, "done");
 
-    // Walk the recorded messages: there must be exactly two `Tool` results
-    // for read_file, the first containing the full file body, the second
-    // containing the FILE_UNCHANGED stub. If the M8.8 reconciliation
-    // regressed, both reads would return the body and the cache would be
-    // empty.
+    // Walk the recorded messages: there must be exactly two full tool results.
     let tool_outputs: Vec<&str> = resp
         .messages
         .iter()
@@ -320,8 +314,8 @@ async fn h02_m0_characterization_cache_stub_follows_body_dispatch() {
         "the provider request before the second read must contain the first file body"
     );
     assert!(
-        tool_outputs[1].contains("[FILE_UNCHANGED]"),
-        "the baseline cache returns a stub after the body-bearing dispatch, got: {}",
+        tool_outputs[1].contains("alpha") && !tool_outputs[1].contains("[FILE_UNCHANGED]"),
+        "M1 keeps repeated reads body-bearing, got: {}",
         tool_outputs[1]
     );
     assert_eq!(

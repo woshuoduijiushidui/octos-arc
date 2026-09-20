@@ -351,10 +351,9 @@ impl Tool for EditFileTool {
             None
         };
 
-        // M8.4: invalidate any stale cache entry — the file's contents and
-        // mtime just changed.
+        // Invalidate every recorded workspace-owned version for this path.
         if let Some(cache) = ctx.file_state_cache.as_ref() {
-            cache.invalidate(&path);
+            cache.invalidate_path(&path);
         }
 
         if !fence_active {
@@ -1203,22 +1202,20 @@ mod tests {
 
     #[tokio::test]
     async fn should_edit_file_tool_invalidate_cache_after_edit() {
-        use crate::file_state_cache::{CacheEntry, FileStateCache};
+        use crate::file_state_cache::{FileMetadataHint, FileStateCache, FileTarget, FileVersion};
         use std::sync::Arc;
-        use std::time::SystemTime;
 
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("code.rs");
         std::fs::write(&file_path, "fn foo() {}\n").unwrap();
 
         let cache = Arc::new(FileStateCache::new());
-        cache.put(CacheEntry::new(
-            file_path.clone(),
-            SystemTime::now(),
-            0xCAFE,
-            12,
-            false,
+        let target = FileTarget::for_local_workspace(dir.path(), &file_path).unwrap();
+        cache.record(FileVersion::from_bytes(
+            target.clone(),
             None,
+            b"fn foo() {}\n",
+            FileMetadataHint::new(12, None, None, None, None),
         ));
         assert_eq!(cache.len(), 1);
 
@@ -1239,7 +1236,7 @@ mod tests {
             .unwrap();
 
         assert!(result.success);
-        assert!(cache.peek(&file_path).is_none());
+        assert!(cache.peek(&target).is_none());
     }
 
     // -----------------------------------------------------------------------

@@ -436,7 +436,7 @@ pub struct ExecutorConfig {
     /// byte-for-byte identical to the v0 path.
     pub workspace_context: PipelineContext,
     /// M8 parity (W1.A1/A3): snapshot of the parent session's shared
-    /// resources (FileStateCache, SubAgentOutputRouter,
+    /// resources (file-version ledger, SubAgentOutputRouter,
     /// AgentSummaryGenerator, TaskSupervisor) picked up via TOOL_CTX
     /// at run_pipeline dispatch. Default = empty, which keeps every
     /// pre-M8 invocation site bitwise identical.
@@ -2373,7 +2373,7 @@ impl PipelineExecutor {
         // `Command` validator to it instead of running it on the host.
         .with_sandbox(self.config.sandbox.clone())
         // M8 parity (W1.A1): propagate the host context so per-node
-        // Agents inherit the parent session's FileStateCache /
+        // Agents inherit the parent task's file-version ledger /
         // SubAgentOutputRouter / AgentSummaryGenerator. Empty context
         // keeps pre-M8 behaviour bitwise identical.
         .with_host_context(self.config.host_context.clone());

@@ -580,11 +580,10 @@ impl WriteFileTool {
             None
         };
 
-        // M8.4: invalidate any stale cache entry for this path — the file's
-        // contents (and mtime) just changed, so previous reads must not serve
-        // a [FILE_UNCHANGED] stub on the next read.
+        // Invalidate every recorded workspace-owned version for this path.
+        // A later read establishes the new version from the bytes on disk.
         if let Some(cache) = ctx.file_state_cache.as_ref() {
-            cache.invalidate(&path);
+            cache.invalidate_path(&path);
         }
 
         if !fenced {
@@ -785,7 +784,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // M8.4 integration test — write invalidates the file-state cache.
+    // H02 integration test — write invalidates the file-version ledger.
     // -----------------------------------------------------------------------
 
     // -----------------------------------------------------------------------
@@ -1279,22 +1278,21 @@ mod tests {
 
     #[tokio::test]
     async fn should_write_file_tool_invalidate_cache_after_write() {
-        use crate::file_state_cache::{CacheEntry, FileStateCache};
+        use crate::file_state_cache::{FileMetadataHint, FileStateCache, FileTarget, FileVersion};
         use std::sync::Arc;
-        use std::time::SystemTime;
 
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("note.txt");
+        std::fs::write(&file_path, "old body").unwrap();
 
-        // Pre-populate the cache as if the file had been read already.
+        // Pre-populate the ledger as if the file had been read already.
         let cache = Arc::new(FileStateCache::new());
-        cache.put(CacheEntry::new(
-            file_path.clone(),
-            SystemTime::now(),
-            0xABCD,
-            42,
-            false,
+        let target = FileTarget::for_local_workspace(dir.path(), &file_path).unwrap();
+        cache.record(FileVersion::from_bytes(
+            target.clone(),
             None,
+            b"old body",
+            FileMetadataHint::new(8, None, None, None, None),
         ));
         assert_eq!(cache.len(), 1);
 
@@ -1314,7 +1312,7 @@ mod tests {
         assert!(result.success);
         // After a successful write, the cache entry for this path must be gone.
         assert!(
-            cache.peek(&file_path).is_none(),
+            cache.peek(&target).is_none(),
             "write_file must invalidate the cached entry"
         );
         assert_eq!(cache.len(), 0);

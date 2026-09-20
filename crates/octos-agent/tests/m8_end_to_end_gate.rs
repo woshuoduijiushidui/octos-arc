@@ -24,10 +24,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use octos_agent::{
-    Agent, AgentConfig, AgentSummaryGenerator, FileStateCache, SubAgentOutputRouter, TaskStatus,
-    Tool, ToolRegistry, ToolResult,
+    Agent, AgentConfig, AgentSummaryGenerator, FileStateCache, FileTarget, SubAgentOutputRouter,
+    TaskStatus, Tool, ToolRegistry, ToolResult,
 };
-use octos_bus::{ReplacementStateRef, ResumePolicy, SanitizeError};
+use octos_bus::{ResumePolicy, SanitizeError};
 use octos_core::{AgentId, Message, MessageRole, ToolCall};
 use octos_llm::{ChatConfig, ChatResponse, LlmProvider, StopReason, TokenUsage, ToolSpec};
 use octos_memory::EpisodeStore;
@@ -179,9 +179,8 @@ fn tc(id: &str, name: &str, args: serde_json::Value) -> ToolCall {
 //   orphan
 // - feed a second transcript with the same shape but a non-existent
 //   workspace_root; verify WorktreeMissing fires
-// - after a successful sanitise, seed the file cache from the refs and
-//   verify a `read_file` against the recovered path returns the live
-//   file body (not a false [FILE_UNCHANGED])
+// - after a successful sanitise, start with an empty version ledger and verify
+//   a `read_file` records the current live file version
 // =========================================================================
 
 #[tokio::test]
@@ -278,18 +277,13 @@ async fn end_to_end_resume_covers_transcript_and_worktree_and_cache() {
         .expect_err("missing worktree must refuse");
     assert!(matches!(err, SanitizeError::WorktreeMissing { .. }));
 
-    // --- Phase 3: post-resume cache behaviour --------------------------
+    // --- Phase 3: post-resume version-ledger behaviour -----------------
     let cache = Arc::new(FileStateCache::new());
-    let refs = vec![ReplacementStateRef {
-        path: dir.path().join("recovered.txt"),
-        content_hash: Some("100".into()),
-    }];
-    let seeded = cache.seed_from_replacement_refs(&refs);
-    assert_eq!(seeded, 1, "content-hash ref must seed");
+    assert!(
+        cache.is_empty(),
+        "historical transcript refs cannot seed a live disk version"
+    );
 
-    // read_file against the recovered path must return the LIVE body
-    // (not a false [FILE_UNCHANGED]): the seeded entry's UNIX_EPOCH
-    // mtime guarantees the first real read is a miss.
     let tool = ReadFileTool::new(dir.path());
     let mut ctx = ToolContext::zero();
     ctx.tool_id = "e2e-read".into();
@@ -304,6 +298,12 @@ async fn end_to_end_resume_covers_transcript_and_worktree_and_cache() {
         read.output
     );
     assert!(read.output.contains("body-line"));
+    let target =
+        FileTarget::for_local_workspace(dir.path(), &dir.path().join("recovered.txt")).unwrap();
+    assert!(
+        cache.get(&target).is_some(),
+        "the live post-resume read records the first trusted version"
+    );
 }
 
 // =========================================================================

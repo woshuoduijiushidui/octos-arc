@@ -1113,9 +1113,8 @@ pub struct SpawnTool {
     /// When combined with a budget policy, the dispatcher rejects
     /// spawns whose projected spend breaches the ceiling.
     cost_accountant: Option<Arc<crate::cost_ledger::CostAccountant>>,
-    /// M8 Runtime Parity W2.B1: parent session's `FileStateCache` so
-    /// spawned child Agents short-circuit re-reads of unchanged files
-    /// the same way the parent does. `None` keeps pre-W2 behaviour.
+    /// Parent task's strong file-version ledger. Children may share disk
+    /// observations, but model-visible read receipts remain branch-local.
     parent_file_state_cache: Option<Arc<FileStateCache>>,
     /// M8 Runtime Parity W2.B1: parent session's M8.7 output router so
     /// the child Agent's spawn_only background tools route output
@@ -1552,10 +1551,7 @@ impl SpawnTool {
         self
     }
 
-    /// M8 Runtime Parity W2.B1: inherit the parent session's
-    /// `FileStateCache` so spawned child Agents short-circuit re-reads
-    /// of unchanged files. Without this, every child re-reads the
-    /// entire workspace on every step.
+    /// Share the parent task's strong file-version ledger.
     pub fn with_parent_file_state_cache(mut self, cache: Arc<FileStateCache>) -> Self {
         self.parent_file_state_cache = Some(cache);
         self
@@ -2255,7 +2251,7 @@ fn extract_inline_podcast_script(task_desc: &str) -> Option<String> {
 ///
 /// Conservative on purpose:
 /// - Only one recovery attempt — second failure bubbles up verbatim.
-/// - Reuses the *same* worker / Agent instance so file-state cache,
+/// - Reuses the *same* worker / Agent instance so the file-version ledger,
 ///   compaction state, and persistent retry buckets are preserved.
 /// - The recovery turn is sent as an `additional_instructions`-style
 ///   tail appended to the original task description, so the worker's
@@ -3977,11 +3973,8 @@ impl Tool for SpawnTool {
                 }
             }
 
-            // M8 Runtime Parity W2.B1: inherit parent caches so the child
-            // observes the same file_state_cache + subagent_output_router
-            // + subagent_summary_generator the session actor wired. This
-            // closes the gap where spawned subagents had `file_state_cache:
-            // None` and re-read the entire workspace on every step.
+            // Share disk versions and the existing output infrastructure with
+            // the child. Model-visible read receipts are not stored here.
             if let Some(ref cache) = self.parent_file_state_cache {
                 worker = worker.with_file_state_cache(cache.clone());
             }
@@ -4318,7 +4311,7 @@ impl Tool for SpawnTool {
             };
             // M8 Runtime Parity W2.B1: capture parent caches into the
             // detached background closure so the bg child Agent gets the
-            // same FileStateCache + Router + SummaryGenerator as the sync
+            // same file-version ledger + Router + SummaryGenerator as the sync
             // path. Without these the detached subagent silently runs
             // without M8.4/M8.7 wiring even when the session actor
             // configured everything.
@@ -4603,10 +4596,8 @@ impl Tool for SpawnTool {
                 effective_config.suppress_auto_send_files = true;
                 effective_config.max_iterations = bg_max_iters;
                 worker = worker.with_config(effective_config);
-                // M8 Runtime Parity W2.B1: apply parent caches to the
-                // detached background child before it consumes any
-                // user-facing instruction. See `with_parent_file_state_cache`
-                // for the contract.
+                // Share disk versions with the detached child before it starts.
+                // Model-visible read receipts are separate branch-local state.
                 if let Some(ref cache) = parent_file_state_cache {
                     worker = worker.with_file_state_cache(cache.clone());
                 }

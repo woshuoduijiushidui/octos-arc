@@ -319,8 +319,8 @@ pub struct CodergenHandler {
     /// caller threading a dedicated provider in.
     compaction_llm_provider: Option<Arc<dyn LlmProvider>>,
     /// M8 parity (W1.A1): inherited resources from the parent session
-    /// — wired onto every per-node Agent so file tools see the same
-    /// FileStateCache, sub-agent output goes to the same router, and
+    /// — wired onto every per-node Agent so file tools share the same
+    /// disk-version ledger, sub-agent output goes to the same router, and
     /// the same summary generator drives periodic LLM digests for any
     /// background task the worker triggers.
     host_context: crate::host_context::PipelineHostContext,
@@ -443,7 +443,7 @@ impl CodergenHandler {
 
     /// M8 parity (W1.A1): attach the parent session's
     /// [`PipelineHostContext`] so the per-node Agent inherits the
-    /// shared FileStateCache / SubAgentOutputRouter /
+    /// shared file-version ledger / SubAgentOutputRouter /
     /// AgentSummaryGenerator handles. The default empty context keeps
     /// pre-M8 callers byte-for-byte identical.
     pub fn with_host_context(
@@ -890,7 +890,7 @@ impl Handler for CodergenHandler {
 
         // M8 parity (W1.A1): wire the parent session's shared
         // resources onto the per-node worker so file tools see the
-        // shared FileStateCache, sub-agent output flows through the
+        // shared file-version ledger, sub-agent output flows through the
         // shared SubAgentOutputRouter, and AgentSummaryGenerator drives
         // periodic LLM digests for any background task the worker
         // triggers. Each handle is optional so legacy callers (no host
