@@ -4587,6 +4587,16 @@ impl PromptContextManager for AppUiPromptContextBridge {
             .map(|epoch| epoch.epoch_id.clone())
     }
 
+    fn tool_output_projection_policy_id(&self) -> Option<String> {
+        Some(
+            self.context_manager
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .tool_output_policy_id()
+                .to_owned(),
+        )
+    }
+
     fn observe_effective_provider_route(&self, provider_name: &str, model_id: &str) {
         // Keep the per-loop scratch and durable canonical manager coherent.
         // `prepare_prompt` locks in this same order before copying scratch back

@@ -39,6 +39,7 @@ pub use prompt_segments::PromptSegmentProvider;
 
 use crate::file_state_cache::FileStateCache;
 use crate::hooks::{HookContext, HookExecutor};
+use crate::model_read_receipts::ModelReadReceiptStore;
 use crate::progress::{ProgressReporter, SilentReporter};
 use crate::prompt_context::PromptContextManager;
 use crate::session::{SessionLimits, SessionUsage};
@@ -436,6 +437,8 @@ pub struct Agent {
     /// [`crate::tools::ToolContext`] so file reads can record strong disk
     /// versions. It does not prove that a model saw file contents.
     pub(super) file_state_cache: Option<Arc<FileStateCache>>,
+    /// Branch-local proof that this model received exact `read_file` output.
+    pub(super) model_read_receipts: Option<Arc<ModelReadReceiptStore>>,
     /// M8.3 profile envelope applied at bootstrap. Recorded so callers can
     /// introspect the active profile name, compaction overrides, and model
     /// preferences. `None` means no profile was explicitly applied — the
@@ -653,6 +656,7 @@ impl Agent {
             persistent_retry_state: None,
             agent_definitions: Arc::new(crate::agents::AgentDefinitions::new()),
             file_state_cache: None,
+            model_read_receipts: None,
             profile: None,
             tiered_compaction: None,
             append_only_audit: Default::default(),
@@ -740,6 +744,7 @@ impl Agent {
             persistent_retry_state: None,
             agent_definitions: Arc::new(crate::agents::AgentDefinitions::new()),
             file_state_cache: None,
+            model_read_receipts: None,
             profile: None,
             tiered_compaction: None,
             append_only_audit: Default::default(),
@@ -974,8 +979,8 @@ impl Agent {
 
     /// Attach the task-local strong file-version ledger.
     ///
-    /// Reads record stable versions and mutations invalidate them. H02 M1
-    /// deliberately does not suppress repeated file contents.
+    /// Reads record stable versions and mutations invalidate them. This handle
+    /// alone never suppresses content; a separate receipt store is required.
     pub fn with_file_state_cache(mut self, cache: Arc<FileStateCache>) -> Self {
         self.file_state_cache = Some(cache);
         self
@@ -984,6 +989,12 @@ impl Agent {
     /// Access the agent's [`FileStateCache`] handle, if configured.
     pub fn file_state_cache(&self) -> Option<&Arc<FileStateCache>> {
         self.file_state_cache.as_ref()
+    }
+
+    /// Attach model-visible read state owned by this model branch.
+    pub fn with_model_read_receipts(mut self, receipts: Arc<ModelReadReceiptStore>) -> Self {
+        self.model_read_receipts = Some(receipts);
+        self
     }
 
     /// Wire an M8.7 [`crate::subagent_output::SubAgentOutputRouter`] so the

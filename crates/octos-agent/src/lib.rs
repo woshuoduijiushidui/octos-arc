@@ -35,6 +35,7 @@ pub mod mcp;
 pub mod mcp_auth;
 pub mod mcp_server;
 pub mod memory_segment;
+pub mod model_read_receipts;
 pub mod permissions;
 pub mod plugins;
 pub mod policy;
@@ -152,6 +153,7 @@ pub use memory_segment::{
     MEMORY_CAPTURE_POLICY, MEMORY_SEGMENT_NAME, MemorySegmentProvider, compose_memory_segment,
     stable_memory_instructions, volatile_memory_content,
 };
+pub use model_read_receipts::ModelReadReceiptStore;
 pub use permissions::{InvalidSafetyTier, SafetyTier};
 pub use plugins::{
     PluginLoadError, PluginLoadOptions, PluginLoadResult, PluginLoader, SynthesisConfig,

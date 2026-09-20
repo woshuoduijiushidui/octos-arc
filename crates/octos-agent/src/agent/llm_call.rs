@@ -86,6 +86,25 @@ impl Agent {
         // so callers must record it instead of re-pricing the merged total at
         // the winner's rate (codex #1632 P2). `None` = no attempt was priced.
     ) -> Result<(ChatResponse, bool, Option<f64>)> {
+        // Consume read candidates against the exact messages about to be sent.
+        // The batch stays local to this call and is activated only after a
+        // non-empty provider response succeeds. Silent checkpoint calls use a
+        // different model purpose and must not consume or activate the main
+        // branch's candidates.
+        let mut pending_read_receipts = if emit_progress {
+            self.model_read_receipts.as_ref().map(|receipts| {
+                let context_policy = self
+                    .prompt_context_manager
+                    .as_ref()
+                    .and_then(|manager| manager.tool_output_projection_policy_id())
+                    .unwrap_or_else(|| "direct-or-unspecified-v1".to_owned());
+                let policy_id = format!("read-output-exact-v1:{context_policy}");
+                receipts.prepare_dispatch(messages, &policy_id)
+            })
+        } else {
+            None
+        };
+
         // Measurement only (#pi/dsh append-only study): report whether this
         // turn's request history is still a prefix-extension of the last one.
         // Off unless OCTOS_APPEND_ONLY_AUDIT=1, and never alters the request —
@@ -290,6 +309,12 @@ impl Agent {
                         response.usage.cache_write_tokens += retry_usage.cache_write_tokens;
                         self.observe_semantic_checkpoint_report(&response, &provider_config);
                         self.observe_effective_provider_route(&response);
+                        if let (Some(receipts), Some(pending)) = (
+                            self.model_read_receipts.as_ref(),
+                            pending_read_receipts.take(),
+                        ) {
+                            receipts.activate(pending);
+                        }
 
                         if let Some(ref hooks) = self.hooks {
                             let latency_ms = call_start.elapsed().as_millis() as u64;
@@ -443,6 +468,12 @@ impl Agent {
                                     &provider_config,
                                 );
                                 self.observe_effective_provider_route(&fallback_resp);
+                                if let (Some(receipts), Some(pending)) = (
+                                    self.model_read_receipts.as_ref(),
+                                    pending_read_receipts.take(),
+                                ) {
+                                    receipts.activate(pending);
+                                }
                                 return Ok((fallback_resp, false, attributed_cost));
                             }
                             Ok(fallback_resp) => {
@@ -641,6 +672,12 @@ impl Agent {
                                 resp.usage.cache_write_tokens += retry_usage.cache_write_tokens;
                                 self.observe_semantic_checkpoint_report(&resp, &provider_config);
                                 self.observe_effective_provider_route(&resp);
+                                if let (Some(receipts), Some(pending)) = (
+                                    self.model_read_receipts.as_ref(),
+                                    pending_read_receipts.take(),
+                                ) {
+                                    receipts.activate(pending);
+                                }
                                 return Ok((resp, false, attributed_cost));
                             }
                             Ok(resp) => {
@@ -764,7 +801,7 @@ mod tests {
 
     use async_trait::async_trait;
     use futures::stream;
-    use octos_core::{AgentId, Message};
+    use octos_core::{AgentId, Message, MessageRole, ToolCall};
     use octos_llm::{
         ChatConfig, ChatResponse, ChatStream, LlmCallPolicy, LlmError, LlmErrorKind, LlmProvider,
         PromptCacheContext, ProviderChain, SemanticCheckpointReport, StopReason, StreamEvent,
@@ -774,6 +811,8 @@ mod tests {
 
     use super::super::Agent;
     use super::super::turn_state::LoopTurnState;
+    use crate::file_state_cache::{FileMetadataHint, FileTarget, FileVersion};
+    use crate::model_read_receipts::{FileView, ModelReadReceiptStore};
     use crate::prompt_context::{PromptContextManager, PromptContextReport, PromptContextRequest};
     use crate::tools::ToolRegistry;
 
@@ -1121,6 +1160,138 @@ mod tests {
 
     fn turn() -> LoopTurnState {
         LoopTurnState::new(Instant::now())
+    }
+
+    fn stage_read_candidate(store: &ModelReadReceiptStore) -> Vec<Message> {
+        let arguments = serde_json::json!({"path": "file.txt"});
+        let version = FileVersion::from_bytes(
+            FileTarget::new("workspace", "/workspace/file.txt"),
+            None,
+            b"body",
+            FileMetadataHint::new(4, None, None, None, None),
+        );
+        store.stage(
+            "call_read",
+            &arguments,
+            version,
+            FileView::Full,
+            FileView::Full,
+            "body",
+        );
+        let mut assistant = Message::assistant("");
+        assistant.tool_calls = Some(vec![ToolCall {
+            id: "call_read".to_owned(),
+            name: "read_file".to_owned(),
+            arguments,
+            metadata: None,
+        }]);
+        let tool = Message {
+            role: MessageRole::Tool,
+            content: "body".to_owned(),
+            media: Vec::new(),
+            tool_calls: None,
+            tool_call_id: Some("call_read".to_owned()),
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        };
+        vec![assistant, tool]
+    }
+
+    #[tokio::test]
+    async fn silent_llm_call_does_not_consume_or_activate_read_candidates() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(NamedRouteProvider {
+            provider: "mock",
+            model: "silent",
+            fail: false,
+        });
+        let (agent, _dir) = build_agent(provider).await;
+        let receipts = Arc::new(ModelReadReceiptStore::new());
+        let agent = agent.with_model_read_receipts(receipts.clone());
+        let messages = stage_read_candidate(&receipts);
+
+        agent
+            .call_llm_with_hooks_silent(
+                &messages,
+                &[],
+                &ChatConfig::default(),
+                1,
+                &octos_core::TokenUsage::default(),
+                &mut turn(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(receipts.staged_len(), 1);
+        assert_eq!(receipts.active_len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn before_llm_hook_deny_consumes_without_activating_read_candidates() {
+        use crate::hooks::{HookConfig, HookEvent, HookExecutor};
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(NamedRouteProvider {
+            provider: "mock",
+            model: "denied",
+            fail: false,
+        });
+        let (agent, _dir) = build_agent(provider).await;
+        let receipts = Arc::new(ModelReadReceiptStore::new());
+        let hooks = Arc::new(HookExecutor::new(vec![HookConfig {
+            event: HookEvent::BeforeLlmCall,
+            command: vec!["false".to_owned()],
+            timeout_ms: 5_000,
+            tool_filter: Vec::new(),
+            path_filter: Vec::new(),
+            requires_bin: None,
+        }]));
+        let agent = agent
+            .with_model_read_receipts(receipts.clone())
+            .with_hooks(hooks);
+        let messages = stage_read_candidate(&receipts);
+
+        let result = agent
+            .call_llm_with_hooks(
+                &messages,
+                &[],
+                &ChatConfig::default(),
+                1,
+                &octos_core::TokenUsage::default(),
+                &mut turn(),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(receipts.staged_len(), 0);
+        assert_eq!(receipts.active_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_llm_call_consumes_without_activating_read_candidates() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(HangingBuildProvider);
+        let (agent, _dir) = build_agent(provider).await;
+        let receipts = Arc::new(ModelReadReceiptStore::new());
+        let agent = agent.with_model_read_receipts(receipts.clone());
+        let messages = stage_read_candidate(&receipts);
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(25),
+            agent.call_llm_with_hooks(
+                &messages,
+                &[],
+                &ChatConfig::default(),
+                1,
+                &octos_core::TokenUsage::default(),
+                &mut turn(),
+            ),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(receipts.staged_len(), 0);
+        assert_eq!(receipts.active_len(), 0);
     }
 
     /// One clean streamed tool-call response with cache-bearing usage, on a

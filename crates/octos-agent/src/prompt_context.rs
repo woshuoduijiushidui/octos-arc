@@ -70,6 +70,13 @@ pub trait PromptContextManager: Send + Sync {
         None
     }
 
+    /// Identifier of the policy that projects tool output into model-visible
+    /// messages. A changed identifier invalidates read receipts even when the
+    /// resulting text happens to be byte-identical.
+    fn tool_output_projection_policy_id(&self) -> Option<String> {
+        None
+    }
+
     /// Report the concrete provider route that actually produced a response.
     /// Wrapper providers may fail over after prompt preparation, so the
     /// durable OUP cache epoch cannot rely only on the wrapper's pre-dispatch

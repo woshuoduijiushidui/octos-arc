@@ -1307,6 +1307,10 @@ impl ContextManager {
         self
     }
 
+    pub(crate) fn tool_output_policy_id(&self) -> &str {
+        &self.tool_output_policy.policy_id
+    }
+
     pub(crate) fn from_session_history(
         session_id: impl Into<String>,
         thread_id: Option<String>,
