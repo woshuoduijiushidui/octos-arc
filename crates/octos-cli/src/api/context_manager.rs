@@ -4976,10 +4976,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn h02_m0_characterization_full_cache_entry_precedes_truncated_prompt_projection() {
+    async fn h02_m1_disk_version_does_not_claim_full_prompt_visibility() {
         use std::sync::Arc;
 
-        use octos_agent::{FileStateCache, ReadFileTool, Tool, tools::ToolContext};
+        use octos_agent::{FileStateCache, FileTarget, ReadFileTool, Tool, tools::ToolContext};
 
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("projection.txt");
@@ -4996,14 +4996,11 @@ mod tests {
         assert!(result.success);
         assert!(result.output.len() > DEFAULT_MODEL_VISIBLE_TOOL_OUTPUT_MAX_BYTES);
 
-        let cached = cache
-            .peek(&path)
-            .or_else(|| {
-                let canonical = std::fs::canonicalize(&path).ok()?;
-                cache.peek(&canonical)
-            })
-            .expect("read_file caches before prompt projection");
-        assert!(!cached.is_partial_view && cached.view_range.is_none());
+        let target = FileTarget::for_local_workspace(temp.path(), &path).unwrap();
+        let version = cache
+            .get(&target)
+            .expect("read_file records a disk version");
+        assert_eq!(version.size(), 11_000);
 
         let mut manager = ContextManager::new("coding:local:h02-m0", None);
         manager.record_tool_output("call_read", "read_file", &result.output);

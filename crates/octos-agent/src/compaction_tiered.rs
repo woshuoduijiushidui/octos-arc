@@ -713,19 +713,11 @@ impl TieredCompactionRunner {
         Some(outcome.into())
     }
 
-    /// M8.4/M8.5 fix-first item 7: tier-3 compaction boundary hook.
+    /// Compatibility helper that clears file versions after tier-3 compaction.
     ///
-    /// When tier 3 fires, the old tool-result messages containing
-    /// `[FILE_UNCHANGED]` stubs are pruned/summarised. The matching
-    /// entries in the [`crate::file_state_cache::FileStateCache`] must
-    /// be cleared so a subsequent `read_file` does not short-circuit
-    /// against stale identity. The M8.4 docs promised this; the fix-
-    /// first checklist pins it.
-    ///
-    /// Callers that attach both the tiered runner and a file-state
-    /// cache should follow a tier-3 run with a
-    /// `cache.clear()` call — this helper performs the conditional
-    /// clear inline so the contract is easier to adopt.
+    /// H02 M1 never uses these versions to suppress file contents, so clearing
+    /// is conservative but not required for correctness. Model-visible receipt
+    /// lifecycle is introduced separately.
     pub fn run_tier3_and_invalidate_cache(
         &self,
         messages: &mut Vec<Message>,

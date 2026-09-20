@@ -169,10 +169,9 @@ impl Tool for DiffEditTool {
             None
         };
 
-        // M8.4: invalidate any stale cache entry — the file's contents and
-        // mtime just changed.
+        // Invalidate every recorded workspace-owned version for this path.
         if let Some(cache) = ctx.file_state_cache.as_ref() {
-            cache.invalidate(&path);
+            cache.invalidate_path(&path);
         }
 
         if let Err(error) =
@@ -404,6 +403,41 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tool = DiffEditTool::new(dir.path());
         assert_eq!(tool.concurrency_class(), ConcurrencyClass::Exclusive);
+    }
+
+    #[tokio::test]
+    async fn should_invalidate_file_version_after_diff_edit() {
+        use std::sync::Arc;
+
+        use crate::file_state_cache::{FileMetadataHint, FileStateCache, FileTarget, FileVersion};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        std::fs::write(&path, "old\n").unwrap();
+        let target = FileTarget::for_local_workspace(dir.path(), &path).unwrap();
+        let ledger = Arc::new(FileStateCache::new());
+        ledger.record(FileVersion::from_bytes(
+            target.clone(),
+            None,
+            b"old\n",
+            FileMetadataHint::new(4, None, None, None, None),
+        ));
+        let mut context = ToolContext::zero();
+        context.file_state_cache = Some(ledger.clone());
+
+        let result = DiffEditTool::new(dir.path())
+            .execute_with_context(
+                &context,
+                &serde_json::json!({
+                    "path": "file.txt",
+                    "diff": "@@ -1 +1 @@\n-old\n+new\n"
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "{}", result.output);
+        assert!(ledger.get(&target).is_none());
     }
 
     #[test]

@@ -96,8 +96,8 @@
 //! The ledger is a process-global map, NOT threaded through `ToolContext`
 //! state: the guard is a data-loss check and must hold on every entry path,
 //! including legacy `Tool::execute` calls that carry a zero context (the
-//! `FileStateCache` on `ToolContext` is optional and absent on those paths,
-//! which is why it was not reused). Entries are keyed by
+//! strong file-version ledger on `ToolContext` is optional and absent on those
+//! paths, which is why it was not reused). Entries are keyed by
 //! `(parent_session_key, canonical path)`: one session's COMPLETE never
 //! authorizes another's, and canonicalization keeps `read_file` and
 //! `write_file` agreeing over path aliases (`/var` vs `/private/var`). The map
@@ -147,9 +147,8 @@ pub(crate) enum WindowClamp {
     Bytes,
 }
 
-/// Typed prefix on the armed `write_file` refusal, so the model (and any
-/// harness) can match it structurally — same convention as
-/// `[FILE_UNCHANGED]`.
+/// Typed prefix on the armed `write_file` refusal so the model and harness can
+/// match it structurally.
 pub(crate) const PARTIAL_VIEW_OVERWRITE_PREFIX: &str = "[PARTIAL_VIEW_OVERWRITE]";
 
 /// Typed prefix for the DISTINCT tainted-overwrite refusal. A tainted view is

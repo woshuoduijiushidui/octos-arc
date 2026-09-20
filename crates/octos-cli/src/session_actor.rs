@@ -3167,10 +3167,9 @@ impl ActorFactory {
         // Create the per-actor session handle early so we can derive the
         // background task ledger path before any worker can mutate state.
         let mut session_handle = SessionHandle::open(&self.data_dir, &session_key);
-        // M8 fix-first item 8 (gap 1): construct the per-actor
-        // FileStateCache BEFORE sanitize so the resume hand-off can seed
-        // it directly. The same Arc is later wired into Agent::new so the
-        // recovered file-identity claims actually reach the file tools.
+        // The task-local file version ledger starts empty. Resume artifacts
+        // describe historical transcript state, not a stable observation of
+        // the current workspace, so they cannot seed disk versions.
         let file_state_cache = Arc::new(octos_agent::FileStateCache::new());
         // M8.6: sanitize the loaded transcript. Dropping unresolved tool
         // calls, orphan thinking, and whitespace-only messages here
@@ -3196,7 +3195,7 @@ impl ActorFactory {
             None
         };
         match session_handle.sanitize_loaded_messages(None, workspace_root_for_sanitize) {
-            Ok((report, refs)) => {
+            Ok((report, _refs)) => {
                 if report.input_len != report.output_len
                     || report.content_replacements_restored > 0
                     || !report.warnings.is_empty()
@@ -3205,20 +3204,6 @@ impl ActorFactory {
                         session = %session_key,
                         report = %report,
                         "resume sanitize applied"
-                    );
-                }
-                // M8.4/M8.6 fix-first item 7 + M8 fix-first item 8 (gap 1):
-                // hand-off complete and now WIRED. Seed the per-actor
-                // FileStateCache with the recovered replacement refs
-                // before any LLM call so post-resume reads consult the
-                // recovered hashes instead of returning false
-                // FILE_UNCHANGED stubs.
-                let seeded = file_state_cache.seed_from_replacement_refs(&refs);
-                if seeded > 0 {
-                    info!(
-                        session = %session_key,
-                        seeded,
-                        "seeded FileStateCache from resume refs"
                     );
                 }
             }
@@ -3972,8 +3957,8 @@ impl ActorFactory {
             .with_shutdown(cancelled.clone())
             .with_prompt_context_manager(prompt_context_bridge)
             .with_system_prompt(system_prompt)
-            // M8 fix-first item 8 (gap 1): wire the seeded per-actor
-            // FileStateCache so file tools see resumed-state claims.
+            // Wire the empty task-local version ledger. Stable reads populate
+            // it from the current workspace; resume history cannot seed it.
             .with_file_state_cache(file_state_cache.clone())
             // M8 fix-first item 8 (gap 2): wire the M8.7 disk router and
             // periodic summary generator so spawn_only background tasks

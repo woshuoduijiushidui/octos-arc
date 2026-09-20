@@ -206,9 +206,9 @@ fn expand_profile_tool_entries(entries: &[String]) -> HashSet<String> {
     out
 }
 
-/// File-state cache re-export (M8.4).
+/// Strong file-version ledger re-export.
 ///
-/// The concrete LRU + mtime/hash implementation lives in
+/// The concrete LRU + strong-version implementation lives in
 /// [`crate::file_state_cache`]; this re-export keeps the historical public
 /// path (`crate::tools::FileStateCache`) stable for downstream users while
 /// the ToolContext carries a shared handle.
@@ -273,13 +273,10 @@ pub struct ToolContext {
     pub agent_definitions: Arc<AgentDefinitions>,
     /// Per-tool permission facts. M8.3 will populate this.
     pub permissions: ToolPermissions,
-    /// File-state cache shared across tools in a turn (M8.4).
+    /// Strong file-version ledger shared across tools in a task.
     ///
-    /// File tools consult this cache on read and invalidate it on write. When
-    /// `None`, tools behave as they did pre-M8.4 (no cache, no stub). The
-    /// cache is wrapped in `Arc` so it can be cloned cheaply into subagents;
-    /// use [`FileStateCache::clone_for_subagent`] when a delegate should
-    /// receive an independent copy instead of a shared handle.
+    /// Reads record stable versions and mutations invalidate them. Model-visible
+    /// read receipts are separate state; this ledger never authorizes a stub.
     pub file_state_cache: Option<Arc<FileStateCache>>,
     /// Notification inbox surfaced to tools. M8.2/M8.3 will populate this.
     pub notifications: Arc<Notifications>,
@@ -1402,7 +1399,8 @@ fn open_no_follow_ro(path: &Path) -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new().read(true).open(path)
 }
 
-/// The descriptor-derived facts an armed windowed read needs beyond the bytes.
+/// The descriptor-derived facts a stable file read needs beyond the text.
+#[derive(Debug)]
 pub(crate) struct ReadMeta {
     /// [`crate::tools::read_window::ViewEpoch`] taken from the SAME descriptor
     /// the bytes came from — not a separate path stat — so it describes the
@@ -1415,57 +1413,152 @@ pub(crate) struct ReadMeta {
     /// reconstructed from it can never be faithful, and the view must never be
     /// allowed to reach COMPLETE (#2193 R4, PDF false-COMPLETE).
     pub transformed: bool,
+    /// Strong version of the raw on-disk bytes read from the descriptor.
+    ///
+    /// `None` means target canonicalization failed after the stable read. The
+    /// caller still returns the body but does not record an unverifiable key.
+    pub file_version: Option<crate::file_state_cache::FileVersion>,
 }
 
-/// Like [`read_no_follow`] but also returns the [`ReadMeta`] the armed
-/// windowed-read ledger needs. Kept as a distinct entry point so the many
-/// non-armed `read_no_follow` callers pay nothing for the extra `fstat`.
-pub(crate) async fn read_no_follow_with_meta(path: &Path) -> std::io::Result<(String, ReadMeta)> {
-    let path = path.to_owned();
-    tokio::task::spawn_blocking(move || {
-        use std::io::{Read, Seek, SeekFrom};
-        let mut file = open_no_follow_ro(&path)?;
-        // fstat the DESCRIPTOR (not a re-resolution of the path): binds the
-        // epoch to the exact inode these bytes are read from.
-        let epoch = file
-            .metadata()
-            .ok()
-            .and_then(|m| crate::tools::read_window::ViewEpoch::from_metadata(&m));
-        // Same PDF handling as read_no_follow, reading the rest from the SAME
-        // O_NOFOLLOW descriptor (seek back to 0), never by re-opening the path.
-        let mut magic = [0u8; 5];
-        let n = file.read(&mut magic)?;
-        file.seek(SeekFrom::Start(0))?;
-        if n >= 5 && &magic == b"%PDF-" {
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes)?;
-            match pdf_extract::extract_text_from_mem(&bytes) {
-                Ok(text) => Ok((
-                    text,
-                    ReadMeta {
-                        epoch,
-                        transformed: true,
-                    },
-                )),
-                Err(err) => Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("pdf extraction failed: {err}"),
-                )),
+#[derive(Debug)]
+pub(crate) enum StableReadError {
+    Io(std::io::Error),
+    TooLarge { size: u64, max: u64 },
+    ConcurrentChange,
+}
+
+impl std::fmt::Display for StableReadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => error.fmt(formatter),
+            Self::TooLarge { size, max } => {
+                write!(formatter, "file is {size} bytes, maximum is {max}")
             }
-        } else {
-            let mut content = String::with_capacity(n);
-            file.read_to_string(&mut content)?;
-            Ok((
-                content,
-                ReadMeta {
-                    epoch,
-                    transformed: false,
-                },
-            ))
+            Self::ConcurrentChange => write!(formatter, "file changed while it was being read"),
         }
+    }
+}
+
+impl std::error::Error for StableReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::TooLarge { .. } | Self::ConcurrentChange => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for StableReadError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+/// Read and hash one stable generation from a no-follow descriptor.
+///
+/// A changed descriptor or path identity is retried once. A second mismatch
+/// returns [`StableReadError::ConcurrentChange`] without producing a version.
+pub(crate) async fn read_no_follow_with_meta(
+    path: &Path,
+    workspace_root: &Path,
+    max_bytes: u64,
+) -> Result<(String, ReadMeta), StableReadError> {
+    let path = path.to_owned();
+    let workspace_root = workspace_root.to_owned();
+    tokio::task::spawn_blocking(move || {
+        read_no_follow_with_meta_blocking(&path, &workspace_root, max_bytes, |_, _| Ok(()))
     })
     .await
-    .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+    .unwrap_or_else(|error| Err(StableReadError::Io(std::io::Error::other(error))))
+}
+
+fn read_no_follow_with_meta_blocking(
+    path: &Path,
+    workspace_root: &Path,
+    max_bytes: u64,
+    mut after_read: impl FnMut(usize, &Path) -> std::io::Result<()>,
+) -> Result<(String, ReadMeta), StableReadError> {
+    use std::io::Read;
+
+    for attempt in 0..2 {
+        let mut file = open_no_follow_ro(path)?;
+        let before = file.metadata()?;
+        if before.len() > max_bytes {
+            return Err(StableReadError::TooLarge {
+                size: before.len(),
+                max: max_bytes,
+            });
+        }
+
+        let mut bytes = Vec::with_capacity(before.len() as usize);
+        file.by_ref()
+            .take(max_bytes.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(StableReadError::TooLarge {
+                size: bytes.len() as u64,
+                max: max_bytes,
+            });
+        }
+        after_read(attempt, path)?;
+
+        let after = file.metadata()?;
+        let path_after = match std::fs::symlink_metadata(path) {
+            Ok(metadata) if !metadata.file_type().is_symlink() => metadata,
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(StableReadError::Io(error)),
+        };
+        let before_hint = crate::file_state_cache::FileMetadataHint::from_metadata(&before);
+        let after_hint = crate::file_state_cache::FileMetadataHint::from_metadata(&after);
+        let path_hint = crate::file_state_cache::FileMetadataHint::from_metadata(&path_after);
+        if !metadata_matches_stable_observation(&before_hint, &after_hint, &path_hint, bytes.len())
+        {
+            continue;
+        }
+
+        let file_version =
+            crate::file_state_cache::FileTarget::for_local_workspace(workspace_root, path)
+                .ok()
+                .map(|target| {
+                    crate::file_state_cache::FileVersion::from_bytes(
+                        target, None, &bytes, after_hint,
+                    )
+                });
+        let transformed = bytes.starts_with(b"%PDF-");
+        let content = if transformed {
+            pdf_extract::extract_text_from_mem(&bytes).map_err(|error| {
+                StableReadError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("pdf extraction failed: {error}"),
+                ))
+            })?
+        } else {
+            String::from_utf8(bytes).map_err(|error| {
+                StableReadError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+            })?
+        };
+        let epoch = crate::tools::read_window::ViewEpoch::from_metadata(&after);
+        return Ok((
+            content,
+            ReadMeta {
+                epoch,
+                transformed,
+                file_version,
+            },
+        ));
+    }
+
+    Err(StableReadError::ConcurrentChange)
+}
+
+fn metadata_matches_stable_observation(
+    before: &crate::file_state_cache::FileMetadataHint,
+    after: &crate::file_state_cache::FileMetadataHint,
+    path_after: &crate::file_state_cache::FileMetadataHint,
+    bytes_read: usize,
+) -> bool {
+    before == after && after == path_after && after.size() == bytes_read as u64
 }
 
 /// Write content to a file, atomically rejecting symlinks via O_NOFOLLOW on Unix.
@@ -1671,15 +1764,95 @@ mod nofollow_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hello.txt");
         std::fs::write(&path, b"hello world\n").unwrap();
-        let (content, meta) = read_no_follow_with_meta(&path).await.unwrap();
+        let (content, meta) = read_no_follow_with_meta(&path, dir.path(), 10_000_000)
+            .await
+            .unwrap();
         assert_eq!(content, "hello world\n");
         assert!(!meta.transformed, "plain text is not a transform");
+        assert_eq!(
+            meta.file_version
+                .as_ref()
+                .expect("canonical target")
+                .content_sha256(),
+            crate::file_state_cache::FileVersion::sha256(b"hello world\n")
+        );
         let epoch = meta.epoch.expect("descriptor epoch");
         assert_eq!(epoch.size, 12);
         let independent =
             crate::tools::read_window::ViewEpoch::from_metadata(&std::fs::metadata(&path).unwrap())
                 .unwrap();
         assert_eq!(epoch, independent, "epoch describes the exact inode read");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_observation_rejects_path_replaced_during_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("target.txt");
+        let old_path = dir.path().join("old.txt");
+        std::fs::write(&path, b"old").unwrap();
+        let file = open_no_follow_ro(&path).unwrap();
+        let before = file.metadata().unwrap();
+
+        std::fs::rename(&path, &old_path).unwrap();
+        std::fs::write(&path, b"new").unwrap();
+
+        let after = file.metadata().unwrap();
+        let path_after = std::fs::symlink_metadata(&path).unwrap();
+        assert!(
+            !metadata_matches_stable_observation(
+                &crate::file_state_cache::FileMetadataHint::from_metadata(&before),
+                &crate::file_state_cache::FileMetadataHint::from_metadata(&after),
+                &crate::file_state_cache::FileMetadataHint::from_metadata(&path_after),
+                3,
+            ),
+            "a replacement path must not be recorded as the descriptor's version"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_read_retries_once_then_reports_concurrent_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("target.txt");
+        std::fs::write(&path, b"old").unwrap();
+
+        let error =
+            read_no_follow_with_meta_blocking(&path, dir.path(), 10_000_000, |attempt, path| {
+                let parked = dir.path().join(format!("generation-{attempt}.txt"));
+                let replacement = dir.path().join(format!("replacement-{attempt}.txt"));
+                std::fs::write(&replacement, b"new")?;
+                std::fs::rename(path, parked)?;
+                std::fs::rename(replacement, path)
+            })
+            .expect_err("two unstable observations must fail closed");
+
+        assert!(matches!(error, StableReadError::ConcurrentChange));
+    }
+
+    #[tokio::test]
+    async fn stable_read_returns_io_error_for_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.txt");
+        let error = read_no_follow_with_meta(&missing, dir.path(), 10_000_000)
+            .await
+            .expect_err("missing file must fail");
+        assert!(matches!(error, StableReadError::Io(_)));
+    }
+
+    #[tokio::test]
+    async fn stable_read_returns_body_when_workspace_identity_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("present.txt");
+        std::fs::write(&path, "body").unwrap();
+
+        let (content, meta) =
+            read_no_follow_with_meta(&path, &dir.path().join("missing-workspace"), 10_000_000)
+                .await
+                .expect("version-key failure must not fail the read");
+
+        assert_eq!(content, "body");
+        assert!(meta.file_version.is_none());
     }
 
     #[tokio::test]
@@ -1777,6 +1950,21 @@ mod nofollow_tests {
 
         let err = read_no_follow(&link).await.unwrap_err();
         assert!(is_symlink_error(&err), "expected ELOOP, got: {err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stable_read_rejects_symlink_without_recording_a_version() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("target.txt");
+        std::fs::write(&target, "secret").unwrap();
+        let link = dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let error = read_no_follow_with_meta(&link, dir.path(), 10_000_000)
+            .await
+            .expect_err("stable read must reject a symlink leaf");
+        assert!(matches!(error, StableReadError::Io(ref io) if is_symlink_error(io)));
     }
 
     #[tokio::test]

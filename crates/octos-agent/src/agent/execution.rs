@@ -634,7 +634,7 @@ impl Agent {
         // and file_state_cache into both foreground and spawn_only ToolContext
         // builders so spawn(agent_definition_id=..) keeps resolving against
         // the live registry and read_file keeps short-circuiting via the
-        // shared file-state cache.
+        // shared file-version ledger.
         let agent_definitions = self.agent_definitions.clone();
         let file_state_cache = self.file_state_cache.clone();
         // M8 fix-first item 8 (gap 4b): if the agent carries a resolved

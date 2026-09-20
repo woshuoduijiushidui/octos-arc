@@ -7,8 +7,11 @@ use eyre::Result;
 use serde::Deserialize;
 
 use super::{Tool, ToolContext, ToolResult};
-use crate::file_state_cache::{CacheEntry, FileStateCache, format_file_unchanged_stub};
+#[cfg(test)]
+use crate::file_state_cache::FileStateCache;
 use crate::policy::FilesystemScope;
+
+const MAX_FILE_BYTES: u64 = 10_000_000;
 
 /// Tool for reading file contents.
 pub struct ReadFileTool {
@@ -266,9 +269,8 @@ impl ReadFileTool {
             });
         }
 
-        // #1767: fold `limit` into an effective end_line up front so every
-        // consumer below (range slicing AND the file-state cache key) sees
-        // one canonical range.
+        // #1767: fold `limit` into an effective end_line up front so range
+        // slicing sees one canonical range.
         let (start_line, end_line) =
             match resolve_line_range(input.start_line, input.end_line, input.limit) {
                 Ok(range) => range,
@@ -363,8 +365,7 @@ impl ReadFileTool {
 
         // Reject files larger than 10MB to prevent OOM (output is capped to 100KB
         // anyway, and reading a multi-GB file just to slice a few lines is wasteful).
-        const MAX_FILE_BYTES: u64 = 10_000_000;
-        let (current_mtime, file_size) = match tokio::fs::metadata(&path).await {
+        let file_size = match tokio::fs::symlink_metadata(&path).await {
             Ok(meta) if meta.len() > MAX_FILE_BYTES => {
                 return Ok(ToolResult {
                     output: format!(
@@ -376,47 +377,32 @@ impl ReadFileTool {
                     ..Default::default()
                 });
             }
-            Ok(meta) => (meta.modified().ok(), meta.len() as usize),
-            Err(_) => (None, 0),
+            Ok(meta) => meta.len() as usize,
+            Err(_) => 0,
         };
 
-        // M8.4: file-state cache consultation. When the cache is configured
-        // and the caller-supplied mtime matches, emit a typed
-        // `[FILE_UNCHANGED]` stub rather than re-reading and re-emitting the
-        // file body. This reduces token cost by 30-60 % in long sessions.
-        // We store the user-supplied range verbatim so the comparison here is
-        // exact (without needing to know the file's total line count).
-        let requested_range = user_range(start_line, end_line);
-        // #1638: a byte-mode request is NOT a line-range request — the cache
-        // stores line ranges, so a stored complete entry must never answer a
-        // byte request with the [FILE_UNCHANGED] stub (the byte branch below
-        // also never stores into the cache).
-        if input.byte_offset.is_none()
-            && let (Some(cache), Some(mtime)) = (ctx.file_state_cache.as_ref(), current_mtime)
-        {
-            if let Some(entry) = cache.get(&path, mtime) {
-                if cache_matches_request(&entry, requested_range) {
-                    return Ok(ToolResult {
-                        output: format_file_unchanged_stub(&path, entry.view_range),
-                        success: true,
-                        ..Default::default()
-                    });
-                }
-            }
-        }
+        let workspace_root = ctx
+            .session_scope
+            .as_ref()
+            .map(|scope| scope.workspace())
+            .unwrap_or(self.base_dir.as_path());
 
         // #1638 R6 (armed-only): raw byte mode. Reached only when armed —
-        // unarmed byte params were rejected above. Bypasses the M8.4 cache in
-        // BOTH directions (the cache's view ranges are line ranges, so a byte
-        // request must never be answered with a line-range [FILE_UNCHANGED]
-        // stub, and a byte view must never be stored as one) and bypasses the
-        // #2131 refusal (a byte read is bounded by construction).
+        // unarmed byte params were rejected above. It bypasses the #2131
+        // refusal because a byte read is bounded by construction.
         if let Some(requested_offset) = input.byte_offset {
             use super::read_window::WINDOW_MAX_BYTES;
-            let (content, read_meta) = match super::read_no_follow_with_meta(&path).await {
+            let (content, read_meta) = match super::read_no_follow_with_meta(
+                &path,
+                workspace_root,
+                MAX_FILE_BYTES,
+            )
+            .await
+            {
                 Ok(cm) => cm,
-                Err(e) => return Ok(super::file_io_error(e, &input.path)),
+                Err(error) => return Ok(stable_read_error(error, &input.path)),
             };
+            record_file_version(ctx, &read_meta);
             let total = content.len();
             if requested_offset >= total {
                 return Ok(ToolResult {
@@ -506,11 +492,14 @@ impl ReadFileTool {
             }
         }
 
-        // Read file (O_NOFOLLOW atomically rejects symlinks, no TOCTOU race)
-        let (content, read_meta) = match super::read_no_follow_with_meta(&path).await {
-            Ok(cm) => cm,
-            Err(e) => return Ok(super::file_io_error(e, &input.path)),
-        };
+        // Read and hash one stable file generation from the same no-follow
+        // descriptor. A concurrent replacement is retried once in the helper.
+        let (content, read_meta) =
+            match super::read_no_follow_with_meta(&path, workspace_root, MAX_FILE_BYTES).await {
+                Ok(observation) => observation,
+                Err(error) => return Ok(stable_read_error(error, &input.path)),
+            };
+        record_file_version(ctx, &read_meta);
 
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
@@ -679,35 +668,6 @@ impl ReadFileTool {
             octos_core::truncate_utf8(&mut output, MAX_OUTPUT, "\n... (content truncated)");
         }
 
-        // M8.4: record this read in the file-state cache so a later read can
-        // short-circuit to the `[FILE_UNCHANGED]` stub. Skip binary blobs —
-        // we never want to serve an image/PDF body from the cache.
-        //
-        // #1638 (b): the recorded view is the view RETURNED, not the view
-        // requested. A clamped read stores its actual window, so an unbounded
-        // request can never hit a windowed entry and claim
-        // `[FILE_UNCHANGED] (full file cached)` against content the model
-        // was never shown.
-        let recorded_range = if clamp.is_some() {
-            Some(((start + 1) as u64, included_end as u64))
-        } else {
-            user_range(start_line, end_line)
-        };
-        if let (Some(cache), Some(mtime)) = (ctx.file_state_cache.as_ref(), current_mtime) {
-            let can_cache = !FileStateCache::has_binary_extension(&path)
-                && FileStateCache::is_text_cacheable(content.as_bytes());
-            if can_cache {
-                cache.put(CacheEntry::new(
-                    path.clone(),
-                    mtime,
-                    FileStateCache::content_hash(content.as_bytes()),
-                    file_size,
-                    recorded_range.is_some(),
-                    recorded_range,
-                ));
-            }
-        }
-
         // #1638 (c): feed the view ledger that backs write_file's fail-closed
         // overwrite guard. Armed only — a disarmed read records nothing, so
         // arming later never trusts evidence gathered while off. Coverage is
@@ -772,35 +732,36 @@ fn line_start_byte_offset(content: &str, line: usize) -> usize {
         .sum()
 }
 
-/// Encode the user-supplied (start_line, end_line) pair as a cache range.
-///
-/// Returns `None` when the caller did not provide either bound (meaning "the
-/// whole file"). When only one bound is set, the absent side is stored as
-/// 0 (for a missing start) or [`u64::MAX`] (for a missing end) so the tuple
-/// still compares by identity without needing the file's total-line count.
-fn user_range(start: Option<usize>, end: Option<usize>) -> Option<(u64, u64)> {
-    if start.is_none() && end.is_none() {
-        return None;
+fn record_file_version(ctx: &ToolContext, read_meta: &super::ReadMeta) {
+    if let (Some(ledger), Some(version)) = (
+        ctx.file_state_cache.as_ref(),
+        read_meta.file_version.as_ref(),
+    ) {
+        ledger.record(version.clone());
     }
-    Some((
-        start.map(|s| s as u64).unwrap_or(0),
-        end.map(|e| e as u64).unwrap_or(u64::MAX),
-    ))
 }
 
-/// True when a cached entry can satisfy the caller's request without
-/// re-reading the file. A full-file cache satisfies any request. A partial
-/// cache satisfies a request only if the ranges agree exactly.
-fn cache_matches_request(entry: &CacheEntry, requested_range: Option<(u64, u64)>) -> bool {
-    match (entry.view_range, requested_range) {
-        // Full-file cache covers a full-file request.
-        (None, None) => true,
-        // A full-file read cannot satisfy a partial request without knowing
-        // the file's line count. Be conservative.
-        (None, Some(_)) => false,
-        // A partial cache cannot satisfy a full request.
-        (Some(_), None) => false,
-        (Some(cached), Some(requested)) => cached == requested,
+fn stable_read_error(error: super::StableReadError, input_path: &str) -> ToolResult {
+    match error {
+        super::StableReadError::Io(error) => super::file_io_error(error, input_path),
+        super::StableReadError::TooLarge { size, max } => ToolResult {
+            output: format!(
+                "File too large ({size} bytes, max {max}). Use start_line/end_line on smaller files."
+            ),
+            success: false,
+            ..Default::default()
+        },
+        super::StableReadError::ConcurrentChange => ToolResult {
+            output: format!(
+                "File changed while it was being read: {input_path}. Re-read the file and retry."
+            ),
+            success: false,
+            structured_metadata: Some(serde_json::json!({
+                "code": "concurrent_file_change",
+                "path": input_path,
+            })),
+            ..Default::default()
+        },
     }
 }
 
@@ -1072,7 +1033,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // M8.4 integration tests — file-state cache behaviour in ReadFileTool
+    // H02 M1 integration tests — strong versions without body suppression.
     // -----------------------------------------------------------------------
 
     use std::sync::Arc;
@@ -1084,9 +1045,28 @@ mod tests {
         ctx
     }
 
+    fn legacy_output_hash(bytes: &[u8]) -> u64 {
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
+        bytes.iter().fold(FNV_OFFSET, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
+        })
+    }
+
+    #[test]
+    fn concurrent_change_error_has_typed_recovery_code() {
+        let result = stable_read_error(crate::tools::StableReadError::ConcurrentChange, "file.txt");
+
+        assert!(!result.success);
+        assert!(result.output.contains("Re-read"));
+        assert_eq!(
+            result.structured_metadata.as_ref().unwrap()["code"],
+            "concurrent_file_change"
+        );
+    }
+
     #[tokio::test]
-    #[ignore = "H02 M0: baseline returns a false stub before any model dispatch"]
-    async fn h02_contract_returns_body_until_a_model_dispatch_confirms_visibility() {
+    async fn should_return_body_until_a_model_dispatch_confirms_visibility() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("stable.txt"), "first\nsecond\nthird\n").unwrap();
 
@@ -1119,7 +1099,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn h02_m0_characterization_caches_full_before_final_prompt_projection() {
+    async fn should_record_strong_version_without_claiming_model_visibility() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("projection.txt");
         std::fs::write(&file, "abcdefghij\n".repeat(1000)).unwrap();
@@ -1139,26 +1119,22 @@ mod tests {
         );
         assert!(
             result.structured_metadata.is_none(),
-            "baseline read_file exposes no typed candidate metadata"
+            "M1 records disk state without creating an M2 read candidate"
         );
-        let entry = cache
-            .peek(&file)
-            .or_else(|| {
-                let canonical = std::fs::canonicalize(&file).ok()?;
-                cache.peek(&canonical)
-            })
-            .expect("read_file stores its pre-projection cache entry");
-        assert!(
-            !entry.is_partial_view && entry.view_range.is_none(),
-            "baseline marks the read complete before the later 8 KiB projection"
+        let target =
+            crate::file_state_cache::FileTarget::for_local_workspace(dir.path(), &file).unwrap();
+        let version = cache
+            .get(&target)
+            .expect("read_file records a disk version");
+        assert_eq!(version.size(), 11_000);
+        assert_eq!(
+            version.content_sha256(),
+            crate::file_state_cache::FileVersion::sha256(&"abcdefghij\n".repeat(1000).into_bytes())
         );
     }
 
     #[tokio::test]
-    async fn should_read_file_tool_miss_when_file_changed_between_reads() {
-        // On most filesystems mtime resolution is coarser than a millisecond.
-        // Seed the cache with an explicitly-older mtime so the subsequent
-        // rewrite is guaranteed to bump it.
+    async fn should_record_new_version_when_file_changed_between_reads() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("edits.txt");
         std::fs::write(&file, "v1\n").unwrap();
@@ -1171,21 +1147,10 @@ mod tests {
             .execute_with_context(&ctx, &serde_json::json!({"path": "edits.txt"}))
             .await
             .unwrap();
-        assert_eq!(cache.len(), 1);
+        let target =
+            crate::file_state_cache::FileTarget::for_local_workspace(dir.path(), &file).unwrap();
+        let first = cache.get(&target).expect("first version");
 
-        // Back-date the cached mtime by 5 seconds to simulate a later edit
-        // without waiting for wall-clock granularity to change on CI.
-        let backdated = std::time::SystemTime::now() - std::time::Duration::from_secs(5);
-        cache.put(CacheEntry::new(
-            dir.path().join("edits.txt"),
-            backdated,
-            0xDEAD_BEEF,
-            2,
-            false,
-            None,
-        ));
-
-        // Rewriting the file must bust the cache on the next read.
         std::fs::write(&file, "v2_content\n").unwrap();
 
         let result = tool
@@ -1199,6 +1164,8 @@ mod tests {
             result.output
         );
         assert!(result.output.contains("v2_content"));
+        let second = cache.get(&target).expect("second version");
+        assert_ne!(first.content_sha256(), second.content_sha256());
     }
 
     #[tokio::test]
@@ -1568,10 +1535,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_hit_cache_when_limit_expresses_same_range_as_end_line() {
-        // limit folds into the canonical (start, end) range BEFORE the
-        // file-state cache is consulted, so an offset+limit request and a
-        // start_line+end_line request for the same lines share one entry.
+    async fn should_return_body_when_limit_expresses_same_range_as_end_line() {
+        // M1 records only the disk version. Equivalent range spellings still
+        // return their requested body until M2 can prove model visibility.
         let dir = tempfile::tempdir().unwrap();
         ten_lines_file(&dir);
 
@@ -1598,15 +1564,14 @@ mod tests {
             .unwrap();
         assert!(second.success);
         assert!(
-            second.output.contains("[FILE_UNCHANGED]"),
-            "same canonical range must hit the cache: {}",
+            !second.output.contains("[FILE_UNCHANGED]") && second.output.contains("line 4"),
+            "M1 must return the requested body: {}",
             second.output
         );
     }
 
     #[tokio::test]
-    async fn should_read_file_tool_not_hit_when_range_differs() {
-        // A (1, 5) cache entry cannot satisfy a (3, 7) request.
+    async fn should_return_body_when_range_differs() {
         let dir = tempfile::tempdir().unwrap();
         let content = (1..=10)
             .map(|i| format!("line {i}"))
@@ -1636,7 +1601,7 @@ mod tests {
         assert!(second.success);
         assert!(
             !second.output.contains("[FILE_UNCHANGED]"),
-            "different range must not hit cache, got: {}",
+            "M1 must return the requested range body, got: {}",
             second.output
         );
         assert!(second.output.contains("line 7"));
@@ -1985,7 +1950,7 @@ mod tests {
         assert_eq!(
             (
                 small.output.len(),
-                FileStateCache::content_hash(small.output.as_bytes())
+                legacy_output_hash(small.output.as_bytes())
             ),
             (32, 0xa9a1_582d_5fdd_6b1c),
             "armed read of a small file must be byte-identical to unarmed: {:?}",
@@ -2002,7 +1967,7 @@ mod tests {
         assert_eq!(
             (
                 range.output.len(),
-                FileStateCache::content_hash(range.output.as_bytes())
+                legacy_output_hash(range.output.as_bytes())
             ),
             (62, 0x7ca7_68c2_04c1_08d7),
             "armed in-window explicit range must be byte-identical to unarmed: {:?}",
@@ -2013,7 +1978,7 @@ mod tests {
     #[tokio::test]
     async fn should_keep_unarmed_outputs_byte_identical_to_pre_change_goldens() {
         // Golden compare against a capture taken on the pre-change tree
-        // (fnv-1a via FileStateCache::content_hash, plus exact lengths).
+        // (FNV-1a plus exact lengths).
         // Inputs are reconstructed deterministically; outputs embed only the
         // relative path, so the hashes are stable across hosts.
         let dir = tempfile::tempdir().unwrap();
@@ -2083,7 +2048,7 @@ mod tests {
                 (
                     r.success,
                     r.output.len(),
-                    FileStateCache::content_hash(r.output.as_bytes())
+                    legacy_output_hash(r.output.as_bytes())
                 ),
                 (success, len, fnv),
                 "unarmed output changed for {args}: {:?}...",
@@ -2264,11 +2229,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_not_serve_file_unchanged_for_a_byte_mode_read() {
-        // The M8.4 cache stores LINE ranges; a byte-mode request must bypass
-        // it entirely — a cached complete entry must not answer a byte
-        // request with the [FILE_UNCHANGED] stub, and a byte read must not
-        // poison the line-range cache.
+    async fn should_return_body_for_a_byte_mode_read() {
+        // Byte reads also record a disk version, but never suppress content.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("cached.txt"), "one\ntwo\nthree\n").unwrap();
         let tool = ReadFileTool::new(dir.path()).with_window_enforcement(true);
@@ -2291,11 +2253,19 @@ mod tests {
         assert!(bytes.success, "{}", bytes.output);
         assert!(
             !bytes.output.contains("[FILE_UNCHANGED]"),
-            "a byte-mode read must never be answered from the line-range \
-             cache: {}",
+            "a byte-mode read must return content in M1: {}",
             bytes.output
         );
         assert!(bytes.output.starts_with("one"), "{}", bytes.output);
+        let target = crate::file_state_cache::FileTarget::for_local_workspace(
+            dir.path(),
+            &dir.path().join("cached.txt"),
+        )
+        .unwrap();
+        assert!(
+            cache.get(&target).is_some(),
+            "byte mode records the same disk-version fact as line mode"
+        );
     }
 
     #[tokio::test]
@@ -2329,13 +2299,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_not_cache_a_windowed_read_as_complete_when_armed() {
-        // (b) The file-state cache hazard: a windowed read recorded as "no
-        // range = complete file" would make the next unbounded read return
-        // `[FILE_UNCHANGED] (full file cached)` — a lie about a view the
-        // model never fully saw. The recorded view must be the RETURNED
-        // window, so an unbounded re-read re-pages instead of claiming
-        // completeness.
+    async fn should_return_body_when_repeating_windowed_unbounded_read() {
+        // Disk versions do not contain model-visible range claims.
         let dir = tempfile::tempdir().unwrap();
         wide_rows_file(&dir, "cache_armed.txt");
         let tool = ReadFileTool::new(dir.path()).with_window_enforcement(true);
@@ -2368,9 +2333,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_still_serve_file_unchanged_for_a_repeated_in_window_range_when_armed() {
-        // Arming must not destroy the M8.4 cache win for ranges the model
-        // truly saw in full.
+    async fn should_return_body_for_a_repeated_in_window_range_when_armed() {
+        // The disk version ledger is independent of model-visible ranges.
         let dir = tempfile::tempdir().unwrap();
         ten_lines_file(&dir);
         let tool = ReadFileTool::new(dir.path()).with_window_enforcement(true);
@@ -2394,8 +2358,8 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            second.output.contains("[FILE_UNCHANGED]"),
-            "an identical fully-seen range still hits the cache when armed: {}",
+            !second.output.contains("[FILE_UNCHANGED]") && second.output.contains("line 5"),
+            "M1 must return the requested range body: {}",
             second.output
         );
     }

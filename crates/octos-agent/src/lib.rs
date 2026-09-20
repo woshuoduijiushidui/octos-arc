@@ -129,9 +129,9 @@ pub use dispatch_policy::{
 pub use event_bus::{EventBus, EventSubscriber};
 pub use exec_env::{DockerEnvironment, ExecEnvironment, ExecOutput, LocalEnvironment};
 pub use file_state_cache::{
-    CacheEntry as FileCacheEntry, DEFAULT_MAX_ENTRIES as FILE_CACHE_DEFAULT_MAX_ENTRIES,
-    DEFAULT_MAX_TOTAL_BYTES as FILE_CACHE_DEFAULT_MAX_TOTAL_BYTES, FILE_UNCHANGED_STUB_PREFIX,
-    FileStateCache, FileStateCacheBuilder, format_file_unchanged_stub,
+    DEFAULT_MAX_ENTRIES as FILE_CACHE_DEFAULT_MAX_ENTRIES,
+    DEFAULT_MAX_TOTAL_BYTES as FILE_CACHE_DEFAULT_MAX_TOTAL_BYTES, FileMetadataHint,
+    FileStateCache, FileStateCacheBuilder, FileTarget, FileVersion,
 };
 pub use harness_errors::{HarnessError, HarnessErrorEvent, OCTOS_LOOP_ERROR_TOTAL, RecoveryHint};
 pub use harness_events::{

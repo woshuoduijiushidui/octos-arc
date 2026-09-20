@@ -3,7 +3,7 @@
 //! call enters the executor.
 //!
 //! The pipeline historically constructed sub-agents in isolation —
-//! every node opened its own `FileStateCache`, no
+//! every node opened its own file-version ledger, no
 //! `SubAgentOutputRouter`, no `TaskSupervisor` registration, no shared
 //! cost ledger. M8 runtime parity (issue #592 — track W1) closes that
 //! gap by snapshotting the live values from the parent session's
@@ -32,9 +32,8 @@ use octos_core::SessionScope;
 /// the no-op path when the field is unset.
 #[derive(Clone, Default)]
 pub struct PipelineHostContext {
-    /// Parent session's [`FileStateCache`]. When set, every pipeline
-    /// node worker is built with `Agent::with_file_state_cache(...)` so
-    /// file tools see the same cache state as the foreground turn.
+    /// Parent task's [`FileStateCache`]. Pipeline nodes share disk versions;
+    /// model-visible read receipts remain separate state.
     pub file_state_cache: Option<Arc<FileStateCache>>,
     /// Parent session's [`SubAgentOutputRouter`]. Threaded onto every
     /// pipeline node worker so background output is routed through the
