@@ -170,23 +170,17 @@ impl Tool for EditFileTool {
             },
         };
 
-        // #1976 — per-path write fence, BEFORE any file I/O. SECURITY ROUND
-        // (codex): a fenced edit must read AND write through ONE confined
-        // handle so an ancestor swapped between the read and the write cannot
-        // redirect the edit. Under create_only every edit is refused ("created,
-        // never modified"); otherwise `check_edit` returns the workspace-
-        // relative path and `confined_open_rdwr` opens the leaf `O_RDWR` via a
-        // component-wise `O_NOFOLLOW` `openat` walk (symlinked ancestor →
-        // refused). The returned handle is reused for the write-back below, so
-        // read and write bind to the same walked object. Unfenced edits keep
-        // the historical `read_no_follow` + `write_no_follow`.
-        let mut fenced: Option<(std::fs::File, std::path::PathBuf)> = None;
-        let content = if let Some(grant) = &self.write_grant {
-            let workspace_root = ctx
-                .session_scope
-                .as_ref()
-                .map(|scope| scope.workspace().to_path_buf())
-                .unwrap_or_else(|| self.base_dir.clone());
+        let workspace_root = ctx
+            .session_scope
+            .as_ref()
+            .map(|scope| scope.workspace().to_path_buf())
+            .unwrap_or_else(|| self.base_dir.clone());
+
+        // #1976 — a fenced edit still obtains its descriptor through the
+        // component-wise confined walk. M4 hands that descriptor to the shared
+        // mutation guard, which reads, re-matches, verifies, and rewrites the
+        // same object.
+        let opened_file = if let Some(grant) = &self.write_grant {
             let rel = match grant.check_edit(&workspace_root, &path, &input.path, self.name()) {
                 Ok(rel) => rel,
                 Err(denied) => {
@@ -198,10 +192,7 @@ impl Tool for EditFileTool {
                 }
             };
             match super::write_grant::confined_open_rdwr(workspace_root.clone(), rel).await {
-                Ok((file, content)) => {
-                    fenced = Some((file, workspace_root));
-                    content
-                }
+                Ok((file, _)) => Some(file),
                 Err(e) => {
                     return Ok(ToolResult {
                         output: grant.map_confined_error(
@@ -216,11 +207,7 @@ impl Tool for EditFileTool {
                 }
             }
         } else {
-            // Read current content (O_NOFOLLOW atomically rejects symlinks)
-            match super::read_no_follow(&path).await {
-                Ok(c) => c,
-                Err(e) => return Ok(super::file_io_error(e, &input.path)),
-            }
+            None
         };
 
         if input.old_string.is_empty() {
@@ -231,66 +218,74 @@ impl Tool for EditFileTool {
             });
         }
 
-        // #1771: cascading replacer chain — exact match first, then
-        // increasingly whitespace/indentation/escape-tolerant fallbacks.
-        let (range, replacer_name) = match super::replacer::find_replacement(
-            &content,
-            &input.old_string,
-        ) {
-            super::replacer::ChainOutcome::Match { range, replacer } => (range, replacer),
-            super::replacer::ChainOutcome::Ambiguous { count, replacer } => {
-                return Ok(ToolResult {
-                    output: format!(
-                        "Found {count} occurrences of the string (via {replacer} replacer). Please provide more context to make the match unique.",
-                    ),
-                    success: false,
-                    ..Default::default()
-                });
-            }
-            super::replacer::ChainOutcome::NoMatch => {
-                return Ok(ToolResult {
-                    output: format!(
-                        "String not found in file. No exact match, and no fuzzy match via the line-trimmed, whitespace-normalized, indentation-flexible, escape-normalized or block-anchor replacers.\n\nSearched for:\n```\n{}\n```",
-                        input.old_string
-                    ),
-                    success: false,
-                    ..Default::default()
-                });
-            }
+        let old_string = input.old_string.clone();
+        let new_string = input.new_string.clone();
+        let guarded = super::mutation_guard::rewrite_existing(
+            ctx,
+            &workspace_root,
+            &path,
+            super::mutation_guard::ExpectedVersionPolicy::Optional,
+            None,
+            opened_file,
+            move |bytes| {
+                let content = std::str::from_utf8(bytes)
+                    .map_err(|_| "File is not valid UTF-8 and cannot be edited".to_string())?;
+                let (range, replacer_name) =
+                    match super::replacer::find_replacement(content, &old_string) {
+                        super::replacer::ChainOutcome::Match { range, replacer } => {
+                            (range, replacer)
+                        }
+                        super::replacer::ChainOutcome::Ambiguous { count, replacer } => {
+                            return Err(format!(
+                                "Found {count} occurrences of the string (via {replacer} \
+                                 replacer). Please provide more context to make the match unique.",
+                            ));
+                        }
+                        super::replacer::ChainOutcome::NoMatch => {
+                            return Err(format!(
+                                "String not found in file. No exact match, and no fuzzy match via \
+                                 the line-trimmed, whitespace-normalized, indentation-flexible, \
+                                 escape-normalized or block-anchor replacers.\n\nSearched for:\n\
+                                 ```\n{old_string}\n```"
+                            ));
+                        }
+                    };
+                let (guard_needle, splice_new) = if replacer_name == "escape_normalized" {
+                    (
+                        super::replacer::unescape_find(&old_string),
+                        super::replacer::unescape_find(&new_string),
+                    )
+                } else {
+                    (old_string, new_string)
+                };
+                let matched_text = &content[range.clone()];
+                if super::replacer::is_disproportionate_match(matched_text, &guard_needle) {
+                    return Err(format!(
+                        "Fuzzy match rejected as disproportionate: the {replacer_name} replacer \
+                         matched {} lines / {} bytes for an old_string of {} lines / {} bytes. \
+                         Provide more context so the match is precise.",
+                        matched_text.lines().count(),
+                        matched_text.len(),
+                        guard_needle.lines().count(),
+                        guard_needle.len(),
+                    ));
+                }
+                let mut new_content =
+                    String::with_capacity(content.len() - range.len() + splice_new.len());
+                new_content.push_str(&content[..range.start]);
+                new_content.push_str(&splice_new);
+                new_content.push_str(&content[range.end..]);
+                Ok((
+                    new_content.as_bytes().to_vec(),
+                    (replacer_name, new_content),
+                ))
+            },
+        )
+        .await;
+        let (replacer_name, new_content) = match guarded {
+            Ok(rewrite) => rewrite.value,
+            Err(error) => return Ok(error.into_tool_result(self.name(), &input.path)),
         };
-
-        // When the match came from the escape_normalized replacer, BOTH call
-        // strings carry the same double-escaping pathology — interpret
-        // new_string (and the guard's needle) with the same unescape rules
-        // that made old_string match. Splicing new_string verbatim would
-        // write literal `\n` text into the file as code, and guarding
-        // against the still-escaped old_string (1 physical line) would
-        // falsely reject every legitimate multi-line match (#1771 review).
-        let (guard_needle, splice_new) = if replacer_name == "escape_normalized" {
-            (
-                super::replacer::unescape_find(&input.old_string),
-                super::replacer::unescape_find(&input.new_string),
-            )
-        } else {
-            (input.old_string.clone(), input.new_string.clone())
-        };
-
-        // Safety guard: a fuzzy matcher must never silently swallow far more
-        // of the file than the old_string described.
-        let matched_text = &content[range.clone()];
-        if super::replacer::is_disproportionate_match(matched_text, &guard_needle) {
-            return Ok(ToolResult {
-                output: format!(
-                    "Fuzzy match rejected as disproportionate: the {replacer_name} replacer matched {} lines / {} bytes for an old_string of {} lines / {} bytes. Provide more context so the match is precise.",
-                    matched_text.lines().count(),
-                    matched_text.len(),
-                    guard_needle.lines().count(),
-                    guard_needle.len(),
-                ),
-                success: false,
-                ..Default::default()
-            });
-        }
 
         if replacer_name != "exact" {
             tracing::info!(
@@ -298,35 +293,6 @@ impl Tool for EditFileTool {
                 path = %input.path,
                 "edit_file fuzzy match succeeded"
             );
-        }
-
-        // Perform replacement by byte range — the fuzzy-matched span may
-        // occur elsewhere as a plain substring, so a string replacen could
-        // hit the wrong occurrence.
-        let mut new_content = String::with_capacity(content.len() - range.len() + splice_new.len());
-        new_content.push_str(&content[..range.start]);
-        new_content.push_str(&splice_new);
-        new_content.push_str(&content[range.end..]);
-
-        // Write back. A fenced edit rewrites the SAME confined handle opened
-        // above (truncate + write from offset 0) — no re-open, so no
-        // ancestor-swap window between read and write. Unfenced edits keep the
-        // historical lexical `write_no_follow`.
-        if let Some((file, workspace_root)) = fenced.take() {
-            if let Err(e) =
-                super::write_grant::confined_rewrite(file, new_content.as_bytes().to_vec()).await
-            {
-                // `map_confined_error` records the typed `[denied]`/[io] to the
-                // sink; a rewrite failure is not create_only-relevant.
-                let grant = self.write_grant.as_ref().expect("fenced implies a grant");
-                return Ok(ToolResult {
-                    output: grant.map_confined_error(&e, &workspace_root, &input.path, self.name()),
-                    success: false,
-                    ..Default::default()
-                });
-            }
-        } else if let Err(e) = super::write_no_follow(&path, new_content.as_bytes()).await {
-            return Ok(super::file_io_error(e, &input.path));
         }
 
         // #1976 SECURITY ROUND 2 (codex): under a per-path write fence the
@@ -352,9 +318,7 @@ impl Tool for EditFileTool {
         };
 
         // Invalidate every recorded workspace-owned version for this path.
-        if let Some(cache) = ctx.file_state_cache.as_ref() {
-            cache.invalidate_path(&path);
-        }
+        super::mutation_guard::complete_mutation(ctx, &workspace_root, &path);
 
         if !fence_active {
             if let Err(error) =
@@ -1215,7 +1179,7 @@ mod tests {
             target.clone(),
             None,
             b"fn foo() {}\n",
-            FileMetadataHint::new(12, None, None, None, None),
+            FileMetadataHint::from_metadata(&std::fs::metadata(&file_path).unwrap()),
         ));
         assert_eq!(cache.len(), 1);
 
@@ -1237,6 +1201,75 @@ mod tests {
 
         assert!(result.success);
         assert!(cache.peek(&target).is_none());
+    }
+
+    #[tokio::test]
+    async fn current_unique_context_can_apply_and_revokes_the_old_receipt() {
+        use crate::model_read_receipts::{ModelReadReceiptStore, ReadReceiptOwner};
+        use crate::tools::read_file::ReadFileTool;
+        use octos_core::{Message, MessageRole, ToolCall};
+
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("notes.txt");
+        std::fs::write(&file_path, "before\nchange me\nafter\n").unwrap();
+        let workspace_id = format!(
+            "local:{}",
+            std::fs::canonicalize(dir.path()).unwrap().display()
+        );
+        let ledger = Arc::new(crate::file_state_cache::FileStateCache::new());
+        let receipts = Arc::new(ModelReadReceiptStore::for_owner(
+            ReadReceiptOwner::new(workspace_id, "task", "session", "branch").unwrap(),
+        ));
+        let mut context = ToolContext::zero();
+        context.tool_id = "call_read".to_string();
+        context.file_state_cache = Some(ledger);
+        context.model_read_receipts = Some(receipts.clone());
+        let read_args = serde_json::json!({"path": "notes.txt"});
+        let read = ReadFileTool::new(dir.path())
+            .execute_with_context(&context, &read_args)
+            .await
+            .unwrap();
+        let mut assistant = Message::assistant("");
+        assistant.tool_calls = Some(vec![ToolCall {
+            id: "call_read".to_string(),
+            name: "read_file".to_string(),
+            arguments: read_args,
+            metadata: None,
+        }]);
+        let tool_output = Message {
+            role: MessageRole::Tool,
+            content: read.output,
+            media: Vec::new(),
+            tool_calls: None,
+            tool_call_id: Some("call_read".to_string()),
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        };
+        let pending = receipts.prepare_dispatch(&[assistant, tool_output], "policy-v1");
+        receipts.activate(pending);
+        assert_eq!(receipts.active_len(), 1);
+
+        std::fs::write(&file_path, "external header\nbefore\nchange me\nafter\n").unwrap();
+        let result = EditFileTool::new(dir.path())
+            .execute_with_context(
+                &context,
+                &serde_json::json!({
+                    "path": "notes.txt",
+                    "old_string": "change me",
+                    "new_string": "changed",
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "{}", result.output);
+        assert_eq!(
+            std::fs::read_to_string(file_path).unwrap(),
+            "external header\nbefore\nchanged\nafter\n"
+        );
+        assert_eq!(receipts.active_len(), 0);
     }
 
     // -----------------------------------------------------------------------

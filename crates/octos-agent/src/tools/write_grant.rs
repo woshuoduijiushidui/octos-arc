@@ -300,7 +300,7 @@ impl WritePathGrant {
 /// symlinked workspace root (e.g. cwd under `/tmp` → `/private/tmp`) still
 /// relativizes. A `..`/`.` component (there should be none post-normalize)
 /// makes the confined walk reject it — deny-wins.
-fn workspace_relative(workspace_root: &Path, resolved: &Path) -> Option<PathBuf> {
+pub(crate) fn workspace_relative(workspace_root: &Path, resolved: &Path) -> Option<PathBuf> {
     if let Ok(rel) = resolved.strip_prefix(workspace_root) {
         return Some(rel.to_path_buf());
     }
@@ -321,6 +321,8 @@ pub enum ConfinedLeaf {
     CreateOrTruncate,
     /// `O_RDWR`, no create — the leaf must already exist (fenced edit).
     OpenExistingRw,
+    /// `O_RDONLY`, no create — the leaf must already exist.
+    OpenExistingRo,
 }
 
 /// #1976 security round — open `workspace_root`/`rel` for writing via a
@@ -401,6 +403,7 @@ pub fn open_confined(
             ConfinedLeaf::CreateNew => OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL,
             ConfinedLeaf::CreateOrTruncate => OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC,
             ConfinedLeaf::OpenExistingRw => OFlags::RDWR,
+            ConfinedLeaf::OpenExistingRo => OFlags::RDONLY,
         };
     let leaf_fd = openat(
         &dir,
@@ -420,7 +423,8 @@ pub fn open_confined(
 /// - [`ConfinedLeaf::CreateNew`] is race-free at the LEAF — `create_new(true)`
 ///   is `O_CREAT|O_EXCL`, which atomically refuses a pre-existing file OR
 ///   symlink at the leaf; parents are created first (parity with Unix).
-/// - [`ConfinedLeaf::CreateOrTruncate`] / [`ConfinedLeaf::OpenExistingRw`] use
+/// - [`ConfinedLeaf::CreateOrTruncate`] / [`ConfinedLeaf::OpenExistingRw`] /
+///   [`ConfinedLeaf::OpenExistingRo`] use
 ///   a check-then-open leaf symlink test that is inherently TOCTOU-racy, and
 ///   the ANCESTOR `lstat` scan is likewise racy against a concurrent swap.
 ///
@@ -474,6 +478,9 @@ pub fn open_confined(
         }
         ConfinedLeaf::OpenExistingRw => {
             opts.read(true).write(true);
+        }
+        ConfinedLeaf::OpenExistingRo => {
+            opts.read(true);
         }
     }
     // Racy leaf symlink test for the non-exclusive modes (documented residual).
@@ -544,6 +551,18 @@ pub(crate) async fn confined_write_checked(
     })
     .await
     .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+}
+
+/// Open an existing confined leaf without truncating or decoding its bytes.
+pub(crate) async fn confined_open_existing(
+    workspace_root: PathBuf,
+    rel: PathBuf,
+) -> std::io::Result<std::fs::File> {
+    tokio::task::spawn_blocking(move || {
+        open_confined(&workspace_root, &rel, ConfinedLeaf::OpenExistingRw)
+    })
+    .await
+    .unwrap_or_else(|error| Err(std::io::Error::other(error)))
 }
 
 /// Confined edit — phase 1: open the existing leaf `O_RDWR` via
