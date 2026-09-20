@@ -213,6 +213,7 @@ fn expand_profile_tool_entries(entries: &[String]) -> HashSet<String> {
 /// path (`crate::tools::FileStateCache`) stable for downstream users while
 /// the ToolContext carries a shared handle.
 pub use crate::file_state_cache::FileStateCache;
+use crate::model_read_receipts::ModelReadReceiptStore;
 
 /// Inbox of in-flight notifications surfaced to tools and the agent loop.
 ///
@@ -278,6 +279,8 @@ pub struct ToolContext {
     /// Reads record stable versions and mutations invalidate them. Model-visible
     /// read receipts are separate state; this ledger never authorizes a stub.
     pub file_state_cache: Option<Arc<FileStateCache>>,
+    /// Model-visible read state for the current model branch.
+    pub model_read_receipts: Option<Arc<ModelReadReceiptStore>>,
     /// Notification inbox surfaced to tools. M8.2/M8.3 will populate this.
     pub notifications: Arc<Notifications>,
     /// Handle to the ambient app state. M8.3 will populate this.
@@ -402,6 +405,7 @@ impl ToolContext {
             agent_definitions: Arc::new(AgentDefinitions::new()),
             permissions: ToolPermissions::default(),
             file_state_cache: None,
+            model_read_receipts: None,
             notifications: Arc::new(Notifications::new()),
             app_state: AppStateHandle::new(),
             subagent_output_router: None,

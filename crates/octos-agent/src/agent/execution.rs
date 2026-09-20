@@ -488,6 +488,7 @@ impl Agent {
             harness_event_sink: self.harness_event_sink.clone(),
             agent_definitions: self.agent_definitions.clone(),
             file_state_cache: self.file_state_cache.clone(),
+            model_read_receipts: self.model_read_receipts.clone(),
             permissions: self
                 .profile
                 .as_deref()
@@ -633,10 +634,10 @@ impl Agent {
         // M8.2/M8.4 reconciliation: M8.8 rewrite must thread agent_definitions
         // and file_state_cache into both foreground and spawn_only ToolContext
         // builders so spawn(agent_definition_id=..) keeps resolving against
-        // the live registry and read_file keeps short-circuiting via the
-        // shared file-version ledger.
+        // the live registry and file tools share current disk versions.
         let agent_definitions = self.agent_definitions.clone();
         let file_state_cache = self.file_state_cache.clone();
+        let model_read_receipts = self.model_read_receipts.clone();
         // M8 fix-first item 8 (gap 4b): if the agent carries a resolved
         // profile envelope, derive a ToolPermissions record once per turn
         // and clone it into every ToolContext. Today's pre-M8 default
@@ -2106,6 +2107,7 @@ impl Agent {
                 // tools see the live registry/cache instead of zeros.
                 agent_definitions: agent_definitions.clone(),
                 file_state_cache: file_state_cache.clone(),
+                model_read_receipts: model_read_receipts.clone(),
                 // M8 fix-first item 8 (gap 4b): consult the profile
                 // envelope so deny-list profiles actually block tools at
                 // the call boundary (read_file already checks

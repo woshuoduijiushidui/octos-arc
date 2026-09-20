@@ -9,6 +9,7 @@ use serde::Deserialize;
 use super::{Tool, ToolContext, ToolResult};
 #[cfg(test)]
 use crate::file_state_cache::FileStateCache;
+use crate::model_read_receipts::FileView;
 use crate::policy::FilesystemScope;
 
 const MAX_FILE_BYTES: u64 = 10_000_000;
@@ -434,6 +435,13 @@ impl ReadFileTool {
                     end_b += 1;
                 }
             }
+            let view = FileView::Bytes {
+                start: start_b as u64,
+                end: end_b as u64,
+            };
+            if let Some(result) = unchanged_result(ctx, &read_meta, &view) {
+                return Ok(result);
+            }
             let mut output = content[start_b..end_b].to_string();
             if end_b < total {
                 output.push_str(&format!(
@@ -460,6 +468,7 @@ impl ReadFileTool {
                 tainted,
                 read_meta.transformed,
             );
+            stage_read_candidate(ctx, args, &read_meta, view.clone(), view, &output);
             return Ok(ToolResult {
                 output,
                 success: true,
@@ -663,9 +672,32 @@ impl ReadFileTool {
         // both this blind cut and the execution loop's 50,000-byte backstop
         // (#2124), which must never fire on an armed read (a blind head/tail
         // cut would mangle the very footer that names the continuation).
+        const MAX_OUTPUT: usize = 100000;
+        let tool_output_truncated = !window_armed && output.len() > MAX_OUTPUT;
         if !window_armed {
-            const MAX_OUTPUT: usize = 100000;
             octos_core::truncate_utf8(&mut output, MAX_OUTPUT, "\n... (content truncated)");
+        }
+
+        let requested_view = if start_line.is_none() && end_line.is_none() {
+            FileView::Full
+        } else {
+            FileView::Lines {
+                start: (start + 1) as u64,
+                end: end as u64,
+            }
+        };
+        let returned_view = if requested_view == FileView::Full && clamp.is_none() {
+            FileView::Full
+        } else {
+            FileView::Lines {
+                start: (start + 1) as u64,
+                end: included_end as u64,
+            }
+        };
+        if !tool_output_truncated
+            && let Some(result) = unchanged_result(ctx, &read_meta, &requested_view)
+        {
+            return Ok(result);
         }
 
         // #1638 (c): feed the view ledger that backs write_file's fail-closed
@@ -695,6 +727,16 @@ impl ReadFileTool {
                 content.len(),
                 tainted,
                 read_meta.transformed,
+            );
+        }
+        if !tool_output_truncated {
+            stage_read_candidate(
+                ctx,
+                args,
+                &read_meta,
+                requested_view,
+                returned_view,
+                &output,
             );
         }
 
@@ -739,6 +781,59 @@ fn record_file_version(ctx: &ToolContext, read_meta: &super::ReadMeta) {
     ) {
         ledger.record(version.clone());
     }
+}
+
+fn unchanged_result(
+    ctx: &ToolContext,
+    read_meta: &super::ReadMeta,
+    requested_view: &FileView,
+) -> Option<ToolResult> {
+    ctx.file_state_cache.as_ref()?;
+    let receipts = ctx.model_read_receipts.as_ref()?;
+    let version = read_meta.file_version.as_ref()?;
+    let receipt = receipts.receipt_for(version, requested_view)?;
+    let digest = version.content_sha256();
+    let display_version = digest.get(..23).unwrap_or(digest);
+    Some(ToolResult {
+        output: format!(
+            "[FILE_UNCHANGED] target={} version={} view={} source={}#{}. \
+             Reuse the prior visible read_file result.",
+            version.target().target_key().display(),
+            display_version,
+            receipt.model_visible_view(),
+            receipt.candidate_id(),
+            receipt.source_occurrence(),
+        ),
+        success: true,
+        ..Default::default()
+    })
+}
+
+fn stage_read_candidate(
+    ctx: &ToolContext,
+    arguments: &serde_json::Value,
+    read_meta: &super::ReadMeta,
+    requested_view: FileView,
+    returned_view: FileView,
+    output: &str,
+) {
+    if ctx.file_state_cache.is_none() {
+        return;
+    }
+    let (Some(receipts), Some(version)) = (
+        ctx.model_read_receipts.as_ref(),
+        read_meta.file_version.as_ref(),
+    ) else {
+        return;
+    };
+    receipts.stage(
+        &ctx.tool_id,
+        arguments,
+        version.clone(),
+        requested_view,
+        returned_view,
+        output,
+    );
 }
 
 fn stable_read_error(error: super::StableReadError, input_path: &str) -> ToolResult {

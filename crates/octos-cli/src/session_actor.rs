@@ -812,6 +812,16 @@ impl PromptContextManager for SessionActorPromptContextBridge {
             generation: Some(frame.context_state.generation),
         })
     }
+
+    fn tool_output_projection_policy_id(&self) -> Option<String> {
+        Some(
+            self.context_manager
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .tool_output_policy_id()
+                .to_owned(),
+        )
+    }
 }
 
 /// PR F (M8.10): pick a `thread_id` for an Assistant row when the caller

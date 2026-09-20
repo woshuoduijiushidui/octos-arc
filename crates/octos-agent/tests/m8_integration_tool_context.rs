@@ -9,8 +9,7 @@
 //!
 //! - `spawn` calls with `agent_definition_id` resolve against the live
 //!   registry instead of seeing an empty zero-value default.
-//! - `read_file` called twice through the agent path can return the
-//! - `read_file` called twice through the agent path returns both bodies while
+//! - `read_file` called twice without a model receipt returns both bodies while
 //!   retaining one latest strong disk version.
 //! - spawn-only background tools see a `ToolContext` with the same M8 fields
 //!   populated as the foreground path (proof the M8.8 reorganisation did
