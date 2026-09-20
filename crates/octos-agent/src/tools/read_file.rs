@@ -1085,9 +1085,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_read_file_tool_return_file_unchanged_when_cache_hit() {
-        // First read populates the cache. Second read with unchanged mtime
-        // must short-circuit to the [FILE_UNCHANGED] stub.
+    #[ignore = "H02 M0: baseline returns a false stub before any model dispatch"]
+    async fn h02_contract_returns_body_until_a_model_dispatch_confirms_visibility() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("stable.txt"), "first\nsecond\nthird\n").unwrap();
 
@@ -1104,18 +1103,55 @@ mod tests {
         assert!(!first.output.contains("[FILE_UNCHANGED]"));
         assert_eq!(cache.len(), 1);
 
-        // Second read: mtime unchanged, must hit the cache and return the stub.
+        // No provider request happened between these direct tool calls, so the
+        // cache cannot prove that a model saw the first body.
         let second = tool
             .execute_with_context(&ctx, &serde_json::json!({"path": "stable.txt"}))
             .await
             .unwrap();
         assert!(second.success);
         assert!(
-            second.output.contains("[FILE_UNCHANGED]"),
-            "expected stub output, got: {}",
+            !second.output.contains("[FILE_UNCHANGED]"),
+            "a read without model-visible evidence must return the body, got: {}",
             second.output
         );
-        assert!(second.output.contains("stable.txt"));
+        assert!(second.output.contains("first"));
+    }
+
+    #[tokio::test]
+    async fn h02_m0_characterization_caches_full_before_final_prompt_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("projection.txt");
+        std::fs::write(&file, "abcdefghij\n".repeat(1000)).unwrap();
+
+        let tool = ReadFileTool::new(dir.path());
+        let cache = Arc::new(FileStateCache::new());
+        let ctx = ctx_with_cache(cache.clone());
+        let result = tool
+            .execute_with_context(&ctx, &serde_json::json!({"path": "projection.txt"}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(
+            result.output.len() > 8 * 1024,
+            "fixture must exceed ContextManager's default model-visible limit"
+        );
+        assert!(
+            result.structured_metadata.is_none(),
+            "baseline read_file exposes no typed candidate metadata"
+        );
+        let entry = cache
+            .peek(&file)
+            .or_else(|| {
+                let canonical = std::fs::canonicalize(&file).ok()?;
+                cache.peek(&canonical)
+            })
+            .expect("read_file stores its pre-projection cache entry");
+        assert!(
+            !entry.is_partial_view && entry.view_range.is_none(),
+            "baseline marks the read complete before the later 8 KiB projection"
+        );
     }
 
     #[tokio::test]

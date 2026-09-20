@@ -4975,6 +4975,49 @@ mod tests {
         assert!(envelope.raw_sha256.starts_with("sha256:"));
     }
 
+    #[tokio::test]
+    async fn h02_m0_characterization_full_cache_entry_precedes_truncated_prompt_projection() {
+        use std::sync::Arc;
+
+        use octos_agent::{FileStateCache, ReadFileTool, Tool, tools::ToolContext};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("projection.txt");
+        std::fs::write(&path, "abcdefghij\n".repeat(1000)).expect("write fixture");
+        let cache = Arc::new(FileStateCache::new());
+        let mut ctx = ToolContext::zero();
+        ctx.tool_id = "call_read".to_owned();
+        ctx.file_state_cache = Some(cache.clone());
+
+        let result = ReadFileTool::new(temp.path())
+            .execute_with_context(&ctx, &json!({"path": "projection.txt"}))
+            .await
+            .expect("read_file completes");
+        assert!(result.success);
+        assert!(result.output.len() > DEFAULT_MODEL_VISIBLE_TOOL_OUTPUT_MAX_BYTES);
+
+        let cached = cache
+            .peek(&path)
+            .or_else(|| {
+                let canonical = std::fs::canonicalize(&path).ok()?;
+                cache.peek(&canonical)
+            })
+            .expect("read_file caches before prompt projection");
+        assert!(!cached.is_partial_view && cached.view_range.is_none());
+
+        let mut manager = ContextManager::new("coding:local:h02-m0", None);
+        manager.record_tool_output("call_read", "read_file", &result.output);
+        let envelope = match &manager.items()[0].kind {
+            TranscriptItemKind::ToolOutput { envelope } => envelope,
+            other => panic!("expected tool output, got {other:?}"),
+        };
+        assert_eq!(
+            envelope.truncation_reason,
+            Some(ToolOutputTruncationReason::MaxBytes)
+        );
+        assert!(envelope.model_visible_bytes < envelope.original_bytes);
+    }
+
     #[test]
     fn tool_output_envelope_inherits_real_tool_name_from_prior_assistant_call() {
         // #982: recording a Tool MessageRole used to bake the placeholder

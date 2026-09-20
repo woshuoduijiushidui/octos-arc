@@ -469,6 +469,34 @@ mod tests {
     }
 
     #[test]
+    fn h02_m0_characterization_get_ignores_content_hash_when_mtime_matches() {
+        let cache = FileStateCache::new();
+        let mtime = SystemTime::now();
+        let path = PathBuf::from("/tmp/same-metadata.txt");
+        let stale_hash = FileStateCache::content_hash(b"old");
+        let current_hash = FileStateCache::content_hash(b"new");
+        assert_ne!(stale_hash, current_hash);
+
+        cache.put(CacheEntry::new(
+            path.clone(),
+            mtime,
+            stale_hash,
+            3,
+            false,
+            None,
+        ));
+
+        let hit = cache
+            .get(&path, mtime)
+            .expect("baseline lookup accepts matching mtime");
+        assert_eq!(hit.content_hash, stale_hash);
+        assert_ne!(
+            hit.content_hash, current_hash,
+            "M0 records that get() never receives or verifies the current content hash"
+        );
+    }
+
+    #[test]
     fn should_miss_when_mtime_changed() {
         let cache = FileStateCache::new();
         let mtime_old = SystemTime::now();
