@@ -89,8 +89,8 @@ pub use abi_schema::{
 pub use agent::{
     Agent, AgentConfig, AssistantSegmentProvenance, ConversationResponse,
     DEFAULT_SESSION_TIMEOUT_SECS, DEFAULT_TOOL_TIMEOUT_SECS, DEFAULT_WORKER_PROMPT,
-    IncompleteResponseError, MAX_TOOL_TIMEOUT_SECS, PartialTurnUsage, PromptSegmentProvider,
-    RealtimeController, TASK_REPORTER, TokenTracker,
+    FILE_READ_RETAINED_RECEIPTS_ENV, IncompleteResponseError, MAX_TOOL_TIMEOUT_SECS,
+    PartialTurnUsage, PromptSegmentProvider, RealtimeController, TASK_REPORTER, TokenTracker,
     loop_state::{
         LoopDecision, LoopRetryCounters, LoopRetryLimits, LoopRetryState, OCTOS_LOOP_RETRY_TOTAL,
         SHELL_SPIRAL_VARIANT,
@@ -155,7 +155,8 @@ pub use memory_segment::{
     stable_memory_instructions, volatile_memory_content,
 };
 pub use model_read_receipts::{
-    ModelReadReceiptStore, ReadReceiptOwner, ReceiptClearEvent, ReceiptClearReason,
+    ModelReadReceiptStore, ReadReceiptOwner, ReadSourceProof, ReceiptClearEvent,
+    ReceiptClearReason, read_source_proofs_for_retained_messages,
 };
 pub use permissions::{InvalidSafetyTier, SafetyTier};
 pub use plugins::{

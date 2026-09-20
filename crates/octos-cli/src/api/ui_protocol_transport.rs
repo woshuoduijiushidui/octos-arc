@@ -4495,6 +4495,7 @@ impl PromptContextManager for AppUiPromptContextBridge {
         let out_policy = self.outgoing_prompt_policy(&request);
         let original_messages = std::mem::take(messages);
         let frame = scratch.manager.for_prompt(&out_policy);
+        let retained_read_source_proofs = frame.retained_read_source_proofs();
         *messages = frame.messages;
         if let Some(system) = runtime_system {
             // Re-apply the agent's runtime System prompt. Two cases:
@@ -4569,6 +4570,7 @@ impl PromptContextManager for AppUiPromptContextBridge {
             messages_after: messages.len(),
             token_estimate: Some(frame.report.token_estimate),
             generation: Some(frame.context_state.generation),
+            retained_read_source_proofs,
         };
         // Emit AFTER releasing the scratch lock (see the collection comment
         // above): a blocking stdio send while holding `scratch` would stall

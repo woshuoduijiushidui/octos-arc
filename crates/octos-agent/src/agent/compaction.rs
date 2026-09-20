@@ -6,7 +6,7 @@ use tracing::{info, warn};
 use super::Agent;
 use crate::compaction::CompactionPhase;
 use crate::compaction_tiered::Tier1Report;
-use crate::model_read_receipts::ReceiptClearReason;
+use crate::model_read_receipts::{ReadSourceProof, ReceiptClearReason, read_source_proofs};
 use crate::prompt_context::{PromptContextPhase, PromptContextRequest};
 
 impl Agent {
@@ -14,6 +14,41 @@ impl Agent {
         if let Some(receipts) = self.model_read_receipts.as_ref() {
             receipts.clear(reason);
         }
+    }
+
+    pub(super) fn reconcile_model_read_receipts_after_frame_change(
+        &self,
+        reason: ReceiptClearReason,
+        retained_proofs: Option<&[ReadSourceProof]>,
+    ) {
+        if !self.retained_read_receipts {
+            self.clear_model_read_receipts(reason);
+            return;
+        }
+        let (Some(receipts), Some(retained_proofs)) =
+            (self.model_read_receipts.as_ref(), retained_proofs)
+        else {
+            self.clear_model_read_receipts(reason);
+            return;
+        };
+        let context_policy = self
+            .prompt_context_manager
+            .as_ref()
+            .and_then(|manager| manager.tool_output_projection_policy_id())
+            .unwrap_or_else(|| "direct-or-unspecified-v1".to_owned());
+        let policy_id = format!("read-output-exact-v1:{context_policy}");
+        receipts.retain_after_frame_change(retained_proofs, &policy_id, reason);
+    }
+
+    pub(super) fn reconcile_legacy_read_receipts_after_frame_change(
+        &self,
+        messages: &[Message],
+        reason: ReceiptClearReason,
+    ) {
+        let retained_proofs = self
+            .retained_read_receipts
+            .then(|| read_source_proofs(messages));
+        self.reconcile_model_read_receipts_after_frame_change(reason, retained_proofs.as_deref());
     }
 
     pub(super) fn trim_to_context_window(&self, messages: &mut Vec<Message>) -> bool {
@@ -115,7 +150,10 @@ impl Agent {
         }
         let outcome = runner.run(messages, CompactionPhase::Preflight);
         if outcome.performed {
-            self.clear_model_read_receipts(ReceiptClearReason::Compaction);
+            self.reconcile_legacy_read_receipts_after_frame_change(
+                messages,
+                ReceiptClearReason::Compaction,
+            );
         }
         info!(
             phase = "preflight",
@@ -158,7 +196,10 @@ impl Agent {
         };
         let report = runner.run_tier1(messages, protected_tool_call_ids, pass);
         if report.performed() {
-            self.clear_model_read_receipts(ReceiptClearReason::ToolResultReplacement);
+            self.reconcile_legacy_read_receipts_after_frame_change(
+                messages,
+                ReceiptClearReason::ToolResultReplacement,
+            );
             info!(
                 results_pruned = report.results_pruned,
                 bytes_reclaimed = report.bytes_reclaimed,
@@ -215,7 +256,10 @@ impl Agent {
         }
         let outcome = runner.run(messages, CompactionPhase::TurnEnd);
         if outcome.performed {
-            self.clear_model_read_receipts(ReceiptClearReason::Compaction);
+            self.reconcile_legacy_read_receipts_after_frame_change(
+                messages,
+                ReceiptClearReason::Compaction,
+            );
             info!(
                 phase = "turn_end",
                 iteration,
@@ -256,10 +300,16 @@ impl Agent {
         };
         match manager.prepare_prompt(request, messages) {
             Ok(report) => {
-                if report.compaction_performed {
-                    self.clear_model_read_receipts(ReceiptClearReason::Compaction);
-                } else if report.prompt_replaced {
-                    self.clear_model_read_receipts(ReceiptClearReason::PromptReplacement);
+                if report.compaction_performed || report.prompt_replaced {
+                    let reason = if report.compaction_performed {
+                        ReceiptClearReason::Compaction
+                    } else {
+                        ReceiptClearReason::PromptReplacement
+                    };
+                    self.reconcile_model_read_receipts_after_frame_change(
+                        reason,
+                        report.retained_read_source_proofs.as_deref(),
+                    );
                 }
                 if report.prompt_replaced || report.compaction_performed {
                     info!(
@@ -390,11 +440,13 @@ mod tests {
         ApiMicroCompactionConfig, FullCompactor, MicroCompactionPolicy, Tier1Pass,
         TieredCompactionRunner,
     };
-    use crate::file_state_cache::{FileMetadataHint, FileTarget, FileVersion};
+    use crate::file_state_cache::{FileMetadataHint, FileStateCache, FileTarget, FileVersion};
     use crate::model_read_receipts::{
         FileView, ModelReadReceiptStore, ReadReceiptOwner, ReceiptClearReason,
+        read_source_proofs_for_retained_messages,
     };
-    use crate::tools::ToolRegistry;
+    use crate::prompt_context::{PromptContextManager, PromptContextReport, PromptContextRequest};
+    use crate::tools::{ReadFileTool, Tool, ToolContext, ToolRegistry};
     use crate::workspace_policy::{CompactionPolicy, CompactionSummarizerKind};
 
     struct NoopProvider;
@@ -435,6 +487,37 @@ mod tests {
         }
     }
 
+    struct ReplacingPromptContext {
+        report_proofs: bool,
+    }
+
+    impl PromptContextManager for ReplacingPromptContext {
+        fn prepare_prompt(
+            &self,
+            _request: PromptContextRequest,
+            messages: &mut Vec<Message>,
+        ) -> Result<PromptContextReport, String> {
+            let retained_read_source_proofs = self
+                .report_proofs
+                .then(|| {
+                    read_source_proofs_for_retained_messages(
+                        messages,
+                        &(0..messages.len()).collect::<Vec<_>>(),
+                    )
+                })
+                .flatten();
+            Ok(PromptContextReport {
+                prompt_replaced: true,
+                compaction_performed: true,
+                messages_before: messages.len(),
+                messages_after: messages.len(),
+                token_estimate: None,
+                generation: Some(1),
+                retained_read_source_proofs,
+            })
+        }
+    }
+
     async fn agent() -> Agent {
         let dir = tempfile::tempdir().unwrap();
         let memory = Arc::new(EpisodeStore::open(dir.path()).await.unwrap());
@@ -444,6 +527,25 @@ mod tests {
             ToolRegistry::new(),
             memory,
         )
+    }
+
+    #[test]
+    fn h02_m7_retained_read_receipts_switch_is_opt_in() {
+        assert!(!super::super::retained_read_receipts_enabled_from_value(
+            None
+        ));
+        assert!(!super::super::retained_read_receipts_enabled_from_value(
+            Some("0")
+        ));
+        assert!(super::super::retained_read_receipts_enabled_from_value(
+            Some("1")
+        ));
+        assert!(super::super::retained_read_receipts_enabled_from_value(
+            Some(" TRUE ")
+        ));
+        assert!(super::super::retained_read_receipts_enabled_from_value(
+            Some("on")
+        ));
     }
 
     fn primed_receipts() -> Arc<ModelReadReceiptStore> {
@@ -475,10 +577,50 @@ mod tests {
         let mut result = Message::assistant("body");
         result.role = MessageRole::Tool;
         result.tool_call_id = Some("call_read".to_owned());
-        let pending = store.prepare_dispatch(&[call, result], "policy-v1");
+        let pending = store.prepare_dispatch(
+            &[call, result],
+            "read-output-exact-v1:direct-or-unspecified-v1",
+        );
         store.activate(pending);
         assert_eq!(store.active_len(), 1);
         store
+    }
+
+    fn read_source_messages() -> Vec<Message> {
+        let mut call = Message::assistant("");
+        call.tool_calls = Some(vec![ToolCall {
+            id: "call_read".to_owned(),
+            name: "read_file".to_owned(),
+            arguments: serde_json::json!({"path": "file.txt"}),
+            metadata: None,
+        }]);
+        let mut result = Message::assistant("body");
+        result.role = MessageRole::Tool;
+        result.tool_call_id = Some("call_read".to_owned());
+        vec![call, result]
+    }
+
+    #[tokio::test]
+    async fn h02_m7_context_manager_retains_exact_sources_only_when_enabled() {
+        for (enabled, report_proofs, expected_active) in
+            [(false, true, 0), (true, true, 1), (true, false, 0)]
+        {
+            let receipts = primed_receipts();
+            let agent = agent()
+                .await
+                .with_model_read_receipts(receipts.clone())
+                .with_retained_read_receipts(enabled)
+                .with_prompt_context_manager(Arc::new(ReplacingPromptContext { report_proofs }));
+            let mut messages = read_source_messages();
+
+            agent.prepare_prompt_with_context_manager(
+                &mut messages,
+                PromptContextPhase::Iteration,
+                2,
+            );
+
+            assert_eq!(receipts.active_len(), expected_active);
+        }
     }
 
     #[tokio::test]
@@ -511,6 +653,119 @@ mod tests {
             receipts.last_clear().map(|event| event.reason),
             Some(ReceiptClearReason::Compaction)
         );
+    }
+
+    #[tokio::test]
+    async fn h02_m7_declarative_compaction_retains_an_exact_recent_read_when_enabled() {
+        let receipts = primed_receipts();
+        let policy = CompactionPolicy {
+            schema_version: COMPACTION_POLICY_SCHEMA_VERSION,
+            token_budget: 500,
+            preflight_threshold: Some(1),
+            prune_tool_results_after_turns: None,
+            preserved_artifacts: Vec::new(),
+            preserved_invariants: Vec::new(),
+            summarizer: CompactionSummarizerKind::Extractive,
+        };
+        let agent = agent()
+            .await
+            .with_compaction_runner(Arc::new(CompactionRunner::new(policy)))
+            .with_model_read_receipts(receipts.clone())
+            .with_retained_read_receipts(true);
+        let filler = "word ".repeat(500);
+        let mut messages = vec![Message::system("prompt")];
+        for _ in 0..8 {
+            messages.push(Message::user(&filler));
+            messages.push(Message::assistant(&filler));
+        }
+        messages.extend(read_source_messages());
+
+        agent.maybe_run_preflight_compaction(&mut messages).unwrap();
+
+        assert_eq!(receipts.active_len(), 1);
+        assert!(
+            messages
+                .iter()
+                .any(|message| { message.role == MessageRole::Tool && message.content == "body" })
+        );
+    }
+
+    #[tokio::test]
+    async fn h02_m7_retained_read_returns_stub_after_compaction() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("file.txt"), "body").unwrap();
+        let ledger = Arc::new(FileStateCache::new());
+        let target =
+            FileTarget::for_local_workspace(workspace.path(), &workspace.path().join("file.txt"))
+                .unwrap();
+        let receipts = Arc::new(ModelReadReceiptStore::for_owner(
+            ReadReceiptOwner::new(target.workspace_id(), "task", "session", "root").unwrap(),
+        ));
+        let read_tool = ReadFileTool::new(workspace.path()).with_deduplication(true);
+        let arguments = serde_json::json!({"path": "file.txt"});
+        let mut context = ToolContext::zero();
+        context.tool_id = "call_read".to_owned();
+        context.file_state_cache = Some(ledger);
+        context.model_read_receipts = Some(receipts.clone());
+        let first = read_tool
+            .execute_with_context(&context, &arguments)
+            .await
+            .unwrap();
+        assert!(first.output.contains("body"));
+
+        let mut read_call = Message::assistant("");
+        read_call.tool_calls = Some(vec![ToolCall {
+            id: "call_read".to_owned(),
+            name: "read_file".to_owned(),
+            arguments: arguments.clone(),
+            metadata: None,
+        }]);
+        let mut read_result = Message::assistant(first.output);
+        read_result.role = MessageRole::Tool;
+        read_result.tool_call_id = Some("call_read".to_owned());
+        let policy_id = "read-output-exact-v1:direct-or-unspecified-v1";
+        let pending =
+            receipts.prepare_dispatch(&[read_call.clone(), read_result.clone()], policy_id);
+        receipts.activate(pending);
+
+        let compaction_policy = CompactionPolicy {
+            schema_version: COMPACTION_POLICY_SCHEMA_VERSION,
+            token_budget: 500,
+            preflight_threshold: Some(1),
+            prune_tool_results_after_turns: None,
+            preserved_artifacts: Vec::new(),
+            preserved_invariants: Vec::new(),
+            summarizer: CompactionSummarizerKind::Extractive,
+        };
+        let agent = agent()
+            .await
+            .with_compaction_runner(Arc::new(CompactionRunner::new(compaction_policy)))
+            .with_model_read_receipts(receipts.clone())
+            .with_retained_read_receipts(true);
+        let filler = "word ".repeat(500);
+        let mut messages = vec![Message::system("prompt")];
+        for _ in 0..8 {
+            messages.push(Message::user(&filler));
+            messages.push(Message::assistant(&filler));
+        }
+        messages.extend([read_call, read_result]);
+        agent.maybe_run_preflight_compaction(&mut messages).unwrap();
+
+        context.tool_id = "call_read_again".to_owned();
+        let second = read_tool
+            .execute_with_context(&context, &arguments)
+            .await
+            .unwrap();
+        assert!(second.output.starts_with("[FILE_UNCHANGED]"));
+
+        std::fs::write(workspace.path().join("file.txt"), "changed").unwrap();
+        context.tool_id = "call_read_changed".to_owned();
+        let changed = read_tool
+            .execute_with_context(&context, &arguments)
+            .await
+            .unwrap();
+        assert!(changed.output.contains("changed"));
+        assert!(!changed.output.starts_with("[FILE_UNCHANGED]"));
     }
 
     #[tokio::test]

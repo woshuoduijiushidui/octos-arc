@@ -393,6 +393,10 @@ pub(crate) struct NormalizationReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PromptFrame {
     pub(crate) messages: Vec<Message>,
+    /// Exact transcript items that produced each message before the frame is
+    /// handed to the provider. Kept only in memory for receipt reconciliation.
+    #[serde(skip)]
+    pub(crate) message_source_item_ids: Vec<Vec<TranscriptItemId>>,
     /// Local projection provenance only; never persisted or sent to a provider.
     #[serde(skip)]
     pub(crate) prior_compaction_summaries: Vec<octos_agent::compaction::PriorCompactionSummary>,
@@ -406,6 +410,32 @@ impl PromptFrame {
             &self.messages,
             budget_tokens,
             &self.prior_compaction_summaries,
+        )
+    }
+
+    pub(crate) fn retained_read_source_proofs(&self) -> Option<Vec<octos_agent::ReadSourceProof>> {
+        if self.messages.len() != self.message_source_item_ids.len() {
+            return None;
+        }
+        if !self.report.repaired_item_ids.is_empty()
+            || !self.report.synthetic_item_ids.is_empty()
+            || !self.report.truncated_item_ids.is_empty()
+        {
+            return None;
+        }
+        let mut seen = HashSet::new();
+        let mut retained_message_indices = Vec::new();
+        for (index, source_item_ids) in self.message_source_item_ids.iter().enumerate() {
+            if source_item_ids.is_empty()
+                || source_item_ids.iter().any(|item_id| !seen.insert(item_id))
+            {
+                return None;
+            }
+            retained_message_indices.push(index);
+        }
+        octos_agent::read_source_proofs_for_retained_messages(
+            &self.messages,
+            &retained_message_indices,
         )
     }
 }
@@ -3251,6 +3281,10 @@ impl ContextManager {
                     })
             })
             .collect();
+        let message_source_item_ids = entries
+            .iter()
+            .map(|entry| entry.source_item_ids.clone())
+            .collect::<Vec<_>>();
         let messages = entries
             .into_iter()
             .map(|entry| entry.message)
@@ -3270,6 +3304,7 @@ impl ContextManager {
         };
         PromptFrame {
             messages,
+            message_source_item_ids,
             prior_compaction_summaries,
             report,
             context_state: self.state(),
@@ -4307,6 +4342,17 @@ mod tests {
         message
     }
 
+    fn read_file_call(call_id: &str, path: &str) -> Message {
+        let mut message = Message::assistant("");
+        message.tool_calls = Some(vec![ToolCall {
+            id: call_id.to_owned(),
+            name: "read_file".to_owned(),
+            arguments: json!({"path": path}),
+            metadata: None,
+        }]);
+        message
+    }
+
     #[test]
     fn records_context_state_checkpoint_and_snapshot_hash() {
         let mut manager = ContextManager::new("coding:local:test", Some("thread-1".into()));
@@ -4625,6 +4671,105 @@ mod tests {
         assert!(
             frame.report.dropped_item_ids.is_empty(),
             "no real output should be dropped when each call has exactly one output"
+        );
+    }
+
+    #[test]
+    fn h02_m7_retained_read_proofs_follow_exact_item_provenance() {
+        let mut manager = ContextManager::new("s", None);
+        manager.record_message(&Message::user("inspect the file"));
+        manager.record_message(&read_file_call("call_read", "notes.txt"));
+        manager.record_tool_output("call_read", "read_file", "exact body");
+        manager.record_message(&Message::user("current request"));
+
+        manager.compact_context(
+            "notes.txt was read earlier",
+            CompactContextPolicy {
+                policy_id: "test".into(),
+                trigger: "context_pressure".into(),
+                keep_recent_items: 3,
+                preserve_system_instructions: true,
+                ..Default::default()
+            },
+        );
+        let retained = manager.for_prompt(&PromptBuildPolicy::default());
+        assert_eq!(
+            retained
+                .retained_read_source_proofs()
+                .expect("valid provenance")
+                .len(),
+            1,
+            "the retained call and exact body remain eligible"
+        );
+
+        let mut dropped = manager.clone();
+        for index in 0..4 {
+            dropped.record_message(&Message::user(format!("later {index}")));
+            dropped.record_message(&Message::assistant("done"));
+        }
+        dropped.compact_context(
+            "notes.txt was read earlier",
+            CompactContextPolicy {
+                policy_id: "drop-read".into(),
+                trigger: "context_pressure".into(),
+                keep_recent_items: 2,
+                preserve_system_instructions: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            dropped
+                .for_prompt(&PromptBuildPolicy::default())
+                .retained_read_source_proofs()
+                .expect("valid provenance")
+                .is_empty(),
+            "a summary path mention must not recreate a source proof"
+        );
+    }
+
+    #[test]
+    fn h02_m7_retained_read_proofs_reject_unsafe_provenance() {
+        let mut truncated = ContextManager::new("truncated", None);
+        truncated.record_message(&read_file_call("call_read", "large.txt"));
+        truncated.record_tool_output("call_read", "read_file", &"x".repeat(9 * 1024));
+        assert!(
+            truncated
+                .for_prompt(&PromptBuildPolicy::default())
+                .retained_read_source_proofs()
+                .is_none(),
+            "a truncated tool output cannot authorize a retained receipt"
+        );
+
+        let mut repeated = ContextManager::new("repeated", None);
+        for body in ["first", "second"] {
+            repeated.record_message(&read_file_call("call_0", "same.txt"));
+            repeated.record_tool_output("call_0", "read_file", body);
+            repeated.record_message(&Message::user("continue"));
+        }
+        let mut frame = repeated.for_prompt(&PromptBuildPolicy::default());
+        assert_eq!(
+            frame
+                .retained_read_source_proofs()
+                .expect("valid provenance")
+                .len(),
+            2,
+            "reused call ids remain distinct by output and occurrence"
+        );
+
+        let duplicate = frame
+            .message_source_item_ids
+            .first()
+            .and_then(|ids| ids.first())
+            .cloned()
+            .expect("source item");
+        frame
+            .message_source_item_ids
+            .last_mut()
+            .expect("last message")
+            .push(duplicate);
+        assert!(
+            frame.retained_read_source_proofs().is_none(),
+            "duplicate item provenance must fail closed"
         );
     }
 

@@ -761,6 +761,7 @@ impl PromptContextManager for SessionActorPromptContextBridge {
         }
         let runtime_system = scratch.runtime_system.clone();
         let frame = scratch.manager.for_prompt(&policy);
+        let retained_read_source_proofs = frame.retained_read_source_proofs();
         let prompt_replaced = messages.len() != frame.messages.len()
             || messages
                 .iter()
@@ -810,6 +811,7 @@ impl PromptContextManager for SessionActorPromptContextBridge {
             messages_after: messages.len(),
             token_estimate: Some(frame.report.token_estimate),
             generation: Some(frame.context_state.generation),
+            retained_read_source_proofs,
         })
     }
 

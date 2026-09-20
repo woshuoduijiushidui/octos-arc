@@ -2114,6 +2114,7 @@ impl PromptContextManager for SpyPromptContextManager {
             messages_after: messages.len(),
             token_estimate: Some(messages.iter().map(|message| message.content.len()).sum()),
             generation: Some(request.iteration as u64),
+            retained_read_source_proofs: None,
         })
     }
 }

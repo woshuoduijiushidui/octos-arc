@@ -8,6 +8,8 @@
 
 use octos_core::Message;
 
+use crate::model_read_receipts::ReadSourceProof;
+
 /// Loop phase at which the prompt context bridge is invoked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PromptContextPhase {
@@ -50,6 +52,9 @@ pub struct PromptContextReport {
     pub messages_after: usize,
     pub token_estimate: Option<usize>,
     pub generation: Option<u64>,
+    /// Exact read sources backed by retained transcript items in the final
+    /// provider-facing frame. `None` means provenance could not be proven.
+    pub retained_read_source_proofs: Option<Vec<ReadSourceProof>>,
 }
 
 /// Object-safe bridge implemented by session runtimes that own a canonical

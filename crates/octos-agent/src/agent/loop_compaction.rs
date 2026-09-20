@@ -31,7 +31,10 @@ pub(crate) fn prepare_conversation_messages(
     turn: &mut LoopTurnState,
 ) {
     if agent.trim_to_context_window(messages) {
-        agent.clear_model_read_receipts(ReceiptClearReason::ContextTrim);
+        agent.reconcile_legacy_read_receipts_after_frame_change(
+            messages,
+            ReceiptClearReason::ContextTrim,
+        );
         turn.record_repair(LoopRepairReason::ContextTrimmed);
     }
     if normalize_system_messages(messages) {
@@ -54,7 +57,10 @@ pub(crate) fn prepare_conversation_messages(
     // which then re-records the whole conversation as duplicates. Tool-output
     // bounding is the ContextManager's job there (ToolOutputPolicy).
     if agent.prompt_context_manager.is_none() && truncate_old_tool_results(messages) {
-        agent.clear_model_read_receipts(ReceiptClearReason::ToolResultReplacement);
+        agent.reconcile_legacy_read_receipts_after_frame_change(
+            messages,
+            ReceiptClearReason::ToolResultReplacement,
+        );
         turn.record_repair(LoopRepairReason::OldToolResultsTruncated);
     }
     if normalize_tool_call_ids(messages) {
@@ -77,7 +83,10 @@ pub(crate) fn prepare_task_messages(
     turn: &mut LoopTurnState,
 ) {
     if agent.trim_to_context_window(messages) {
-        agent.clear_model_read_receipts(ReceiptClearReason::ContextTrim);
+        agent.reconcile_legacy_read_receipts_after_frame_change(
+            messages,
+            ReceiptClearReason::ContextTrim,
+        );
         turn.record_repair(LoopRepairReason::ContextTrimmed);
     }
     if normalize_system_messages(messages) {

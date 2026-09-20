@@ -3799,6 +3799,70 @@ fn appui_prompt_context_bridge_preserves_current_user_turn() {
 }
 
 #[test]
+fn h02_m7_appui_prompt_context_bridge_reports_exact_retained_read_source() {
+    let session_id = SessionKey::new("api", "context-retained-read");
+    let mut history: Vec<Message> = (0..8)
+        .flat_map(|index| {
+            vec![
+                test_message(
+                    MessageRole::User,
+                    format!("old request {index}: {}", "x".repeat(300)),
+                ),
+                test_message(
+                    MessageRole::Assistant,
+                    format!("old answer {index}: {}", "y".repeat(300)),
+                ),
+            ]
+        })
+        .collect();
+    history.push(test_message(MessageRole::User, "current request"));
+    let mut read_call = test_message(MessageRole::Assistant, "");
+    read_call.tool_calls = Some(vec![octos_core::ToolCall {
+        id: "call_read".to_owned(),
+        name: "read_file".to_owned(),
+        arguments: serde_json::json!({"path": "notes.txt"}),
+        metadata: None,
+    }]);
+    history.push(read_call);
+    let mut read_result = test_message(MessageRole::Tool, "exact body");
+    read_result.tool_call_id = Some("call_read".to_owned());
+    history.push(read_result);
+
+    let manager = Arc::new(StdMutex::new(ContextManager::from_session_history(
+        session_id.to_string(),
+        None,
+        &history,
+    )));
+    let dir = tempfile::tempdir().unwrap();
+    let bridge =
+        AppUiPromptContextBridge::new(session_id, dir.path().to_path_buf(), manager, false);
+    let mut prompt = vec![test_message(MessageRole::System, "runtime system")];
+    prompt.extend(history);
+
+    let report = bridge
+        .prepare_prompt(
+            PromptContextRequest {
+                phase: PromptContextPhase::TurnStart,
+                iteration: 1,
+                provider_name: "test".to_string(),
+                model_id: "tiny-context".to_string(),
+                context_window: 300,
+            },
+            &mut prompt,
+        )
+        .expect("context manager bridge should prepare prompt");
+
+    assert!(report.compaction_performed);
+    assert_eq!(
+        report
+            .retained_read_source_proofs
+            .expect("ContextManager provenance must be available")
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn effective_provider_route_updates_scratch_and_persists_exactly_one_epoch_rotation() {
     let session_id = SessionKey::new("api", "context-failover-epoch");
     let mut initial = ContextManager::from_session_history(

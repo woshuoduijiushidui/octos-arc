@@ -61,6 +61,24 @@ tokio::task_local! {
 
 /// Compiled-in default worker prompt (from `prompts/worker.txt`).
 pub const DEFAULT_WORKER_PROMPT: &str = include_str!("../prompts/worker.txt");
+/// Experimental M7 switch for retaining exact read receipts across prompt
+/// compaction. Disabled unless set to `1`, `true`, or `on`.
+pub const FILE_READ_RETAINED_RECEIPTS_ENV: &str = "OCTOS_FILE_READ_RETAINED_RECEIPTS";
+
+fn retained_read_receipts_enabled_from_value(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        let value = value.trim();
+        value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("on")
+    })
+}
+
+fn retained_read_receipts_enabled_from_env() -> bool {
+    retained_read_receipts_enabled_from_value(
+        std::env::var(FILE_READ_RETAINED_RECEIPTS_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
 
 /// Configuration for agent execution.
 #[derive(Debug, Clone)]
@@ -443,6 +461,9 @@ pub struct Agent {
     /// Complete task/branch file state. Kept explicitly so child builders can
     /// share only the ledger and mint their own receipt store.
     pub(super) task_file_state: Option<ModelBranchFileState>,
+    /// Experimental selective preservation of exact read receipts after the
+    /// model-visible frame changes.
+    pub(super) retained_read_receipts: bool,
     /// M8.3 profile envelope applied at bootstrap. Recorded so callers can
     /// introspect the active profile name, compaction overrides, and model
     /// preferences. `None` means no profile was explicitly applied — the
@@ -662,6 +683,7 @@ impl Agent {
             file_state_cache: None,
             model_read_receipts: None,
             task_file_state: None,
+            retained_read_receipts: retained_read_receipts_enabled_from_env(),
             profile: None,
             tiered_compaction: None,
             append_only_audit: Default::default(),
@@ -751,6 +773,7 @@ impl Agent {
             file_state_cache: None,
             model_read_receipts: None,
             task_file_state: None,
+            retained_read_receipts: retained_read_receipts_enabled_from_env(),
             profile: None,
             tiered_compaction: None,
             append_only_audit: Default::default(),
@@ -1022,6 +1045,13 @@ impl Agent {
     /// Access the branch-local receipt store, if configured.
     pub fn model_read_receipts(&self) -> Option<&Arc<ModelReadReceiptStore>> {
         self.model_read_receipts.as_ref()
+    }
+
+    /// Override the experimental retained-read-receipt switch.
+    #[cfg(test)]
+    pub(crate) fn with_retained_read_receipts(mut self, enabled: bool) -> Self {
+        self.retained_read_receipts = enabled;
+        self
     }
 
     /// Wire an M8.7 [`crate::subagent_output::SubAgentOutputRouter`] so the
