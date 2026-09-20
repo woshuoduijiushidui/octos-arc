@@ -219,8 +219,9 @@ struct ReadSourceSignature {
     output_sha256: String,
 }
 
+/// Opaque identity of one exact, model-visible `read_file` call and output.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct SourceProof {
+pub struct ReadSourceProof {
     signature: ReadSourceSignature,
     occurrence: u64,
 }
@@ -242,7 +243,7 @@ pub(crate) struct ModelReadReceipt {
     file_version: FileVersion,
     model_visible_view: FileView,
     projection_policy_id: String,
-    source_proof: SourceProof,
+    source_proof: ReadSourceProof,
     context_generation: u64,
     activated_at: Option<Instant>,
 }
@@ -528,18 +529,18 @@ impl ModelReadReceiptStore {
         let Some(owner) = self.owner.as_ref() else {
             return PendingReadReceipts::default();
         };
-        let sources = visible_read_sources(messages);
+        let sources = visible_read_sources(messages, None);
         let visible_proofs = sources
             .iter()
-            .map(|(_, proof)| proof.clone())
+            .map(|source| source.proof.clone())
             .collect::<HashSet<_>>();
-        let mut sources_by_signature: HashMap<ReadSourceSignature, Vec<SourceProof>> =
+        let mut sources_by_signature: HashMap<ReadSourceSignature, Vec<ReadSourceProof>> =
             HashMap::new();
-        for (signature, proof) in sources {
+        for source in sources {
             sources_by_signature
-                .entry(signature)
+                .entry(source.signature)
                 .or_default()
-                .push(proof);
+                .push(source.proof);
         }
 
         let mut inner = self.lock_fail_closed();
@@ -656,6 +657,78 @@ impl ModelReadReceiptStore {
         }
     }
 
+    pub(crate) fn retain_after_frame_change(
+        &self,
+        retained_proofs: &[ReadSourceProof],
+        projection_policy_id: &str,
+        reason: ReceiptClearReason,
+    ) {
+        let proof_set = retained_proofs.iter().cloned().collect::<HashSet<_>>();
+        let mut inner = self.lock_fail_closed();
+        if proof_set.len() != retained_proofs.len() {
+            Self::clear_inner(&mut inner, reason);
+            return;
+        }
+        if inner.projection_policy_id.as_deref() != Some(projection_policy_id) {
+            Self::clear_inner(&mut inner, ReceiptClearReason::ProjectionPolicyChanged);
+            return;
+        }
+
+        let staged = std::mem::take(&mut inner.staged);
+        for candidate in &staged {
+            Self::remember_miss_hint(
+                &mut inner,
+                candidate.file_version.target().clone(),
+                ReadReceiptMissReason::LifecycleCleared,
+            );
+        }
+        let active = std::mem::take(&mut inner.active);
+        let active_count = active.len();
+        let mut retained = Vec::with_capacity(active.len());
+        for receipt in active {
+            if receipt.projection_policy_id == projection_policy_id
+                && proof_set.contains(&receipt.source_proof)
+            {
+                retained.push(receipt);
+            } else {
+                Self::remember_miss_hint(
+                    &mut inner,
+                    receipt.file_version.target().clone(),
+                    ReadReceiptMissReason::SourceNotVisible,
+                );
+            }
+        }
+
+        inner.generation = inner.generation.saturating_add(1);
+        for receipt in &mut retained {
+            receipt.context_generation = inner.generation;
+        }
+        let event = ReceiptClearEvent {
+            reason,
+            staged_removed: staged.len(),
+            active_removed: active_count.saturating_sub(retained.len()),
+        };
+        let retained_count = retained.len();
+        inner.active = retained;
+        inner.clear_count = inner.clear_count.saturating_add(1);
+        inner.last_clear = Some(event.clone());
+        metrics::counter!(
+            "octos_model_read_receipt_selective_reconciliations_total",
+            "reason" => reason.as_str().to_string(),
+        )
+        .increment(1);
+        metrics::counter!(
+            "octos_model_read_receipt_entries_retained_total",
+            "reason" => reason.as_str().to_string(),
+        )
+        .increment(retained_count as u64);
+        metrics::counter!(
+            "octos_model_read_receipt_entries_cleared_total",
+            "reason" => reason.as_str().to_string(),
+        )
+        .increment((event.staged_removed + event.active_removed) as u64);
+    }
+
     fn clear_inner(inner: &mut Inner, reason: ReceiptClearReason) {
         let event = ReceiptClearEvent {
             reason,
@@ -747,19 +820,29 @@ impl ModelReadReceiptStore {
     }
 }
 
-fn visible_read_sources(messages: &[Message]) -> Vec<(ReadSourceSignature, SourceProof)> {
+#[derive(Debug)]
+struct VisibleReadSource {
+    signature: ReadSourceSignature,
+    proof: ReadSourceProof,
+}
+
+fn visible_read_sources(
+    messages: &[Message],
+    retained_message_indices: Option<&HashSet<usize>>,
+) -> Vec<VisibleReadSource> {
     #[derive(Debug)]
     struct PendingCall {
         tool_call_id: String,
         tool_name: String,
         arguments_sha256: String,
+        assistant_message_index: usize,
     }
 
     let mut open_calls = VecDeque::new();
     let mut occurrence_by_signature: HashMap<ReadSourceSignature, u64> = HashMap::new();
     let mut sources = Vec::new();
 
-    for message in messages {
+    for (message_index, message) in messages.iter().enumerate() {
         match message.role {
             MessageRole::Assistant => {
                 open_calls.clear();
@@ -768,6 +851,7 @@ fn visible_read_sources(messages: &[Message]) -> Vec<(ReadSourceSignature, Sourc
                         tool_call_id: crate::normalize_tool_call_id(&call.id),
                         tool_name: call.name.clone(),
                         arguments_sha256: hash_json(&call.arguments),
+                        assistant_message_index: message_index,
                     });
                 }
             }
@@ -788,6 +872,12 @@ fn visible_read_sources(messages: &[Message]) -> Vec<(ReadSourceSignature, Sourc
                 if call.tool_name != "read_file" {
                     continue;
                 }
+                if retained_message_indices.is_some_and(|retained| {
+                    !retained.contains(&call.assistant_message_index)
+                        || !retained.contains(&message_index)
+                }) {
+                    continue;
+                }
                 let signature = ReadSourceSignature {
                     tool_call_id,
                     arguments_sha256: call.arguments_sha256,
@@ -797,11 +887,11 @@ fn visible_read_sources(messages: &[Message]) -> Vec<(ReadSourceSignature, Sourc
                     .entry(signature.clone())
                     .and_modify(|value| *value = value.saturating_add(1))
                     .or_insert(1);
-                let proof = SourceProof {
+                let proof = ReadSourceProof {
                     signature: signature.clone(),
                     occurrence: *occurrence,
                 };
-                sources.push((signature, proof));
+                sources.push(VisibleReadSource { signature, proof });
             }
             MessageRole::System | MessageRole::User => {
                 open_calls.clear();
@@ -810,6 +900,36 @@ fn visible_read_sources(messages: &[Message]) -> Vec<(ReadSourceSignature, Sourc
     }
 
     sources
+}
+
+/// Extract exact `read_file` source proofs whose call and result messages both
+/// originate from trusted retained prompt items.
+pub fn read_source_proofs_for_retained_messages(
+    messages: &[Message],
+    retained_message_indices: &[usize],
+) -> Option<Vec<ReadSourceProof>> {
+    let retained = retained_message_indices
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    if retained.len() != retained_message_indices.len()
+        || retained.iter().any(|index| *index >= messages.len())
+    {
+        return None;
+    }
+    Some(
+        visible_read_sources(messages, Some(&retained))
+            .into_iter()
+            .map(|source| source.proof)
+            .collect(),
+    )
+}
+
+pub(crate) fn read_source_proofs(messages: &[Message]) -> Vec<ReadSourceProof> {
+    visible_read_sources(messages, None)
+        .into_iter()
+        .map(|source| source.proof)
+        .collect()
 }
 
 fn hash_bytes(bytes: &[u8]) -> String {
@@ -1486,6 +1606,170 @@ mod tests {
                 .iter()
                 .all(|receipt| receipt.candidate_id() != "read-candidate-1")
         );
+    }
+
+    #[test]
+    fn retained_frame_keeps_only_exact_visible_receipts() {
+        let store = store();
+        let first_args = serde_json::json!({"path": "file.txt"});
+        let second_args = serde_json::json!({"path": "other.txt"});
+        let first_version = version(b"body");
+        let second_version = FileVersion::from_bytes(
+            FileTarget::new("workspace", "/workspace/other.txt"),
+            None,
+            b"other",
+            FileMetadataHint::new(5, None, None, None, None),
+        );
+        let messages = vec![
+            assistant("call_1", first_args.clone()),
+            tool("call_1", "body"),
+            assistant("call_2", second_args.clone()),
+            tool("call_2", "other"),
+        ];
+        store.stage(
+            "call_1",
+            &first_args,
+            first_version.clone(),
+            FileView::Full,
+            FileView::Full,
+            "body",
+        );
+        store.stage(
+            "call_2",
+            &second_args,
+            second_version.clone(),
+            FileView::Full,
+            FileView::Full,
+            "other",
+        );
+        let pending = store.prepare_dispatch(&messages, "policy-v1");
+        store.activate(pending);
+        store.stage(
+            "call_pending",
+            &serde_json::json!({"path": "pending.txt"}),
+            FileVersion::from_bytes(
+                FileTarget::new("workspace", "/workspace/pending.txt"),
+                None,
+                b"pending",
+                FileMetadataHint::new(7, None, None, None, None),
+            ),
+            FileView::Full,
+            FileView::Full,
+            "pending",
+        );
+
+        let retained =
+            read_source_proofs_for_retained_messages(&messages, &[0, 1]).expect("valid indices");
+        store.retain_after_frame_change(&retained, "policy-v1", ReceiptClearReason::Compaction);
+
+        assert!(store.receipt_for(&first_version, &FileView::Full).is_some());
+        assert!(
+            store
+                .receipt_for(&second_version, &FileView::Full)
+                .is_none()
+        );
+        assert_eq!(store.active_len(), 1);
+        assert_eq!(store.staged_len(), 0);
+        assert!(matches!(
+            store.lookup_receipt(&version(b"B0dy"), &FileView::Full),
+            Err(ReadReceiptMissReason::DigestChanged)
+        ));
+    }
+
+    #[test]
+    fn repeated_call_id_retains_exact_occurrence_when_both_remain() {
+        let store = store();
+        let args = serde_json::json!({"path": "file.txt"});
+        let file_version = version(b"body");
+        let messages = vec![
+            assistant("call_1", args.clone()),
+            tool("call_1", "body"),
+            Message::user("separator"),
+            assistant("call_1", args.clone()),
+            tool("call_1", "body"),
+        ];
+        store.stage(
+            "call_1",
+            &args,
+            file_version.clone(),
+            FileView::Full,
+            FileView::Full,
+            "body",
+        );
+        let pending = store.prepare_dispatch(&messages, "policy-v1");
+        store.activate(pending);
+
+        let retained = read_source_proofs_for_retained_messages(&messages, &[0, 1, 3, 4])
+            .expect("valid indices");
+        store.retain_after_frame_change(&retained, "policy-v1", ReceiptClearReason::Compaction);
+
+        assert!(store.receipt_for(&file_version, &FileView::Full).is_some());
+    }
+
+    #[test]
+    fn stub_or_projection_change_cannot_keep_a_receipt_alive() {
+        let args = serde_json::json!({"path": "file.txt"});
+        let file_version = version(b"body");
+
+        for (output, policy) in [
+            (
+                "[FILE_UNCHANGED] target=file.txt version=sha256:123 view=full source=x#1",
+                "policy-v1",
+            ),
+            ("body", "policy-v2"),
+        ] {
+            let store = store();
+            let original = [assistant("call_1", args.clone()), tool("call_1", "body")];
+            store.stage(
+                "call_1",
+                &args,
+                file_version.clone(),
+                FileView::Full,
+                FileView::Full,
+                "body",
+            );
+            let pending = store.prepare_dispatch(&original, "policy-v1");
+            store.activate(pending);
+            let changed = [assistant("call_1", args.clone()), tool("call_1", output)];
+            let retained =
+                read_source_proofs_for_retained_messages(&changed, &[0, 1]).expect("valid indices");
+
+            store.retain_after_frame_change(&retained, policy, ReceiptClearReason::Compaction);
+
+            assert_eq!(store.active_len(), 0);
+            assert!(store.receipt_for(&file_version, &FileView::Full).is_none());
+        }
+    }
+
+    #[test]
+    fn duplicate_retained_proof_falls_back_to_full_clear() {
+        let store = store();
+        let args = serde_json::json!({"path": "file.txt"});
+        let file_version = version(b"body");
+        let messages = [assistant("call_1", args.clone()), tool("call_1", "body")];
+        store.stage(
+            "call_1",
+            &args,
+            file_version.clone(),
+            FileView::Full,
+            FileView::Full,
+            "body",
+        );
+        let pending = store.prepare_dispatch(&messages, "policy-v1");
+        store.activate(pending);
+        let proof = read_source_proofs_for_retained_messages(&messages, &[0, 1])
+            .expect("valid indices")
+            .pop()
+            .expect("read proof");
+
+        store.retain_after_frame_change(
+            &[proof.clone(), proof],
+            "policy-v1",
+            ReceiptClearReason::Compaction,
+        );
+
+        assert_eq!(store.active_len(), 0);
+        assert!(store.receipt_for(&file_version, &FileView::Full).is_none());
     }
 
     #[test]

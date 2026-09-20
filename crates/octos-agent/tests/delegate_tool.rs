@@ -47,6 +47,7 @@ impl PromptContextManager for RecordingPromptContextManager {
             messages_after: messages.len(),
             token_estimate: None,
             generation: Some(1),
+            retained_read_source_proofs: None,
         })
     }
 }
