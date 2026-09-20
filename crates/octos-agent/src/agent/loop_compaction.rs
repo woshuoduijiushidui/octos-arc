@@ -13,6 +13,7 @@ use super::message_repair::{
     synthesize_missing_tool_results, truncate_old_tool_results,
 };
 use super::turn_state::{LoopRepairReason, LoopTurnState};
+use crate::model_read_receipts::ReceiptClearReason;
 
 /// Prepare a conversation turn for the next model call.
 ///
@@ -30,6 +31,7 @@ pub(crate) fn prepare_conversation_messages(
     turn: &mut LoopTurnState,
 ) {
     if agent.trim_to_context_window(messages) {
+        agent.clear_model_read_receipts(ReceiptClearReason::ContextTrim);
         turn.record_repair(LoopRepairReason::ContextTrimmed);
     }
     if normalize_system_messages(messages) {
@@ -52,6 +54,7 @@ pub(crate) fn prepare_conversation_messages(
     // which then re-records the whole conversation as duplicates. Tool-output
     // bounding is the ContextManager's job there (ToolOutputPolicy).
     if agent.prompt_context_manager.is_none() && truncate_old_tool_results(messages) {
+        agent.clear_model_read_receipts(ReceiptClearReason::ToolResultReplacement);
         turn.record_repair(LoopRepairReason::OldToolResultsTruncated);
     }
     if normalize_tool_call_ids(messages) {
@@ -74,6 +77,7 @@ pub(crate) fn prepare_task_messages(
     turn: &mut LoopTurnState,
 ) {
     if agent.trim_to_context_window(messages) {
+        agent.clear_model_read_receipts(ReceiptClearReason::ContextTrim);
         turn.record_repair(LoopRepairReason::ContextTrimmed);
     }
     if normalize_system_messages(messages) {
@@ -97,6 +101,8 @@ mod tests {
     use std::time::Instant;
     use tempfile::TempDir;
 
+    use crate::file_state_cache::{FileMetadataHint, FileTarget, FileVersion};
+    use crate::model_read_receipts::{FileView, ModelReadReceiptStore, ReadReceiptOwner};
     use crate::prompt_context::{
         PromptContextManager, PromptContextPhase, PromptContextReport, PromptContextRequest,
     };
@@ -235,6 +241,39 @@ mod tests {
         (dir, agent)
     }
 
+    fn primed_receipts() -> Arc<ModelReadReceiptStore> {
+        let store = Arc::new(ModelReadReceiptStore::for_owner(
+            ReadReceiptOwner::new("workspace", "task", "session", "branch").unwrap(),
+        ));
+        let arguments = serde_json::json!({"path": "file.txt"});
+        let version = FileVersion::from_bytes(
+            FileTarget::new("workspace", "/workspace/file.txt"),
+            None,
+            b"body",
+            FileMetadataHint::new(4, None, None, None, None),
+        );
+        store.stage(
+            "call_read",
+            &arguments,
+            version,
+            FileView::Full,
+            FileView::Full,
+            "body",
+        );
+        let mut call = Message::assistant("");
+        call.tool_calls = Some(vec![ToolCall {
+            id: "call_read".to_owned(),
+            name: "read_file".to_owned(),
+            arguments,
+            metadata: None,
+        }]);
+        let pending =
+            store.prepare_dispatch(&[call, tool_result_msg("call_read", "body")], "policy-v1");
+        store.activate(pending);
+        assert_eq!(store.active_len(), 1);
+        store
+    }
+
     fn projection(messages: &[Message]) -> Vec<(MessageRole, String, Option<String>, Vec<String>)> {
         messages
             .iter()
@@ -289,6 +328,52 @@ mod tests {
                 || turn
                     .repair_reasons()
                     .contains(&LoopRepairReason::OldToolResultsTruncated)
+        );
+    }
+
+    #[tokio::test]
+    async fn context_trim_clears_model_read_receipts() {
+        let (_dir, agent) = setup_agent(120).await;
+        let receipts = primed_receipts();
+        let agent = agent.with_model_read_receipts(receipts.clone());
+        let mut turn = LoopTurnState::new(Instant::now());
+        let mut messages = vec![sys("prompt")];
+        for index in 0..12 {
+            messages.push(user(&format!("old filler {index} {}", "x".repeat(80))));
+            messages.push(assistant(&format!("old reply {index} {}", "y".repeat(80))));
+        }
+        messages.push(user("current question"));
+
+        prepare_conversation_messages(&agent, &mut messages, &mut turn);
+
+        assert_eq!(receipts.active_len(), 0);
+        assert_eq!(
+            receipts.last_clear().map(|event| event.reason),
+            Some(ReceiptClearReason::ContextTrim)
+        );
+    }
+
+    #[tokio::test]
+    async fn old_tool_result_replacement_clears_model_read_receipts() {
+        let (_dir, agent) = setup_agent(1_000_000).await;
+        let receipts = primed_receipts();
+        let agent = agent.with_model_read_receipts(receipts.clone());
+        let mut turn = LoopTurnState::new(Instant::now());
+        let mut messages = vec![
+            sys("prompt"),
+            user("old question"),
+            assistant_with_tools(&["call_old"]),
+            tool_result_msg("call_old", &"z".repeat(2_000)),
+            assistant("old answer"),
+            user("current question"),
+        ];
+
+        prepare_conversation_messages(&agent, &mut messages, &mut turn);
+
+        assert_eq!(receipts.active_len(), 0);
+        assert_eq!(
+            receipts.last_clear().map(|event| event.reason),
+            Some(ReceiptClearReason::ToolResultReplacement)
         );
     }
 

@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use octos_agent::{
     Agent, AgentConfig, FileStateCache, HookConfig, HookEvent, HookExecutor, ModelReadReceiptStore,
-    PromptContextManager, PromptContextReport, PromptContextRequest, ReadFileTool, Tool,
-    ToolRegistry, tools::ToolContext,
+    PromptContextManager, PromptContextReport, PromptContextRequest, ReadFileTool,
+    ReadReceiptOwner, Tool, ToolRegistry, tools::ToolContext,
 };
 use octos_core::{AgentId, Message, MessageRole, ToolCall};
 use octos_llm::{
@@ -195,11 +195,21 @@ fn tool_outputs(response: &octos_agent::ConversationResponse) -> Vec<&str> {
         .collect()
 }
 
+fn receipt_store(workspace: &std::path::Path) -> Arc<ModelReadReceiptStore> {
+    let workspace_id = format!(
+        "local:{}",
+        std::fs::canonicalize(workspace).unwrap().display()
+    );
+    Arc::new(ModelReadReceiptStore::for_owner(
+        ReadReceiptOwner::new(workspace_id, "task", "session", "branch").unwrap(),
+    ))
+}
+
 #[tokio::test]
 async fn direct_repeated_reads_do_not_activate_staged_candidates() {
     let workspace = tempfile::tempdir().unwrap();
     std::fs::write(workspace.path().join("notes.txt"), "alpha\nbeta\n").unwrap();
-    let receipts = Arc::new(ModelReadReceiptStore::new());
+    let receipts = receipt_store(workspace.path());
     let ledger = Arc::new(FileStateCache::new());
     let mut context = ToolContext::zero();
     context.tool_id = "call_direct".to_owned();
@@ -222,7 +232,7 @@ async fn direct_repeated_reads_do_not_activate_staged_candidates() {
 async fn successful_provider_dispatch_enables_next_matching_read_stub() {
     let workspace = tempfile::tempdir().unwrap();
     std::fs::write(workspace.path().join("notes.txt"), "alpha\nbeta\n").unwrap();
-    let receipts = Arc::new(ModelReadReceiptStore::new());
+    let receipts = receipt_store(workspace.path());
     let scripted = Arc::new(ScriptedProvider::new(vec![
         tool_use(vec![tool_call(
             "call_1",
@@ -263,7 +273,7 @@ async fn successful_provider_dispatch_enables_next_matching_read_stub() {
 async fn failed_provider_dispatch_does_not_activate_a_receipt() {
     let workspace = tempfile::tempdir().unwrap();
     std::fs::write(workspace.path().join("notes.txt"), "alpha\nbeta\n").unwrap();
-    let receipts = Arc::new(ModelReadReceiptStore::new());
+    let receipts = receipt_store(workspace.path());
     let provider: Arc<dyn LlmProvider> = Arc::new(ToolThenFailProvider {
         calls: AtomicUsize::new(0),
     });
@@ -284,7 +294,7 @@ async fn failed_provider_dispatch_does_not_activate_a_receipt() {
 async fn eight_kib_projection_does_not_activate_a_receipt() {
     let workspace = tempfile::tempdir().unwrap();
     std::fs::write(workspace.path().join("notes.txt"), "alpha\n".repeat(2_000)).unwrap();
-    let receipts = Arc::new(ModelReadReceiptStore::new());
+    let receipts = receipt_store(workspace.path());
     let provider: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider::new(vec![
         tool_use(vec![tool_call(
             "call_1",
@@ -316,7 +326,7 @@ async fn eight_kib_projection_does_not_activate_a_receipt() {
 async fn context_pressure_source_drop_does_not_activate_a_receipt() {
     let workspace = tempfile::tempdir().unwrap();
     std::fs::write(workspace.path().join("notes.txt"), "alpha\nbeta\n").unwrap();
-    let receipts = Arc::new(ModelReadReceiptStore::new());
+    let receipts = receipt_store(workspace.path());
     let provider: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider::new(vec![
         tool_use(vec![tool_call(
             "call_1",
@@ -348,7 +358,7 @@ async fn context_pressure_source_drop_does_not_activate_a_receipt() {
 async fn read_file_internal_100kb_truncation_does_not_stage_a_candidate() {
     let workspace = tempfile::tempdir().unwrap();
     std::fs::write(workspace.path().join("large.txt"), "x".repeat(120_000)).unwrap();
-    let receipts = Arc::new(ModelReadReceiptStore::new());
+    let receipts = receipt_store(workspace.path());
     let ledger = Arc::new(FileStateCache::new());
     let mut context = ToolContext::zero();
     context.tool_id = "call_large".to_owned();
@@ -376,7 +386,7 @@ async fn read_file_internal_100kb_truncation_does_not_stage_a_candidate() {
 async fn execution_50kb_truncation_does_not_activate_a_receipt() {
     let workspace = tempfile::tempdir().unwrap();
     std::fs::write(workspace.path().join("large.txt"), "x".repeat(60_000)).unwrap();
-    let receipts = Arc::new(ModelReadReceiptStore::new());
+    let receipts = receipt_store(workspace.path());
     let args = serde_json::json!({"path": "large.txt", "start_line": 1, "end_line": 1});
     let provider: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider::new(vec![
         tool_use(vec![tool_call("call_1", args.clone())]),
@@ -408,7 +418,7 @@ async fn sanitized_output_does_not_activate_a_receipt() {
         "OPENAI_API_KEY=sk-proj-abc123def456ghi789jklmnopqrst\n",
     )
     .unwrap();
-    let receipts = Arc::new(ModelReadReceiptStore::new());
+    let receipts = receipt_store(workspace.path());
     let provider: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider::new(vec![
         tool_use(vec![tool_call(
             "call_1",
@@ -446,7 +456,7 @@ async fn sanitized_output_does_not_activate_a_receipt() {
 async fn after_tool_hook_feedback_does_not_activate_a_receipt() {
     let workspace = tempfile::tempdir().unwrap();
     std::fs::write(workspace.path().join("notes.txt"), "alpha\nbeta\n").unwrap();
-    let receipts = Arc::new(ModelReadReceiptStore::new());
+    let receipts = receipt_store(workspace.path());
     let provider: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider::new(vec![
         tool_use(vec![tool_call(
             "call_1",
@@ -498,7 +508,7 @@ async fn partial_receipt_covers_only_the_visible_line_range() {
         "one\ntwo\nthree\nfour\nfive\n",
     )
     .unwrap();
-    let receipts = Arc::new(ModelReadReceiptStore::new());
+    let receipts = receipt_store(workspace.path());
     let provider: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider::new(vec![
         tool_use(vec![tool_call(
             "call_1",
@@ -532,7 +542,7 @@ async fn partial_receipt_covers_only_the_visible_line_range() {
 async fn parallel_reads_do_not_authorize_each_other_before_dispatch() {
     let workspace = tempfile::tempdir().unwrap();
     std::fs::write(workspace.path().join("notes.txt"), "alpha\nbeta\n").unwrap();
-    let receipts = Arc::new(ModelReadReceiptStore::new());
+    let receipts = receipt_store(workspace.path());
     let provider: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider::new(vec![
         tool_use(vec![
             tool_call(
