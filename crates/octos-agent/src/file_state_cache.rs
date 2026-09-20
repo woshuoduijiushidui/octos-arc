@@ -22,6 +22,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 #[cfg(not(unix))]
 use std::time::SystemTime;
 
@@ -192,10 +193,15 @@ impl FileVersion {
         bytes: &[u8],
         metadata_hint: FileMetadataHint,
     ) -> Self {
+        let started_at = Instant::now();
+        let content_sha256 = Self::sha256(bytes);
+        metrics::counter!("octos_file_version_hash_bytes_total").increment(bytes.len() as u64);
+        metrics::histogram!("octos_file_version_hash_duration_seconds")
+            .record(started_at.elapsed().as_secs_f64());
         Self {
             target,
             provider_version,
-            content_sha256: Self::sha256(bytes),
+            content_sha256,
             size: bytes.len() as u64,
             metadata_hint,
         }

@@ -1524,6 +1524,11 @@ fn read_no_follow_with_meta_blocking(
         let path_hint = crate::file_state_cache::FileMetadataHint::from_metadata(&path_after);
         if !metadata_matches_stable_observation(&before_hint, &after_hint, &path_hint, bytes.len())
         {
+            metrics::counter!(
+                "octos_file_read_stability_retries_total",
+                "outcome" => "retry".to_string(),
+            )
+            .increment(1);
             continue;
         }
 
@@ -1549,6 +1554,13 @@ fn read_no_follow_with_meta_blocking(
             })?
         };
         let epoch = crate::tools::read_window::ViewEpoch::from_metadata(&after);
+        if attempt > 0 {
+            metrics::counter!(
+                "octos_file_read_stability_retries_total",
+                "outcome" => "recovered".to_string(),
+            )
+            .increment(1);
+        }
         return Ok((
             content,
             ReadMeta {
@@ -1559,6 +1571,11 @@ fn read_no_follow_with_meta_blocking(
         ));
     }
 
+    metrics::counter!(
+        "octos_file_read_stability_retries_total",
+        "outcome" => "exhausted".to_string(),
+    )
+    .increment(1);
     Err(StableReadError::ConcurrentChange)
 }
 

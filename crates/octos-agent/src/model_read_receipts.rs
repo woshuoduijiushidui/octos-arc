@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::{Mutex, MutexGuard};
+use std::time::Instant;
 
 use octos_core::{Message, MessageRole};
 use serde_json::Value;
@@ -12,6 +13,7 @@ use crate::file_state_cache::FileVersion;
 
 const MAX_STAGED_CANDIDATES: usize = 256;
 const MAX_ACTIVE_RECEIPTS: usize = 256;
+const MAX_MISS_HINTS: usize = 256;
 
 /// Stable identity of one model-visible history branch.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -174,6 +176,42 @@ impl fmt::Display for FileView {
     }
 }
 
+/// Stable reason why a read could not reuse an active receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadReceiptMissReason {
+    FeatureDisabled,
+    MissingState,
+    NoReceipt,
+    OwnerMismatch,
+    SourceNotVisible,
+    SourceTruncated,
+    ViewNotCovered,
+    ProjectionChanged,
+    MetadataChanged,
+    DigestChanged,
+    ReceiptEvicted,
+    LifecycleCleared,
+}
+
+impl ReadReceiptMissReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::FeatureDisabled => "feature_disabled",
+            Self::MissingState => "missing_state",
+            Self::NoReceipt => "no_receipt",
+            Self::OwnerMismatch => "owner_mismatch",
+            Self::SourceNotVisible => "source_not_visible",
+            Self::SourceTruncated => "source_truncated",
+            Self::ViewNotCovered => "view_not_covered",
+            Self::ProjectionChanged => "projection_changed",
+            Self::MetadataChanged => "metadata_changed",
+            Self::DigestChanged => "digest_changed",
+            Self::ReceiptEvicted => "receipt_evicted",
+            Self::LifecycleCleared => "lifecycle_cleared",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ReadSourceSignature {
     tool_call_id: String,
@@ -205,6 +243,8 @@ pub(crate) struct ModelReadReceipt {
     model_visible_view: FileView,
     projection_policy_id: String,
     source_proof: SourceProof,
+    context_generation: u64,
+    activated_at: Option<Instant>,
 }
 
 impl ModelReadReceipt {
@@ -219,6 +259,20 @@ impl ModelReadReceipt {
     pub(crate) fn source_occurrence(&self) -> u64 {
         self.source_proof.occurrence
     }
+
+    pub(crate) fn projection_policy_id(&self) -> &str {
+        &self.projection_policy_id
+    }
+
+    pub(crate) fn context_generation(&self) -> u64 {
+        self.context_generation
+    }
+
+    pub(crate) fn age_millis(&self) -> u128 {
+        self.activated_at
+            .map(|activated_at| activated_at.elapsed().as_millis())
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -228,6 +282,8 @@ struct Inner {
     staged: Vec<ReadCandidate>,
     active: Vec<ModelReadReceipt>,
     projection_policy_id: Option<String>,
+    miss_hints: HashMap<crate::file_state_cache::FileTarget, ReadReceiptMissReason>,
+    miss_hint_order: VecDeque<crate::file_state_cache::FileTarget>,
     clear_count: u64,
     last_clear: Option<ReceiptClearEvent>,
 }
@@ -330,6 +386,13 @@ impl ModelReadReceiptStore {
         inner.generation = inner.generation.saturating_add(1);
         let removed = staged_before.saturating_sub(inner.staged.len())
             + active_before.saturating_sub(inner.active.len());
+        if removed > 0 {
+            Self::remember_miss_hint(
+                &mut inner,
+                target.clone(),
+                ReadReceiptMissReason::LifecycleCleared,
+            );
+        }
         metrics::counter!(
             "octos_model_read_receipt_target_revocations_total",
             "reason" => reason.as_str().to_string(),
@@ -361,7 +424,12 @@ impl ModelReadReceiptStore {
         inner.next_candidate_id = inner.next_candidate_id.saturating_add(1);
         let candidate_id = format!("read-candidate-{}", inner.next_candidate_id);
         if inner.staged.len() >= MAX_STAGED_CANDIDATES {
-            inner.staged.remove(0);
+            let evicted = inner.staged.remove(0);
+            Self::remember_miss_hint(
+                &mut inner,
+                evicted.file_version.target().clone(),
+                ReadReceiptMissReason::ReceiptEvicted,
+            );
             metrics::counter!(
                 "octos_model_read_receipt_evictions_total",
                 "kind" => "candidate".to_string(),
@@ -382,21 +450,44 @@ impl ModelReadReceiptStore {
         });
     }
 
+    #[cfg(test)]
     pub(crate) fn receipt_for(
         &self,
         file_version: &FileVersion,
         requested_view: &FileView,
     ) -> Option<ModelReadReceipt> {
-        let owner = self.owner.as_ref()?;
+        self.lookup_receipt(file_version, requested_view).ok()
+    }
+
+    pub(crate) fn lookup_receipt(
+        &self,
+        file_version: &FileVersion,
+        requested_view: &FileView,
+    ) -> Result<ModelReadReceipt, ReadReceiptMissReason> {
+        let Some(owner) = self.owner.as_ref() else {
+            return Err(ReadReceiptMissReason::MissingState);
+        };
         if file_version.target().workspace_id() != owner.workspace_id() {
-            return None;
+            return Err(ReadReceiptMissReason::OwnerMismatch);
         }
         let mut inner = self.lock_fail_closed();
+        let mut changed_reason = None;
         inner.active.retain(|receipt| {
-            receipt.file_version.target() != file_version.target()
+            if receipt.file_version.target() != file_version.target()
                 || receipt.file_version == *file_version
+            {
+                return true;
+            }
+            changed_reason = Some(
+                if receipt.file_version.metadata_hint() != file_version.metadata_hint() {
+                    ReadReceiptMissReason::MetadataChanged
+                } else {
+                    ReadReceiptMissReason::DigestChanged
+                },
+            );
+            false
         });
-        inner
+        if let Some(receipt) = inner
             .active
             .iter()
             .rev()
@@ -406,6 +497,27 @@ impl ModelReadReceiptStore {
                     && receipt.model_visible_view.covers(requested_view)
             })
             .cloned()
+        {
+            Self::take_miss_hint(&mut inner, file_version.target());
+            return Ok(receipt);
+        }
+        if inner.active.iter().any(|receipt| {
+            receipt.owner == *owner
+                && receipt.file_version == *file_version
+                && !receipt.model_visible_view.covers(requested_view)
+        }) {
+            return Err(ReadReceiptMissReason::ViewNotCovered);
+        }
+        if let Some(reason) = changed_reason {
+            metrics::counter!(
+                "octos_file_read_version_rejects_total",
+                "reason" => reason.as_str().to_string(),
+            )
+            .increment(1);
+            return Err(reason);
+        }
+        Err(Self::take_miss_hint(&mut inner, file_version.target())
+            .unwrap_or(ReadReceiptMissReason::NoReceipt))
     }
 
     pub(crate) fn prepare_dispatch(
@@ -439,23 +551,50 @@ impl ModelReadReceiptStore {
             Self::clear_inner(&mut inner, ReceiptClearReason::ProjectionPolicyChanged);
         }
         inner.projection_policy_id = Some(projection_policy_id.to_owned());
-        inner.active.retain(|receipt| {
-            receipt.projection_policy_id == projection_policy_id
+        let active = std::mem::take(&mut inner.active);
+        for receipt in active {
+            if receipt.projection_policy_id == projection_policy_id
                 && visible_proofs.contains(&receipt.source_proof)
-        });
+            {
+                inner.active.push(receipt);
+            } else {
+                Self::remember_miss_hint(
+                    &mut inner,
+                    receipt.file_version.target().clone(),
+                    ReadReceiptMissReason::SourceNotVisible,
+                );
+            }
+        }
         let generation = inner.generation;
         let staged = std::mem::take(&mut inner.staged);
-        drop(inner);
 
         let mut pending = Vec::new();
         for candidate in staged.into_iter().rev() {
             if !candidate.requested_view.covers(&candidate.returned_view) {
+                Self::remember_miss_hint(
+                    &mut inner,
+                    candidate.file_version.target().clone(),
+                    ReadReceiptMissReason::SourceTruncated,
+                );
                 continue;
             }
             let Some(proof) = sources_by_signature
                 .get_mut(&candidate.signature)
                 .and_then(Vec::pop)
             else {
+                let reason = if sources_by_signature.keys().any(|source| {
+                    source.tool_call_id == candidate.signature.tool_call_id
+                        && source.arguments_sha256 == candidate.signature.arguments_sha256
+                }) {
+                    ReadReceiptMissReason::SourceTruncated
+                } else {
+                    ReadReceiptMissReason::SourceNotVisible
+                };
+                Self::remember_miss_hint(
+                    &mut inner,
+                    candidate.file_version.target().clone(),
+                    reason,
+                );
                 continue;
             };
             pending.push(ModelReadReceipt {
@@ -465,6 +604,8 @@ impl ModelReadReceiptStore {
                 model_visible_view: candidate.returned_view,
                 projection_policy_id: projection_policy_id.to_owned(),
                 source_proof: proof,
+                context_generation: generation,
+                activated_at: None,
             });
         }
         pending.reverse();
@@ -483,7 +624,7 @@ impl ModelReadReceiptStore {
         if pending.owner.as_ref() != Some(owner) || pending.generation != inner.generation {
             return;
         }
-        for receipt in pending.receipts {
+        for mut receipt in pending.receipts {
             if receipt.owner != *owner {
                 continue;
             }
@@ -497,13 +638,20 @@ impl ModelReadReceiptStore {
                     || existing.model_visible_view != receipt.model_visible_view
             });
             if inner.active.len() >= MAX_ACTIVE_RECEIPTS {
-                inner.active.remove(0);
+                let evicted = inner.active.remove(0);
+                Self::remember_miss_hint(
+                    &mut inner,
+                    evicted.file_version.target().clone(),
+                    ReadReceiptMissReason::ReceiptEvicted,
+                );
                 metrics::counter!(
                     "octos_model_read_receipt_evictions_total",
                     "kind" => "receipt".to_string(),
                 )
                 .increment(1);
             }
+            receipt.activated_at = Some(Instant::now());
+            Self::take_miss_hint(&mut inner, receipt.file_version.target());
             inner.active.push(receipt);
         }
     }
@@ -514,6 +662,25 @@ impl ModelReadReceiptStore {
             staged_removed: inner.staged.len(),
             active_removed: inner.active.len(),
         };
+        let miss_reason = if reason == ReceiptClearReason::ProjectionPolicyChanged {
+            ReadReceiptMissReason::ProjectionChanged
+        } else {
+            ReadReceiptMissReason::LifecycleCleared
+        };
+        let targets = inner
+            .staged
+            .iter()
+            .map(|candidate| candidate.file_version.target().clone())
+            .chain(
+                inner
+                    .active
+                    .iter()
+                    .map(|receipt| receipt.file_version.target().clone()),
+            )
+            .collect::<Vec<_>>();
+        for target in targets {
+            Self::remember_miss_hint(inner, target, miss_reason);
+        }
         inner.generation = inner.generation.saturating_add(1);
         inner.staged.clear();
         inner.active.clear();
@@ -529,6 +696,43 @@ impl ModelReadReceiptStore {
             "reason" => reason.as_str().to_string(),
         )
         .increment((event.staged_removed + event.active_removed) as u64);
+    }
+
+    fn remember_miss_hint(
+        inner: &mut Inner,
+        target: crate::file_state_cache::FileTarget,
+        reason: ReadReceiptMissReason,
+    ) {
+        metrics::counter!(
+            "octos_model_read_receipt_invalidations_total",
+            "reason" => reason.as_str().to_string(),
+        )
+        .increment(1);
+        if !inner.miss_hints.contains_key(&target) {
+            inner.miss_hint_order.push_back(target.clone());
+        }
+        inner.miss_hints.insert(target, reason);
+        while inner.miss_hints.len() > MAX_MISS_HINTS {
+            let Some(oldest) = inner.miss_hint_order.pop_front() else {
+                break;
+            };
+            inner.miss_hints.remove(&oldest);
+        }
+    }
+
+    fn take_miss_hint(
+        inner: &mut Inner,
+        target: &crate::file_state_cache::FileTarget,
+    ) -> Option<ReadReceiptMissReason> {
+        let reason = inner.miss_hints.remove(target)?;
+        if let Some(index) = inner
+            .miss_hint_order
+            .iter()
+            .position(|candidate| candidate == target)
+        {
+            inner.miss_hint_order.remove(index);
+        }
+        Some(reason)
     }
 
     fn lock_fail_closed(&self) -> MutexGuard<'_, Inner> {
@@ -711,6 +915,34 @@ mod tests {
     }
 
     #[test]
+    fn miss_reason_labels_are_stable() {
+        let reasons = [
+            (ReadReceiptMissReason::FeatureDisabled, "feature_disabled"),
+            (ReadReceiptMissReason::MissingState, "missing_state"),
+            (ReadReceiptMissReason::NoReceipt, "no_receipt"),
+            (ReadReceiptMissReason::OwnerMismatch, "owner_mismatch"),
+            (
+                ReadReceiptMissReason::SourceNotVisible,
+                "source_not_visible",
+            ),
+            (ReadReceiptMissReason::SourceTruncated, "source_truncated"),
+            (ReadReceiptMissReason::ViewNotCovered, "view_not_covered"),
+            (
+                ReadReceiptMissReason::ProjectionChanged,
+                "projection_changed",
+            ),
+            (ReadReceiptMissReason::MetadataChanged, "metadata_changed"),
+            (ReadReceiptMissReason::DigestChanged, "digest_changed"),
+            (ReadReceiptMissReason::ReceiptEvicted, "receipt_evicted"),
+            (ReadReceiptMissReason::LifecycleCleared, "lifecycle_cleared"),
+        ];
+
+        for (reason, expected) in reasons {
+            assert_eq!(reason.as_str(), expected);
+        }
+    }
+
+    #[test]
     fn exact_source_activates_only_after_success_is_committed() {
         let store = store();
         let args = serde_json::json!({"path": "file.txt"});
@@ -742,6 +974,123 @@ mod tests {
                 .is_none(),
             "a line-numbered full view must not authorize raw byte mode"
         );
+    }
+
+    #[test]
+    fn detailed_lookup_reports_hit_and_version_rejection_reasons() {
+        let args = serde_json::json!({"path": "file.txt"});
+        let file_version = version(b"body");
+
+        let hit_store = store();
+        hit_store.stage(
+            "call_1",
+            &args,
+            file_version.clone(),
+            FileView::Full,
+            FileView::Full,
+            "body",
+        );
+        let pending = hit_store.prepare_dispatch(
+            &[assistant("call_1", args.clone()), tool("call_1", "body")],
+            "policy-v1",
+        );
+        hit_store.activate(pending);
+        let receipt = hit_store
+            .lookup_receipt(&file_version, &FileView::Full)
+            .expect("exact version and view must hit");
+        assert_eq!(receipt.projection_policy_id(), "policy-v1");
+        assert_eq!(receipt.context_generation(), 0);
+
+        let digest_store = store();
+        digest_store.stage(
+            "call_1",
+            &args,
+            file_version.clone(),
+            FileView::Full,
+            FileView::Full,
+            "body",
+        );
+        let pending = digest_store.prepare_dispatch(
+            &[assistant("call_1", args.clone()), tool("call_1", "body")],
+            "policy-v1",
+        );
+        digest_store.activate(pending);
+        let changed_digest = version(b"B0dy");
+        assert!(matches!(
+            digest_store.lookup_receipt(&changed_digest, &FileView::Full),
+            Err(ReadReceiptMissReason::DigestChanged)
+        ));
+
+        let metadata_store = store();
+        metadata_store.stage(
+            "call_1",
+            &args,
+            file_version.clone(),
+            FileView::Full,
+            FileView::Full,
+            "body",
+        );
+        let pending = metadata_store.prepare_dispatch(
+            &[assistant("call_1", args), tool("call_1", "body")],
+            "policy-v1",
+        );
+        metadata_store.activate(pending);
+        let changed_metadata = FileVersion::from_bytes(
+            file_version.target().clone(),
+            None,
+            b"body",
+            FileMetadataHint::new(4, Some(1), None, None, None),
+        );
+        assert!(matches!(
+            metadata_store.lookup_receipt(&changed_metadata, &FileView::Full),
+            Err(ReadReceiptMissReason::MetadataChanged)
+        ));
+    }
+
+    #[test]
+    fn detailed_lookup_remembers_visibility_and_lifecycle_invalidation() {
+        let args = serde_json::json!({"path": "file.txt"});
+        let file_version = version(b"body");
+
+        let source_store = store();
+        source_store.stage(
+            "call_1",
+            &args,
+            file_version.clone(),
+            FileView::Full,
+            FileView::Full,
+            "body",
+        );
+        let pending = source_store.prepare_dispatch(
+            &[assistant("call_1", args.clone()), tool("call_1", "body")],
+            "policy-v1",
+        );
+        source_store.activate(pending);
+        source_store.prepare_dispatch(&[], "policy-v1");
+        assert!(matches!(
+            source_store.lookup_receipt(&file_version, &FileView::Full),
+            Err(ReadReceiptMissReason::SourceNotVisible)
+        ));
+
+        let lifecycle_store = store();
+        lifecycle_store.stage(
+            "call_1",
+            &args,
+            file_version.clone(),
+            FileView::Full,
+            FileView::Full,
+            "body",
+        );
+        let pending = lifecycle_store.prepare_dispatch(
+            &[assistant("call_1", args), tool("call_1", "body")],
+            "policy-v1",
+        );
+        lifecycle_store.activate(pending);
+        lifecycle_store.clear(ReceiptClearReason::Compaction);
+        assert!(matches!(
+            lifecycle_store.lookup_receipt(&file_version, &FileView::Full),
+            Err(ReadReceiptMissReason::LifecycleCleared)
+        ));
     }
 
     #[test]
@@ -811,18 +1160,25 @@ mod tests {
 
     #[test]
     fn changed_or_missing_output_consumes_candidate_without_receipt() {
-        for messages in [
-            vec![
-                assistant("call_1", serde_json::json!({"path": "file.txt"})),
-                tool("call_1", "projected body"),
-            ],
-            vec![assistant("call_1", serde_json::json!({"path": "file.txt"}))],
+        for (messages, expected_reason) in [
+            (
+                vec![
+                    assistant("call_1", serde_json::json!({"path": "file.txt"})),
+                    tool("call_1", "projected body"),
+                ],
+                ReadReceiptMissReason::SourceTruncated,
+            ),
+            (
+                vec![assistant("call_1", serde_json::json!({"path": "file.txt"}))],
+                ReadReceiptMissReason::SourceNotVisible,
+            ),
         ] {
             let store = store();
+            let file_version = version(b"body");
             store.stage(
                 "call_1",
                 &serde_json::json!({"path": "file.txt"}),
-                version(b"body"),
+                file_version.clone(),
                 FileView::Full,
                 FileView::Full,
                 "body",
@@ -831,6 +1187,10 @@ mod tests {
             store.activate(pending);
             assert_eq!(store.staged_len(), 0);
             assert_eq!(store.active_len(), 0);
+            assert!(matches!(
+                store.lookup_receipt(&file_version, &FileView::Full),
+                Err(reason) if reason == expected_reason
+            ));
         }
     }
 
@@ -879,7 +1239,7 @@ mod tests {
         store.stage(
             "call_1",
             &args,
-            file_version,
+            file_version.clone(),
             FileView::Full,
             FileView::Full,
             "body",
@@ -944,7 +1304,7 @@ mod tests {
         store.stage(
             "call_1",
             &args,
-            file_version,
+            file_version.clone(),
             FileView::Full,
             FileView::Full,
             "body",
@@ -960,6 +1320,10 @@ mod tests {
             store.last_clear().map(|event| event.reason),
             Some(ReceiptClearReason::ProjectionPolicyChanged)
         );
+        assert!(matches!(
+            store.lookup_receipt(&file_version, &FileView::Full),
+            Err(ReadReceiptMissReason::ProjectionChanged)
+        ));
     }
 
     #[test]
@@ -1079,7 +1443,10 @@ mod tests {
         }
 
         assert_eq!(store.active_len(), MAX_ACTIVE_RECEIPTS);
-        assert!(store.receipt_for(&first_version, &FileView::Full).is_none());
+        assert!(matches!(
+            store.lookup_receipt(&first_version, &FileView::Full),
+            Err(ReadReceiptMissReason::ReceiptEvicted)
+        ));
     }
 
     #[test]
