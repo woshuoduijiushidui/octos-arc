@@ -85,6 +85,20 @@ pub enum ReceiptClearReason {
     LockPoisoned,
 }
 
+/// Targeted reason for revoking receipts without clearing the whole branch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReceiptRevokeReason {
+    Mutation,
+}
+
+impl ReceiptRevokeReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mutation => "mutation",
+        }
+    }
+}
+
 impl ReceiptClearReason {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -287,6 +301,45 @@ impl ModelReadReceiptStore {
     pub fn clear(&self, reason: ReceiptClearReason) {
         let mut inner = self.lock_fail_closed();
         Self::clear_inner(&mut inner, reason);
+    }
+
+    /// Revoke staged and active receipts for one canonical provider target.
+    ///
+    /// The generation bump also prevents a provider request prepared before
+    /// the mutation from activating an out-of-date pending receipt afterward.
+    pub(crate) fn revoke_target(
+        &self,
+        target: &crate::file_state_cache::FileTarget,
+        reason: ReceiptRevokeReason,
+    ) {
+        let Some(owner) = self.owner.as_ref() else {
+            return;
+        };
+        if target.workspace_id() != owner.workspace_id() {
+            return;
+        }
+        let mut inner = self.lock_fail_closed();
+        let staged_before = inner.staged.len();
+        let active_before = inner.active.len();
+        inner
+            .staged
+            .retain(|candidate| candidate.file_version.target() != target);
+        inner
+            .active
+            .retain(|receipt| receipt.file_version.target() != target);
+        inner.generation = inner.generation.saturating_add(1);
+        let removed = staged_before.saturating_sub(inner.staged.len())
+            + active_before.saturating_sub(inner.active.len());
+        metrics::counter!(
+            "octos_model_read_receipt_target_revocations_total",
+            "reason" => reason.as_str().to_string(),
+        )
+        .increment(1);
+        metrics::counter!(
+            "octos_model_read_receipt_entries_revoked_total",
+            "reason" => reason.as_str().to_string(),
+        )
+        .increment(removed as u64);
     }
 
     pub(crate) fn stage(
@@ -689,6 +742,71 @@ mod tests {
                 .is_none(),
             "a line-numbered full view must not authorize raw byte mode"
         );
+    }
+
+    #[test]
+    fn mutation_revokes_only_the_target_and_invalidates_prepared_receipts() {
+        let store = store();
+        let first_args = serde_json::json!({"path": "file.txt"});
+        let second_args = serde_json::json!({"path": "other.txt"});
+        let first = version(b"body");
+        let second = FileVersion::from_bytes(
+            FileTarget::new("workspace", "/workspace/other.txt"),
+            None,
+            b"other",
+            FileMetadataHint::new(5, None, None, None, None),
+        );
+        store.stage(
+            "call_1",
+            &first_args,
+            first.clone(),
+            FileView::Full,
+            FileView::Full,
+            "body",
+        );
+        store.stage(
+            "call_2",
+            &second_args,
+            second.clone(),
+            FileView::Full,
+            FileView::Full,
+            "other",
+        );
+        let pending = store.prepare_dispatch(
+            &[
+                assistant("call_1", first_args.clone()),
+                tool("call_1", "body"),
+                assistant("call_2", second_args.clone()),
+                tool("call_2", "other"),
+            ],
+            "policy-v1",
+        );
+        store.activate(pending);
+        assert_eq!(store.active_len(), 2);
+
+        store.stage(
+            "call_3",
+            &first_args,
+            first.clone(),
+            FileView::Full,
+            FileView::Full,
+            "body",
+        );
+        let prepared_before_mutation = store.prepare_dispatch(
+            &[
+                assistant("call_3", first_args),
+                tool("call_3", "body"),
+                assistant("call_2", second_args),
+                tool("call_2", "other"),
+            ],
+            "policy-v1",
+        );
+        store.revoke_target(first.target(), ReceiptRevokeReason::Mutation);
+        store.activate(prepared_before_mutation);
+
+        assert!(store.receipt_for(&first, &FileView::Full).is_none());
+        assert!(store.receipt_for(&second, &FileView::Full).is_some());
+        assert_eq!(store.active_len(), 1);
     }
 
     #[test]

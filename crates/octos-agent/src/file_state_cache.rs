@@ -18,10 +18,10 @@
 //! coordinating on a `&mut` handle. A single lock keeps the state machine
 //! small and easy to reason about; the critical sections are short.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 #[cfg(not(unix))]
 use std::time::SystemTime;
 
@@ -56,7 +56,10 @@ impl FileTarget {
     /// Canonicalize a local workspace and target into one stable identity.
     pub fn for_local_workspace(workspace_root: &Path, target: &Path) -> io::Result<Self> {
         let workspace_root = dunce::canonicalize(workspace_root)?;
-        let target_key = dunce::canonicalize(target)?;
+        // The leaf may have been deleted after it was observed or may be the
+        // destination of a create. Resolve the nearest existing ancestor so
+        // both states retain the same canonical provider key.
+        let target_key = octos_core::canonicalize_lossy(target);
         Ok(Self::new(
             format!("local:{}", workspace_root.display()),
             target_key,
@@ -236,6 +239,9 @@ struct Inner {
     /// (back). On every `get`/`record` we bump the touched key to the back.
     order: VecDeque<FileTarget>,
     total_size_bytes: usize,
+    /// Targets whose observed version is currently being consumed by a
+    /// mutation. A second mutation cannot reuse the same observation.
+    mutation_claims: HashSet<FileTarget>,
 }
 
 impl Inner {
@@ -244,6 +250,7 @@ impl Inner {
             entries: HashMap::new(),
             order: VecDeque::new(),
             total_size_bytes: 0,
+            mutation_claims: HashSet::new(),
         }
     }
 
@@ -252,6 +259,47 @@ impl Inner {
             if let Some(key) = self.order.remove(pos) {
                 self.order.push_back(key);
             }
+        }
+    }
+}
+
+/// Why an observed version could not be reserved for a mutation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MutationClaimError {
+    /// The task has not observed this target, or that observation was invalidated.
+    MissingExpectedVersion,
+    /// Another mutation is already consuming the same observed version.
+    AlreadyClaimed,
+}
+
+/// Exclusive, task-local claim on one observed file version.
+///
+/// Dropping a claim releases it without changing the recorded observation.
+/// [`Self::invalidate`] consumes both the claim and the observation after a
+/// successful write or a proven stale comparison.
+#[derive(Debug)]
+pub(crate) struct FileMutationClaim {
+    ledger: Arc<FileStateCache>,
+    target: FileTarget,
+    expected: FileVersion,
+    invalidated: bool,
+}
+
+impl FileMutationClaim {
+    pub(crate) fn expected(&self) -> &FileVersion {
+        &self.expected
+    }
+
+    pub(crate) fn invalidate(mut self) {
+        self.ledger.finish_mutation_claim(&self.target, true);
+        self.invalidated = true;
+    }
+}
+
+impl Drop for FileMutationClaim {
+    fn drop(&mut self) {
+        if !self.invalidated {
+            self.ledger.finish_mutation_claim(&self.target, false);
         }
     }
 }
@@ -329,6 +377,31 @@ impl FileStateCache {
         inner.entries.get(target).cloned()
     }
 
+    /// Reserve the current observation for one mutation.
+    ///
+    /// This is intentionally task-local: it prevents two built-in mutations
+    /// from both committing against one observed version. The caller must
+    /// still compare [`FileMutationClaim::expected`] with bytes read from the
+    /// descriptor it will actually mutate.
+    pub(crate) fn claim_mutation(
+        self: &Arc<Self>,
+        target: &FileTarget,
+    ) -> Result<FileMutationClaim, MutationClaimError> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(expected) = inner.entries.get(target).cloned() else {
+            return Err(MutationClaimError::MissingExpectedVersion);
+        };
+        if !inner.mutation_claims.insert(target.clone()) {
+            return Err(MutationClaimError::AlreadyClaimed);
+        }
+        Ok(FileMutationClaim {
+            ledger: self.clone(),
+            target: target.clone(),
+            expected,
+            invalidated: false,
+        })
+    }
+
     /// Record a stable observation, bumping it to the most-recent LRU slot and
     /// evicting stale entries until both caps hold.
     pub fn record(&self, version: FileVersion) {
@@ -390,6 +463,12 @@ impl FileStateCache {
         }
     }
 
+    /// Drop one exact provider-scoped target.
+    pub(crate) fn invalidate_target(&self, target: &FileTarget) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        Self::remove_target(&mut inner, target);
+    }
+
     /// Clear every recorded version. Losing ledger state only causes later
     /// reads to establish a fresh version.
     pub fn clear(&self) {
@@ -409,11 +488,31 @@ impl FileStateCache {
             entries: inner.entries.clone(),
             order: inner.order.clone(),
             total_size_bytes: inner.total_size_bytes,
+            mutation_claims: HashSet::new(),
         };
         Self {
             max_entries: self.max_entries,
             max_total_bytes: self.max_total_bytes,
             inner: Mutex::new(snapshot),
+        }
+    }
+
+    fn finish_mutation_claim(&self, target: &FileTarget, invalidate: bool) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.mutation_claims.remove(target);
+        if invalidate {
+            Self::remove_target(&mut inner, target);
+        }
+    }
+
+    fn remove_target(inner: &mut Inner, target: &FileTarget) {
+        if let Some(dropped) = inner.entries.remove(target) {
+            inner.total_size_bytes = inner
+                .total_size_bytes
+                .saturating_sub(version_size(&dropped));
+        }
+        if let Some(pos) = inner.order.iter().position(|candidate| candidate == target) {
+            inner.order.remove(pos);
         }
     }
 }

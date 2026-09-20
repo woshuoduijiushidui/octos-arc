@@ -305,6 +305,7 @@ impl ApplyPatchTool {
                     "modified_paths": modified_paths,
                     "partial_paths": partial_paths,
                     "failed_section": failure.section_no,
+                    "error_code": failure.error_code,
                 })),
                 ..Default::default()
             });
@@ -351,6 +352,11 @@ impl ApplyPatchTool {
         ctx: &ToolContext,
         ops: &[PatchOp],
     ) -> Result<Vec<PlannedSection>, String> {
+        let workspace_root = ctx
+            .session_scope
+            .as_ref()
+            .map(|scope| scope.workspace().to_path_buf())
+            .unwrap_or_else(|| self.base_dir.clone());
         // Simulated post-patch state per resolved path: `Some(content)` for a
         // file this patch creates/rewrites, `None` for a file it removes.
         // Paths not in the overlay defer to the on-disk state.
@@ -379,16 +385,34 @@ impl ApplyPatchTool {
                         path: resolved,
                         display: path.clone(),
                         content: content.clone(),
+                        expected_content: None,
+                        expected_version: None,
                         op: "add",
                     }
                 }
                 PatchOp::Delete { path } => {
                     let resolved = self.resolve_patch_path(ctx, path).map_err(fail)?;
-                    match overlay.get(&resolved) {
-                        Some(Some(_)) => {}
+                    let (expected_content, expected_version) = match overlay.get(&resolved) {
+                        Some(Some(content)) => (content.clone(), None),
                         Some(None) => return Err(fail("file not found".to_string())),
                         None => match disk_entry(&resolved).await.map_err(fail)? {
-                            DiskEntry::File => {}
+                            DiskEntry::File => {
+                                let (bytes, version) = super::mutation_guard::observe_existing(
+                                    &resolved,
+                                    &workspace_root,
+                                )
+                                .await
+                                .map_err(|_| {
+                                    fail(
+                                        "file changed while the patch was being planned; \
+                                             re-read it and retry"
+                                            .to_string(),
+                                    )
+                                })?;
+                                let content = String::from_utf8(bytes)
+                                    .map_err(|_| fail("file is not valid UTF-8".to_string()))?;
+                                (content, Some(version))
+                            }
                             DiskEntry::Absent => return Err(fail("file not found".to_string())),
                             DiskEntry::Symlink => {
                                 return Err(fail("Symlinks are not allowed".to_string()));
@@ -397,11 +421,13 @@ impl ApplyPatchTool {
                                 return Err(fail("not a regular file".to_string()));
                             }
                         },
-                    }
+                    };
                     overlay.insert(resolved.clone(), None);
                     PlannedChange::Remove {
                         path: resolved,
                         display: path.clone(),
+                        expected_content,
+                        expected_version,
                     }
                 }
                 PatchOp::Update {
@@ -410,13 +436,27 @@ impl ApplyPatchTool {
                     hunks,
                 } => {
                     let resolved = self.resolve_patch_path(ctx, path).map_err(fail)?;
-                    let current = match overlay.get(&resolved) {
-                        Some(Some(content)) => content.clone(),
+                    let (current, expected_version) = match overlay.get(&resolved) {
+                        Some(Some(content)) => (content.clone(), None),
                         Some(None) => return Err(fail("file not found".to_string())),
                         None => match disk_entry(&resolved).await.map_err(fail)? {
-                            DiskEntry::File => super::read_no_follow(&resolved)
+                            DiskEntry::File => {
+                                let (bytes, version) = super::mutation_guard::observe_existing(
+                                    &resolved,
+                                    &workspace_root,
+                                )
                                 .await
-                                .map_err(|e| fail(format!("failed to read file: {e}")))?,
+                                .map_err(|_| {
+                                    fail(
+                                        "file changed while the patch was being planned; \
+                                             re-read it and retry"
+                                            .to_string(),
+                                    )
+                                })?;
+                                let content = String::from_utf8(bytes)
+                                    .map_err(|_| fail("file is not valid UTF-8".to_string()))?;
+                                (content, Some(version))
+                            }
                             DiskEntry::Absent => return Err(fail("file not found".to_string())),
                             DiskEntry::Symlink => {
                                 return Err(fail("Symlinks are not allowed".to_string()));
@@ -455,6 +495,8 @@ impl ApplyPatchTool {
                                 to: to_resolved,
                                 to_display,
                                 content: updated,
+                                expected_content: current,
+                                expected_version,
                             }
                         }
                         None => {
@@ -463,6 +505,8 @@ impl ApplyPatchTool {
                                 path: resolved,
                                 display: path.clone(),
                                 content: updated,
+                                expected_content: Some(current),
+                                expected_version,
                                 op: "update",
                             }
                         }
@@ -486,95 +530,211 @@ impl ApplyPatchTool {
         ctx: &ToolContext,
         plan: &[PlannedSection],
     ) -> (Vec<AppliedOp>, Option<ApplyFailure>) {
+        let workspace_root = ctx
+            .session_scope
+            .as_ref()
+            .map(|scope| scope.workspace().to_path_buf())
+            .unwrap_or_else(|| self.base_dir.clone());
         let mut applied = Vec::new();
         for section in plan {
-            // Invalidate every candidate path regardless of outcome — a
-            // failed move may still have written its destination.
-            let candidates: Vec<PathBuf> = match &section.change {
-                PlannedChange::Write { path, .. } | PlannedChange::Remove { path, .. } => {
-                    vec![path.clone()]
-                }
-                PlannedChange::Move { from, to, .. } => vec![from.clone(), to.clone()],
-            };
-            if let Some(ledger) = ctx.file_state_cache.as_ref() {
-                for path in &candidates {
-                    ledger.invalidate_path(path);
-                }
-            }
-
-            let outcome: Result<AppliedOp, SectionFailure> =
-                match &section.change {
-                    PlannedChange::Write {
-                        path,
-                        display,
-                        content,
-                        op,
-                    } => write_with_parents(path, content)
+            let outcome: Result<AppliedOp, SectionFailure> = match &section.change {
+                PlannedChange::Write {
+                    path,
+                    display,
+                    content,
+                    expected_content,
+                    expected_version,
+                    op,
+                } => {
+                    let write_result = if let Some(expected_content) = expected_content {
+                        let expected_content = expected_content.as_bytes().to_vec();
+                        let new_content = content.as_bytes().to_vec();
+                        super::mutation_guard::rewrite_existing(
+                            ctx,
+                            &workspace_root,
+                            path,
+                            super::mutation_guard::ExpectedVersionPolicy::Optional,
+                            expected_version.clone(),
+                            None,
+                            move |current| {
+                                if current != expected_content {
+                                    return Err(
+                                        super::mutation_guard::MutationTransformError::StaleContext,
+                                    );
+                                }
+                                Ok::<_, super::mutation_guard::MutationTransformError>((
+                                    new_content,
+                                    (),
+                                ))
+                            },
+                        )
                         .await
+                        .map(|_| ())
+                    } else {
+                        if let Some(parent) = path.parent()
+                            && let Err(error) = tokio::fs::create_dir_all(parent).await
+                        {
+                            return (
+                                applied,
+                                Some(ApplyFailure {
+                                    section_no: section.section_no,
+                                    label: section.label.clone(),
+                                    error: format!("failed to create parent directories: {error}"),
+                                    partial: Vec::new(),
+                                    error_code: None,
+                                }),
+                            );
+                        }
+                        super::mutation_guard::create_new(
+                            ctx,
+                            &workspace_root,
+                            path,
+                            content.as_bytes().to_vec(),
+                            None,
+                        )
+                        .await
+                        .map(|_| ())
+                    };
+                    write_result
                         .map(|()| AppliedOp {
                             op,
                             display: display.clone(),
                             from_display: None,
                             touched: vec![path.clone()],
                         })
-                        .map_err(|failure| SectionFailure {
-                            partial: write_failure_partial(&failure, display, path),
-                            error: failure.into_message(),
-                        }),
-                    PlannedChange::Remove { path, display } => tokio::fs::remove_file(path)
+                        .map_err(|error| guarded_section_failure(error, display, path))
+                }
+                PlannedChange::Remove {
+                    path,
+                    display,
+                    expected_content,
+                    expected_version,
+                } => {
+                    let expected = match expected_version.clone() {
+                        Some(version) => Ok(version),
+                        None => {
+                            current_version_matching(
+                                path,
+                                &workspace_root,
+                                expected_content.as_bytes(),
+                            )
+                            .await
+                        }
+                    };
+                    match expected {
+                        Ok(expected) => super::mutation_guard::remove_existing(
+                            ctx,
+                            &workspace_root,
+                            path,
+                            expected,
+                        )
                         .await
-                        .map_err(|e| SectionFailure {
-                            error: format!("failed to delete file: {e}"),
-                            // A failed unlink leaves the file as it was.
-                            partial: Vec::new(),
-                        })
-                        .map(|()| AppliedOp {
+                        .map(|_| AppliedOp {
                             op: "delete",
                             display: display.clone(),
                             from_display: None,
                             touched: vec![path.clone()],
+                        })
+                        .map_err(|error| guarded_section_failure(error, display, path)),
+                        Err(error) => Err(SectionFailure {
+                            error,
+                            partial: Vec::new(),
+                            error_code: Some(
+                                super::mutation_guard::STALE_MUTATION_CODE.to_string(),
+                            ),
                         }),
-                    PlannedChange::Move {
-                        from,
-                        from_display,
-                        to,
-                        to_display,
-                        content,
-                    } => {
-                        async {
-                            write_with_parents(to, content).await.map_err(|failure| {
+                    }
+                }
+                PlannedChange::Move {
+                    from,
+                    from_display,
+                    to,
+                    to_display,
+                    content,
+                    expected_content,
+                    expected_version,
+                } => {
+                    async {
+                        let expected = match expected_version.clone() {
+                            Some(version) => version,
+                            None => current_version_matching(
+                                from,
+                                &workspace_root,
+                                expected_content.as_bytes(),
+                            )
+                            .await
+                            .map_err(|error| SectionFailure {
+                                error,
+                                partial: Vec::new(),
+                                error_code: Some(
+                                    super::mutation_guard::STALE_MUTATION_CODE.to_string(),
+                                ),
+                            })?,
+                        };
+                        if let Some(parent) = to.parent() {
+                            tokio::fs::create_dir_all(parent).await.map_err(|error| {
                                 SectionFailure {
-                                    partial: write_failure_partial(&failure, to_display, to),
-                                    error: failure.into_message(),
+                                    error: format!("failed to create parent directories: {error}"),
+                                    partial: Vec::new(),
+                                    error_code: None,
                                 }
                             })?;
-                            tokio::fs::remove_file(from).await.map_err(|e| SectionFailure {
-                            error: format!(
-                                "wrote {to_display} but failed to remove {from_display}: {e}"
-                            ),
-                            // The destination fully exists even though the
-                            // section did not complete — report it so the
-                            // result never claims an unchanged workspace.
-                            partial: vec![PartialPath {
-                                display: to_display.clone(),
-                                resolved: to.clone(),
-                                note: PARTIAL_WRITTEN,
-                            }],
-                        })?;
-                            Ok(AppliedOp {
-                                op: "move",
-                                display: to_display.clone(),
-                                from_display: Some(from_display.clone()),
-                                touched: vec![from.clone(), to.clone()],
-                            })
                         }
+                        super::mutation_guard::create_new(
+                            ctx,
+                            &workspace_root,
+                            to,
+                            content.as_bytes().to_vec(),
+                            None,
+                        )
                         .await
+                        .map_err(|error| guarded_section_failure(error, to_display, to))?;
+                        super::mutation_guard::remove_existing(
+                            ctx,
+                            &workspace_root,
+                            from,
+                            expected,
+                        )
+                        .await
+                        .map_err(|error| {
+                            let result = error.into_tool_result("apply_patch", from_display);
+                            let error_code = result
+                                .structured_metadata
+                                .as_ref()
+                                .and_then(|metadata| metadata["error_code"].as_str())
+                                .map(str::to_string);
+                            SectionFailure {
+                                error: format!(
+                                    "wrote {to_display} but failed to remove \
+                                         {from_display}: {}",
+                                    result.output
+                                ),
+                                partial: vec![PartialPath {
+                                    display: to_display.clone(),
+                                    resolved: to.clone(),
+                                    note: PARTIAL_WRITTEN,
+                                }],
+                                error_code,
+                            }
+                        })?;
+                        Ok(AppliedOp {
+                            op: "move",
+                            display: to_display.clone(),
+                            from_display: Some(from_display.clone()),
+                            touched: vec![from.clone(), to.clone()],
+                        })
                     }
-                };
+                    .await
+                }
+            };
 
             match outcome {
                 Ok(op) => applied.push(op),
-                Err(SectionFailure { error, partial }) => {
+                Err(SectionFailure {
+                    error,
+                    partial,
+                    error_code,
+                }) => {
                     return (
                         applied,
                         Some(ApplyFailure {
@@ -582,6 +742,7 @@ impl ApplyPatchTool {
                             label: section.label.clone(),
                             error,
                             partial,
+                            error_code,
                         }),
                     );
                 }
@@ -589,6 +750,47 @@ impl ApplyPatchTool {
         }
         (applied, None)
     }
+}
+
+fn guarded_section_failure(
+    error: super::mutation_guard::GuardedMutationError,
+    display: &str,
+    path: &Path,
+) -> SectionFailure {
+    let result = error.into_tool_result("apply_patch", display);
+    let error_code = result
+        .structured_metadata
+        .as_ref()
+        .and_then(|metadata| metadata["error_code"].as_str())
+        .map(str::to_string);
+    let partial = result.file_modified.is_some().then(|| PartialPath {
+        display: display.to_string(),
+        resolved: path.to_path_buf(),
+        note: PARTIAL_UNKNOWN,
+    });
+    SectionFailure {
+        error: result.output,
+        partial: partial.into_iter().collect(),
+        error_code,
+    }
+}
+
+async fn current_version_matching(
+    path: &Path,
+    workspace_root: &Path,
+    expected_content: &[u8],
+) -> Result<crate::file_state_cache::FileVersion, String> {
+    let (current, version) = super::mutation_guard::observe_existing(path, workspace_root)
+        .await
+        .map_err(|error| error.into_tool_result("apply_patch", "target").output)?;
+    if current != expected_content {
+        return Err(format!(
+            "[{}] apply_patch refused: the planned file context changed. Re-read the affected \
+             file, review its current content, then retry with a new patch.",
+            super::mutation_guard::STALE_MUTATION_CODE,
+        ));
+    }
+    Ok(version)
 }
 
 /// Kind of directory entry currently on disk at a path.
@@ -628,52 +830,6 @@ async fn overlay_entry_exists(
         return Ok(state.is_some());
     }
     Ok(!matches!(disk_entry(path).await?, DiskEntry::Absent))
-}
-
-/// Failure from [`write_with_parents`], distinguishing whether the target
-/// file itself may have been touched (drives partial-state reporting).
-enum WriteFailure {
-    /// Parent-directory creation failed — the target file was NOT touched.
-    Parents(String),
-    /// The `O_NOFOLLOW` write failed. The writer opens with truncate, so the
-    /// target may have been created, truncated, or partially written before
-    /// the error.
-    Write(String),
-}
-
-impl WriteFailure {
-    fn into_message(self) -> String {
-        match self {
-            WriteFailure::Parents(message) | WriteFailure::Write(message) => message,
-        }
-    }
-}
-
-/// Partial-state entries for a failed [`write_with_parents`] call: a failed
-/// parent mkdir touched nothing, but a failed write may have left the target
-/// created, truncated, or partially written.
-fn write_failure_partial(failure: &WriteFailure, display: &str, path: &Path) -> Vec<PartialPath> {
-    match failure {
-        WriteFailure::Parents(_) => Vec::new(),
-        WriteFailure::Write(_) => vec![PartialPath {
-            display: display.to_string(),
-            resolved: path.to_path_buf(),
-            note: PARTIAL_UNKNOWN,
-        }],
-    }
-}
-
-/// Create parent directories and write `content` through the shared
-/// `O_NOFOLLOW` writer.
-async fn write_with_parents(path: &Path, content: &str) -> Result<(), WriteFailure> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(|e| {
-            WriteFailure::Parents(format!("failed to create parent directories: {e}"))
-        })?;
-    }
-    super::write_no_follow(path, content.as_bytes())
-        .await
-        .map_err(|e| WriteFailure::Write(format!("failed to write file: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -739,10 +895,17 @@ enum PlannedChange {
         path: PathBuf,
         display: String,
         content: String,
+        expected_content: Option<String>,
+        expected_version: Option<crate::file_state_cache::FileVersion>,
         op: &'static str,
     },
     /// Remove the file at `path`.
-    Remove { path: PathBuf, display: String },
+    Remove {
+        path: PathBuf,
+        display: String,
+        expected_content: String,
+        expected_version: Option<crate::file_state_cache::FileVersion>,
+    },
     /// Write updated `content` to `to`, then remove `from` (Update + Move).
     Move {
         from: PathBuf,
@@ -750,6 +913,8 @@ enum PlannedChange {
         to: PathBuf,
         to_display: String,
         content: String,
+        expected_content: String,
+        expected_version: Option<crate::file_state_cache::FileVersion>,
     },
 }
 
@@ -817,6 +982,7 @@ struct SectionFailure {
     error: String,
     /// Paths the failed section may have modified before failing.
     partial: Vec<PartialPath>,
+    error_code: Option<String>,
 }
 
 struct ApplyFailure {
@@ -825,6 +991,7 @@ struct ApplyFailure {
     error: String,
     /// Paths the failed section may have modified before failing.
     partial: Vec<PartialPath>,
+    error_code: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1133,16 +1300,28 @@ fn apply_codex_hunks(content: &str, hunks: &[UpdateHunk]) -> Result<String, Stri
             // Locate the `@@ <anchor>` context line at/after the cursor; the
             // hunk body is then searched after it. Falls back to a
             // fully-trimmed comparison for indentation drift.
-            let anchor_pos = (cursor..lines.len())
-                .find(|&idx| lines[idx].trim_end() == anchor.trim_end())
-                .or_else(|| (cursor..lines.len()).find(|&idx| lines[idx].trim() == anchor.trim()));
-            match anchor_pos {
-                Some(pos) => cursor = pos + 1,
-                None => {
+            let mut anchor_matches = (cursor..lines.len())
+                .filter(|&idx| lines[idx].trim_end() == anchor.trim_end())
+                .collect::<Vec<_>>();
+            if anchor_matches.is_empty() {
+                anchor_matches = (cursor..lines.len())
+                    .filter(|&idx| lines[idx].trim() == anchor.trim())
+                    .collect();
+            }
+            match anchor_matches.as_slice() {
+                [pos] => cursor = *pos + 1,
+                [] => {
                     return Err(format!(
                         "hunk {hunk_no}: context marker '@@ {anchor}' not found in the \
                          file (searched from line {})",
                         cursor + 1
+                    ));
+                }
+                _ => {
+                    return Err(format!(
+                        "hunk {hunk_no}: context marker '@@ {anchor}' is ambiguous (found {} \
+                         locations); provide more surrounding context",
+                        anchor_matches.len()
                     ));
                 }
             }
@@ -1173,20 +1352,29 @@ fn apply_codex_hunks(content: &str, hunks: &[UpdateHunk]) -> Result<String, Stri
 
         let match_pos = if hunk.at_eof {
             // The pattern must sit exactly at the end of the file.
-            lines
+            Ok(lines
                 .len()
                 .checked_sub(pattern.len())
-                .filter(|&pos| pos >= cursor && matches_at(&lines, &pattern, pos))
+                .filter(|&pos| pos >= cursor && matches_at(&lines, &pattern, pos)))
         } else {
-            find_block_from(&lines, &pattern, cursor)
+            find_unique_block_from(&lines, &pattern, cursor)
         };
-        let Some(match_pos) = match_pos else {
-            let preview: Vec<&str> = pattern.iter().take(3).copied().collect();
-            return Err(format!(
-                "hunk {hunk_no}: could not find the context/removed lines in the file \
+        let match_pos = match match_pos {
+            Ok(Some(position)) => position,
+            Err(count) => {
+                return Err(format!(
+                    "hunk {hunk_no}: context/removed lines are ambiguous (found {count} \
+                     locations); provide more surrounding context"
+                ));
+            }
+            Ok(None) => {
+                let preview: Vec<&str> = pattern.iter().take(3).copied().collect();
+                return Err(format!(
+                    "hunk {hunk_no}: could not find the context/removed lines in the file \
                  (searched from line {}). Expected block starting with: {preview:?}",
-                cursor + 1
-            ));
+                    cursor + 1
+                ));
+            }
         };
         let added = replacement.len();
         lines.splice(match_pos..match_pos + pattern.len(), replacement);
@@ -1200,12 +1388,23 @@ fn apply_codex_hunks(content: &str, hunks: &[UpdateHunk]) -> Result<String, Stri
     Ok(out)
 }
 
-/// Find the first position `>= from` where `pattern` matches `lines`.
-fn find_block_from(lines: &[String], pattern: &[&str], from: usize) -> Option<usize> {
+/// Find the only position `>= from` where `pattern` matches `lines`.
+fn find_unique_block_from(
+    lines: &[String],
+    pattern: &[&str],
+    from: usize,
+) -> Result<Option<usize>, usize> {
     if pattern.is_empty() || pattern.len() > lines.len() {
-        return None;
+        return Ok(None);
     }
-    (from..=lines.len() - pattern.len()).find(|&pos| matches_at(lines, pattern, pos))
+    let matches = (from..=lines.len() - pattern.len())
+        .filter(|&position| matches_at(lines, pattern, position))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [position] => Ok(Some(*position)),
+        _ => Err(matches.len()),
+    }
 }
 
 #[cfg(test)]
@@ -1406,7 +1605,7 @@ mod tests {
     // -- Hunk application --------------------------------------------------
 
     #[test]
-    fn should_apply_hunks_sequentially_when_same_block_repeats() {
+    fn should_reject_hunk_when_same_block_repeats_without_unique_context() {
         let ops = parse_patch_envelope(
             "*** Begin Patch\n*** Update File: f\n@@\n-a\n+A1\n@@\n-a\n+A2\n*** End Patch\n",
         )
@@ -1414,8 +1613,10 @@ mod tests {
         let PatchOp::Update { hunks, .. } = &ops[0] else {
             panic!("expected Update");
         };
-        let out = apply_codex_hunks("a\nb\na\nb\n", hunks).expect("hunks apply");
-        assert_eq!(out, "A1\nb\nA2\nb\n");
+        let error = apply_codex_hunks("a\nb\na\nb\n", hunks)
+            .expect_err("ambiguous context must fail closed");
+        assert!(error.contains("ambiguous"), "{error}");
+        assert!(error.contains("found 2 locations"), "{error}");
     }
 
     #[test]
@@ -1520,7 +1721,74 @@ mod tests {
         assert_eq!(out, "class A:\n    def greet(self):\n        return 1\n");
     }
 
+    #[test]
+    fn should_reject_ambiguous_hunk_context_without_modifying_content() {
+        let content = "same\nkeep\nsame\nkeep\n";
+        let hunks = parse_update_hunks(
+            "*** Begin Patch\n*** Update File: f\n@@\n-same\n+changed\n*** End Patch\n",
+        );
+        let error =
+            apply_codex_hunks(content, &hunks).expect_err("ambiguous context must be rejected");
+        assert!(error.contains("ambiguous"), "{error}");
+        assert_eq!(content, "same\nkeep\nsame\nkeep\n");
+    }
+
     // -- Tool end-to-end ---------------------------------------------------
+
+    #[tokio::test]
+    async fn should_refuse_when_file_changes_between_plan_and_apply() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("planned.txt");
+        std::fs::write(&path, "old\n").unwrap();
+        let tool = ApplyPatchTool::new(temp.path());
+        let ctx = ToolContext::zero();
+        let ops = parse_patch_envelope(
+            "*** Begin Patch\n*** Update File: planned.txt\n@@\n-old\n+new\n*** End Patch\n",
+        )
+        .unwrap();
+        let plan = tool.plan_sections(&ctx, &ops).await.unwrap();
+
+        std::fs::write(&path, "external\n").unwrap();
+        let (applied, failure) = tool.apply_planned(&ctx, &plan).await;
+
+        assert!(applied.is_empty());
+        let failure = failure.expect("stale plan must fail");
+        assert!(failure.error.contains("[stale_file_version]"));
+        assert!(failure.error.contains("Re-read it with read_file"));
+        assert_eq!(
+            failure.error_code.as_deref(),
+            Some(crate::tools::mutation_guard::STALE_MUTATION_CODE)
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "external\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn should_refuse_symlink_swap_between_plan_and_apply() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside");
+        let path = temp.path().join("planned.txt");
+        let outside_path = outside.path().join("outside.txt");
+        std::fs::write(&path, "old\n").unwrap();
+        std::fs::write(&outside_path, "outside\n").unwrap();
+        let tool = ApplyPatchTool::new(temp.path());
+        let ctx = ToolContext::zero();
+        let ops = parse_patch_envelope(
+            "*** Begin Patch\n*** Update File: planned.txt\n@@\n-old\n+new\n*** End Patch\n",
+        )
+        .unwrap();
+        let plan = tool.plan_sections(&ctx, &ops).await.unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        symlink(&outside_path, &path).unwrap();
+        let (applied, failure) = tool.apply_planned(&ctx, &plan).await;
+
+        assert!(applied.is_empty());
+        assert!(failure.is_some());
+        assert_eq!(std::fs::read_to_string(outside_path).unwrap(), "outside\n");
+    }
 
     #[tokio::test]
     async fn apply_patch_adds_and_updates_file() {

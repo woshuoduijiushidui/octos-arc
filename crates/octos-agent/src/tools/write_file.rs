@@ -222,6 +222,16 @@ impl WriteFileTool {
                 }
             },
         };
+        let workspace_root = ctx
+            .session_scope
+            .as_ref()
+            .map(|scope| scope.workspace().to_path_buf())
+            .unwrap_or_else(|| self.base_dir.clone());
+        let target_existed = match tokio::fs::symlink_metadata(&path).await {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Ok(super::file_io_error(error, &input.path)),
+        };
 
         // Observe-only (#read-paging probe): a whole-file overwrite of a path
         // that was previously read. If `read_file` were ever changed to return
@@ -405,11 +415,6 @@ impl WriteFileTool {
         // ancestor fails `ELOOP`/`ENOTDIR` at its own component. `create_only`
         // becomes `O_CREAT|O_EXCL` on that same walked leaf.
         let fenced = if let Some(grant) = &self.write_grant {
-            let workspace_root = ctx
-                .session_scope
-                .as_ref()
-                .map(|scope| scope.workspace().to_path_buf())
-                .unwrap_or_else(|| self.base_dir.clone());
             let rel = match grant.check_write(&workspace_root, &path, &input.path, self.name()) {
                 Ok(rel) => rel,
                 Err(denied) => {
@@ -425,8 +430,49 @@ impl WriteFileTool {
             // the fenced path, which otherwise re-opens the leaf with O_TRUNC and
             // clobbers whatever it resolves to. Only existing-file overwrites
             // (never create_only) take the checked path.
-            match (grant.create_only(), authorized_epoch) {
-                (false, Some(expected)) => {
+            match (
+                grant.create_only(),
+                target_existed,
+                ctx.file_state_cache.is_some(),
+                authorized_epoch,
+            ) {
+                (false, true, true, _) => {
+                    let opened = match super::write_grant::confined_open_existing(
+                        workspace_root.clone(),
+                        rel,
+                    )
+                    .await
+                    {
+                        Ok(file) => file,
+                        Err(error) => {
+                            return Ok(ToolResult {
+                                output: grant.map_confined_error(
+                                    &error,
+                                    &workspace_root,
+                                    &input.path,
+                                    self.name(),
+                                ),
+                                success: false,
+                                ..Default::default()
+                            });
+                        }
+                    };
+                    let new_content = input.content.as_bytes().to_vec();
+                    if let Err(error) = super::mutation_guard::rewrite_existing(
+                        ctx,
+                        &workspace_root,
+                        &path,
+                        super::mutation_guard::ExpectedVersionPolicy::RequireWhenTracked,
+                        None,
+                        Some(opened),
+                        move |_| Ok::<_, String>((new_content, ())),
+                    )
+                    .await
+                    {
+                        return Ok(error.into_tool_result(self.name(), &input.path));
+                    }
+                }
+                (false, true, false, Some(expected)) => {
                     match super::write_grant::confined_write_checked(
                         workspace_root.clone(),
                         rel,
@@ -468,6 +514,19 @@ impl WriteFileTool {
                                 ..Default::default()
                             });
                         }
+                    }
+                }
+                (_, false, _, _) => {
+                    if let Err(error) = super::mutation_guard::create_new(
+                        ctx,
+                        &workspace_root,
+                        &path,
+                        input.content.as_bytes().to_vec(),
+                        Some(rel),
+                    )
+                    .await
+                    {
+                        return Ok(error.into_tool_result(self.name(), &input.path));
                     }
                 }
                 _ => {
@@ -515,8 +574,28 @@ impl WriteFileTool {
             // refused, not clobbered. Non-authorized writes (new files, small
             // never-read files under today's blind semantics) take the plain
             // O_NOFOLLOW path.
-            match authorized_epoch {
-                Some(expected) => {
+            match (
+                target_existed,
+                ctx.file_state_cache.is_some(),
+                authorized_epoch,
+            ) {
+                (true, true, _) => {
+                    let new_content = input.content.as_bytes().to_vec();
+                    if let Err(error) = super::mutation_guard::rewrite_existing(
+                        ctx,
+                        &workspace_root,
+                        &path,
+                        super::mutation_guard::ExpectedVersionPolicy::RequireWhenTracked,
+                        None,
+                        None,
+                        move |_| Ok::<_, String>((new_content, ())),
+                    )
+                    .await
+                    {
+                        return Ok(error.into_tool_result(self.name(), &input.path));
+                    }
+                }
+                (true, false, Some(expected)) => {
                     match super::write_no_follow_checked(&path, input.content.as_bytes(), expected)
                         .await
                     {
@@ -546,7 +625,20 @@ impl WriteFileTool {
                         Err(e) => return Ok(super::file_io_error(e, &input.path)),
                     }
                 }
-                None => {
+                (false, _, _) => {
+                    if let Err(error) = super::mutation_guard::create_new(
+                        ctx,
+                        &workspace_root,
+                        &path,
+                        input.content.as_bytes().to_vec(),
+                        None,
+                    )
+                    .await
+                    {
+                        return Ok(error.into_tool_result(self.name(), &input.path));
+                    }
+                }
+                (true, false, None) => {
                     // Write file (O_NOFOLLOW atomically rejects symlinks, no TOCTOU race).
                     if let Err(e) = super::write_no_follow(&path, input.content.as_bytes()).await {
                         return Ok(super::file_io_error(e, &input.path));
@@ -582,9 +674,7 @@ impl WriteFileTool {
 
         // Invalidate every recorded workspace-owned version for this path.
         // A later read establishes the new version from the bytes on disk.
-        if let Some(cache) = ctx.file_state_cache.as_ref() {
-            cache.invalidate_path(&path);
-        }
+        super::mutation_guard::complete_mutation(ctx, &workspace_root, &path);
 
         if !fenced {
             if let Err(error) =
@@ -1292,7 +1382,7 @@ mod tests {
             target.clone(),
             None,
             b"old body",
-            FileMetadataHint::new(8, None, None, None, None),
+            FileMetadataHint::from_metadata(&std::fs::metadata(&file_path).unwrap()),
         ));
         assert_eq!(cache.len(), 1);
 
@@ -1316,6 +1406,93 @@ mod tests {
             "write_file must invalidate the cached entry"
         );
         assert_eq!(cache.len(), 0);
+    }
+
+    async fn context_after_read(
+        dir: &std::path::Path,
+        file_name: &str,
+    ) -> (ToolContext, Arc<crate::file_state_cache::FileStateCache>) {
+        let ledger = Arc::new(crate::file_state_cache::FileStateCache::new());
+        let mut context = ToolContext::zero();
+        context.tool_id = "m4-read".to_string();
+        context.file_state_cache = Some(ledger.clone());
+        let read = ReadFileTool::new(dir)
+            .execute_with_context(&context, &serde_json::json!({"path": file_name}))
+            .await
+            .unwrap();
+        assert!(
+            read.success,
+            "read must establish a version: {}",
+            read.output
+        );
+        (context, ledger)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn should_refuse_same_size_overwrite_after_content_changes_and_mtime_is_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("same-size.txt");
+        std::fs::write(&path, "AAAA\n").unwrap();
+        let original_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let (context, _) = context_after_read(dir.path(), "same-size.txt").await;
+
+        std::fs::write(&path, "BBBB\n").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(original_mtime)
+            .unwrap();
+
+        let result = WriteFileTool::new(dir.path())
+            .execute_with_context(
+                &context,
+                &serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "content": "CCCC\n",
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.output.contains("[stale_file_version]"));
+        assert!(result.output.contains("Re-read it with read_file"));
+        assert!(!result.output.contains(&dir.path().display().to_string()));
+        assert_eq!(
+            result.structured_metadata.as_ref().unwrap()["error_code"],
+            serde_json::json!("stale_file_version")
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "BBBB\n");
+    }
+
+    #[tokio::test]
+    async fn concurrent_overwrites_cannot_consume_the_same_observed_version_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("race.txt");
+        std::fs::write(&path, "original\n").unwrap();
+        let (context, _) = context_after_read(dir.path(), "race.txt").await;
+        let tool = WriteFileTool::new(dir.path());
+        let left_args = serde_json::json!({"path": "race.txt", "content": "left\n"});
+        let right_args = serde_json::json!({"path": "race.txt", "content": "right\n"});
+
+        let (left, right) = tokio::join!(
+            tool.execute_with_context(&context, &left_args),
+            tool.execute_with_context(&context, &right_args),
+        );
+        let results = [left.unwrap(), right.unwrap()];
+
+        assert_eq!(results.iter().filter(|result| result.success).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| result.output.contains("[stale_file_version]"))
+                .count(),
+            1
+        );
+        let final_content = std::fs::read_to_string(path).unwrap();
+        assert!(final_content == "left\n" || final_content == "right\n");
     }
 
     // -----------------------------------------------------------------------

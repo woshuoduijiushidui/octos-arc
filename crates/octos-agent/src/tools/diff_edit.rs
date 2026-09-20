@@ -104,27 +104,37 @@ impl Tool for DiffEditTool {
             });
         }
 
-        // Resolve path (with traversal protection)
-        let path = match super::resolve_path_with_scope(
-            &self.base_dir,
-            &input.path,
-            self.filesystem_scope,
-        ) {
-            Ok(p) => p,
-            Err(_) => {
-                return Ok(ToolResult {
-                    output: format!("Path outside working directory: {}", input.path),
-                    success: false,
-                    ..Default::default()
-                });
-            }
+        let path = match ctx.session_scope.as_ref() {
+            Some(scope) => match super::resolve_path_for_session_scope_write(scope, &input.path) {
+                Ok(path) => path,
+                Err(reason) => {
+                    return Ok(ToolResult {
+                        output: format!("{reason}: {}", input.path),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+            },
+            None => match super::resolve_path_with_scope(
+                &self.base_dir,
+                &input.path,
+                self.filesystem_scope,
+            ) {
+                Ok(path) => path,
+                Err(_) => {
+                    return Ok(ToolResult {
+                        output: format!("Path outside working directory: {}", input.path),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+            },
         };
-
-        // Read file (O_NOFOLLOW atomically rejects symlinks)
-        let content = match super::read_no_follow(&path).await {
-            Ok(c) => c,
-            Err(e) => return Ok(super::file_io_error(e, &input.path)),
-        };
+        let workspace_root = ctx
+            .session_scope
+            .as_ref()
+            .map(|scope| scope.workspace().to_path_buf())
+            .unwrap_or_else(|| self.base_dir.clone());
 
         let hunks = match parse_unified_diff(&input.diff) {
             Ok(h) => h,
@@ -144,21 +154,28 @@ impl Tool for DiffEditTool {
                 ..Default::default()
             });
         }
+        let hunk_count = hunks.len();
 
-        let new_content = match apply_hunks(&content, &hunks) {
-            Ok(c) => c,
-            Err(e) => {
-                return Ok(ToolResult {
-                    output: format!("Failed to apply diff: {e}"),
-                    success: false,
-                    ..Default::default()
-                });
-            }
+        let guarded = super::mutation_guard::rewrite_existing(
+            ctx,
+            &workspace_root,
+            &path,
+            super::mutation_guard::ExpectedVersionPolicy::Optional,
+            None,
+            None,
+            move |bytes| -> Result<_, String> {
+                let content = std::str::from_utf8(bytes)
+                    .map_err(|_| "File is not valid UTF-8 and cannot be edited".to_string())?;
+                let new_content = apply_hunks(content, &hunks)
+                    .map_err(|error| format!("Failed to apply diff: {error}"))?;
+                Ok((new_content.as_bytes().to_vec(), new_content))
+            },
+        )
+        .await;
+        let new_content = match guarded {
+            Ok(rewrite) => rewrite.value,
+            Err(error) => return Ok(error.into_tool_result(self.name(), &input.path)),
         };
-
-        if let Err(e) = super::write_no_follow(&path, new_content.as_bytes()).await {
-            return Ok(super::file_io_error(e, &input.path));
-        }
 
         // #1774: opt-in post-edit formatting. Runs BEFORE cache invalidation
         // and the git snapshot so both observe the final on-disk content.
@@ -170,9 +187,7 @@ impl Tool for DiffEditTool {
         };
 
         // Invalidate every recorded workspace-owned version for this path.
-        if let Some(cache) = ctx.file_state_cache.as_ref() {
-            cache.invalidate_path(&path);
-        }
+        super::mutation_guard::complete_mutation(ctx, &workspace_root, &path);
 
         if let Err(error) =
             crate::workspace_git::snapshot_workspace_change(&self.base_dir, &path, "diff_edit")
@@ -187,7 +202,7 @@ impl Tool for DiffEditTool {
         Ok(ToolResult {
             output: format!(
                 "Applied {} hunk(s) to {}{}",
-                hunks.len(),
+                hunk_count,
                 input.path,
                 format_note.unwrap_or_default()
             ),
@@ -353,30 +368,27 @@ fn apply_hunks(content: &str, hunks: &[Hunk]) -> Result<String> {
 }
 
 fn find_match(lines: &[String], pattern: &[&str], target: usize) -> Result<usize> {
-    // Try exact position
-    if matches_at(lines, pattern, target) {
-        return Ok(target);
+    let start = target.saturating_sub(FUZZY_RANGE as usize);
+    let end = target
+        .saturating_add(FUZZY_RANGE as usize)
+        .min(lines.len().saturating_sub(pattern.len()));
+    let matches = (start..=end)
+        .filter(|position| matches_at(lines, pattern, *position))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [position] => Ok(*position),
+        [] => eyre::bail!(
+            "could not find matching context at line {} (+-{} lines). Expected: {:?}",
+            target + 1,
+            FUZZY_RANGE,
+            &pattern[..pattern.len().min(3)]
+        ),
+        _ => eyre::bail!(
+            "matching context is ambiguous: found {} locations near line {}",
+            matches.len(),
+            target + 1
+        ),
     }
-
-    // Fuzzy search around target
-    for offset in 1..=FUZZY_RANGE {
-        let above = target as i64 - offset;
-        let below = target as i64 + offset;
-
-        if above >= 0 && matches_at(lines, pattern, above as usize) {
-            return Ok(above as usize);
-        }
-        if (below as usize) < lines.len() && matches_at(lines, pattern, below as usize) {
-            return Ok(below as usize);
-        }
-    }
-
-    eyre::bail!(
-        "could not find matching context at line {} (+-{} lines). Expected: {:?}",
-        target + 1,
-        FUZZY_RANGE,
-        &pattern[..pattern.len().min(3)]
-    )
 }
 
 /// Whether `pattern` matches `lines` starting at `start`, comparing with
@@ -420,7 +432,7 @@ mod tests {
             target.clone(),
             None,
             b"old\n",
-            FileMetadataHint::new(4, None, None, None, None),
+            FileMetadataHint::from_metadata(&std::fs::metadata(&path).unwrap()),
         ));
         let mut context = ToolContext::zero();
         context.file_state_cache = Some(ledger.clone());
@@ -485,6 +497,26 @@ mod tests {
         let hunks = parse_unified_diff(diff).unwrap();
         let result = apply_hunks(content, &hunks).unwrap();
         assert_eq!(result, "extra\nline1\nline2_fuzzy\nline3\n");
+    }
+
+    #[tokio::test]
+    async fn should_reject_ambiguous_diff_context_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("duplicate.txt");
+        let original = "same\nkeep\nsame\nkeep\n";
+        std::fs::write(&path, original).unwrap();
+
+        let result = DiffEditTool::new(dir.path())
+            .execute(&serde_json::json!({
+                "path": "duplicate.txt",
+                "diff": "@@ -1 +1 @@\n-same\n+changed\n",
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.output.contains("ambiguous"), "{}", result.output);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
     }
 
     #[test]

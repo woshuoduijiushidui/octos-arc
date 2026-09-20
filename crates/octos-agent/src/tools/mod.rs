@@ -31,6 +31,7 @@
 
 mod build_cache_usage;
 pub use build_cache_usage::{BuildCacheUsage, BuildCacheUseGuard};
+mod mutation_guard;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
