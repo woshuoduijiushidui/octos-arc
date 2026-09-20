@@ -10,6 +10,109 @@ use sha2::{Digest, Sha256};
 
 use crate::file_state_cache::FileVersion;
 
+const MAX_STAGED_CANDIDATES: usize = 256;
+const MAX_ACTIVE_RECEIPTS: usize = 256;
+
+/// Stable identity of one model-visible history branch.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ReadReceiptOwner {
+    workspace_id: String,
+    task_id: String,
+    logical_session_id: String,
+    model_branch_id: String,
+}
+
+impl ReadReceiptOwner {
+    /// Build an owner only when every isolation dimension is present.
+    pub fn new(
+        workspace_id: impl Into<String>,
+        task_id: impl Into<String>,
+        logical_session_id: impl Into<String>,
+        model_branch_id: impl Into<String>,
+    ) -> Option<Self> {
+        let owner = Self {
+            workspace_id: workspace_id.into(),
+            task_id: task_id.into(),
+            logical_session_id: logical_session_id.into(),
+            model_branch_id: model_branch_id.into(),
+        };
+        if [
+            owner.workspace_id.as_str(),
+            owner.task_id.as_str(),
+            owner.logical_session_id.as_str(),
+            owner.model_branch_id.as_str(),
+        ]
+        .into_iter()
+        .any(|part| part.trim().is_empty())
+        {
+            return None;
+        }
+        Some(owner)
+    }
+
+    pub fn workspace_id(&self) -> &str {
+        &self.workspace_id
+    }
+
+    pub fn task_id(&self) -> &str {
+        &self.task_id
+    }
+
+    pub fn logical_session_id(&self) -> &str {
+        &self.logical_session_id
+    }
+
+    pub fn model_branch_id(&self) -> &str {
+        &self.model_branch_id
+    }
+}
+
+/// Destructive lifecycle transition that revoked branch-local receipts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReceiptClearReason {
+    ContextTrim,
+    ToolResultReplacement,
+    Compaction,
+    PromptReplacement,
+    ProjectionPolicyChanged,
+    Rewind,
+    Rollback,
+    Resume,
+    Teleport,
+    Fork,
+    TaskSwitch,
+    ColdRestore,
+    LockPoisoned,
+}
+
+impl ReceiptClearReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ContextTrim => "context_trim",
+            Self::ToolResultReplacement => "tool_result_replacement",
+            Self::Compaction => "compaction",
+            Self::PromptReplacement => "prompt_replacement",
+            Self::ProjectionPolicyChanged => "projection_policy_changed",
+            Self::Rewind => "rewind",
+            Self::Rollback => "rollback",
+            Self::Resume => "resume",
+            Self::Teleport => "teleport",
+            Self::Fork => "fork",
+            Self::TaskSwitch => "task_switch",
+            Self::ColdRestore => "cold_restore",
+            Self::LockPoisoned => "lock_poisoned",
+        }
+    }
+}
+
+/// Last observed receipt clear, exposed for lifecycle verification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReceiptClearEvent {
+    pub reason: ReceiptClearReason,
+    pub staged_removed: usize,
+    pub active_removed: usize,
+}
+
 /// File range represented by a successful `read_file` result.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum FileView {
@@ -73,6 +176,7 @@ struct SourceProof {
 #[derive(Clone, Debug)]
 struct ReadCandidate {
     candidate_id: String,
+    owner: ReadReceiptOwner,
     signature: ReadSourceSignature,
     file_version: FileVersion,
     requested_view: FileView,
@@ -82,6 +186,7 @@ struct ReadCandidate {
 #[derive(Clone, Debug)]
 pub(crate) struct ModelReadReceipt {
     candidate_id: String,
+    owner: ReadReceiptOwner,
     file_version: FileVersion,
     model_visible_view: FileView,
     projection_policy_id: String,
@@ -104,9 +209,13 @@ impl ModelReadReceipt {
 
 #[derive(Debug, Default)]
 struct Inner {
+    generation: u64,
     next_candidate_id: u64,
     staged: Vec<ReadCandidate>,
     active: Vec<ModelReadReceipt>,
+    projection_policy_id: Option<String>,
+    clear_count: u64,
+    last_clear: Option<ReceiptClearEvent>,
 }
 
 /// Pending receipts derived from one exact provider request.
@@ -114,17 +223,48 @@ struct Inner {
 /// Dropping this value rejects the candidates. Only a successful provider
 /// response may pass it to [`ModelReadReceiptStore::activate`].
 #[derive(Debug, Default)]
-pub(crate) struct PendingReadReceipts(Vec<ModelReadReceipt>);
+pub(crate) struct PendingReadReceipts {
+    owner: Option<ReadReceiptOwner>,
+    generation: u64,
+    receipts: Vec<ModelReadReceipt>,
+}
 
 /// Branch-local read candidates and active model-visible receipts.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ModelReadReceiptStore {
+    owner: Option<ReadReceiptOwner>,
     inner: Mutex<Inner>,
 }
 
+impl Default for ModelReadReceiptStore {
+    fn default() -> Self {
+        Self {
+            owner: None,
+            inner: Mutex::new(Inner::default()),
+        }
+    }
+}
+
 impl ModelReadReceiptStore {
+    /// Build a disabled store. Deduplication requires [`Self::for_owner`].
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Build an enabled store isolated to one complete model branch owner.
+    pub fn for_owner(owner: ReadReceiptOwner) -> Self {
+        Self {
+            owner: Some(owner),
+            inner: Mutex::new(Inner::default()),
+        }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.owner.is_some()
+    }
+
+    pub fn owner(&self) -> Option<&ReadReceiptOwner> {
+        self.owner.as_ref()
     }
 
     pub fn active_len(&self) -> usize {
@@ -133,6 +273,20 @@ impl ModelReadReceiptStore {
 
     pub fn staged_len(&self) -> usize {
         self.lock_fail_closed().staged.len()
+    }
+
+    pub fn clear_count(&self) -> u64 {
+        self.lock_fail_closed().clear_count
+    }
+
+    pub fn last_clear(&self) -> Option<ReceiptClearEvent> {
+        self.lock_fail_closed().last_clear.clone()
+    }
+
+    /// Revoke all candidates and receipts after a destructive history change.
+    pub fn clear(&self, reason: ReceiptClearReason) {
+        let mut inner = self.lock_fail_closed();
+        Self::clear_inner(&mut inner, reason);
     }
 
     pub(crate) fn stage(
@@ -144,14 +298,26 @@ impl ModelReadReceiptStore {
         returned_view: FileView,
         output: &str,
     ) {
-        if tool_call_id.is_empty() {
+        let Some(owner) = self.owner.as_ref() else {
+            return;
+        };
+        if tool_call_id.is_empty() || file_version.target().workspace_id() != owner.workspace_id() {
             return;
         }
         let mut inner = self.lock_fail_closed();
         inner.next_candidate_id = inner.next_candidate_id.saturating_add(1);
         let candidate_id = format!("read-candidate-{}", inner.next_candidate_id);
+        if inner.staged.len() >= MAX_STAGED_CANDIDATES {
+            inner.staged.remove(0);
+            metrics::counter!(
+                "octos_model_read_receipt_evictions_total",
+                "kind" => "candidate".to_string(),
+            )
+            .increment(1);
+        }
         inner.staged.push(ReadCandidate {
             candidate_id,
+            owner: owner.clone(),
             signature: ReadSourceSignature {
                 tool_call_id: crate::normalize_tool_call_id(tool_call_id),
                 arguments_sha256: hash_json(arguments),
@@ -168,6 +334,10 @@ impl ModelReadReceiptStore {
         file_version: &FileVersion,
         requested_view: &FileView,
     ) -> Option<ModelReadReceipt> {
+        let owner = self.owner.as_ref()?;
+        if file_version.target().workspace_id() != owner.workspace_id() {
+            return None;
+        }
         let mut inner = self.lock_fail_closed();
         inner.active.retain(|receipt| {
             receipt.file_version.target() != file_version.target()
@@ -178,7 +348,8 @@ impl ModelReadReceiptStore {
             .iter()
             .rev()
             .find(|receipt| {
-                receipt.file_version == *file_version
+                receipt.owner == *owner
+                    && receipt.file_version == *file_version
                     && receipt.model_visible_view.covers(requested_view)
             })
             .cloned()
@@ -189,6 +360,9 @@ impl ModelReadReceiptStore {
         messages: &[Message],
         projection_policy_id: &str,
     ) -> PendingReadReceipts {
+        let Some(owner) = self.owner.as_ref() else {
+            return PendingReadReceipts::default();
+        };
         let sources = visible_read_sources(messages);
         let visible_proofs = sources
             .iter()
@@ -204,10 +378,19 @@ impl ModelReadReceiptStore {
         }
 
         let mut inner = self.lock_fail_closed();
+        if inner
+            .projection_policy_id
+            .as_deref()
+            .is_some_and(|current| current != projection_policy_id)
+        {
+            Self::clear_inner(&mut inner, ReceiptClearReason::ProjectionPolicyChanged);
+        }
+        inner.projection_policy_id = Some(projection_policy_id.to_owned());
         inner.active.retain(|receipt| {
             receipt.projection_policy_id == projection_policy_id
                 && visible_proofs.contains(&receipt.source_proof)
         });
+        let generation = inner.generation;
         let staged = std::mem::take(&mut inner.staged);
         drop(inner);
 
@@ -224,6 +407,7 @@ impl ModelReadReceiptStore {
             };
             pending.push(ModelReadReceipt {
                 candidate_id: candidate.candidate_id,
+                owner: candidate.owner,
                 file_version: candidate.file_version,
                 model_visible_view: candidate.returned_view,
                 projection_policy_id: projection_policy_id.to_owned(),
@@ -231,12 +415,25 @@ impl ModelReadReceiptStore {
             });
         }
         pending.reverse();
-        PendingReadReceipts(pending)
+        PendingReadReceipts {
+            owner: Some(owner.clone()),
+            generation,
+            receipts: pending,
+        }
     }
 
     pub(crate) fn activate(&self, pending: PendingReadReceipts) {
+        let Some(owner) = self.owner.as_ref() else {
+            return;
+        };
         let mut inner = self.lock_fail_closed();
-        for receipt in pending.0 {
+        if pending.owner.as_ref() != Some(owner) || pending.generation != inner.generation {
+            return;
+        }
+        for receipt in pending.receipts {
+            if receipt.owner != *owner {
+                continue;
+            }
             inner.active.retain(|existing| {
                 if existing.file_version.target() == receipt.file_version.target()
                     && existing.file_version != receipt.file_version
@@ -246,8 +443,39 @@ impl ModelReadReceiptStore {
                 existing.file_version != receipt.file_version
                     || existing.model_visible_view != receipt.model_visible_view
             });
+            if inner.active.len() >= MAX_ACTIVE_RECEIPTS {
+                inner.active.remove(0);
+                metrics::counter!(
+                    "octos_model_read_receipt_evictions_total",
+                    "kind" => "receipt".to_string(),
+                )
+                .increment(1);
+            }
             inner.active.push(receipt);
         }
+    }
+
+    fn clear_inner(inner: &mut Inner, reason: ReceiptClearReason) {
+        let event = ReceiptClearEvent {
+            reason,
+            staged_removed: inner.staged.len(),
+            active_removed: inner.active.len(),
+        };
+        inner.generation = inner.generation.saturating_add(1);
+        inner.staged.clear();
+        inner.active.clear();
+        inner.clear_count = inner.clear_count.saturating_add(1);
+        inner.last_clear = Some(event.clone());
+        metrics::counter!(
+            "octos_model_read_receipt_lifecycle_clears_total",
+            "reason" => reason.as_str().to_string(),
+        )
+        .increment(1);
+        metrics::counter!(
+            "octos_model_read_receipt_entries_cleared_total",
+            "reason" => reason.as_str().to_string(),
+        )
+        .increment((event.staged_removed + event.active_removed) as u64);
     }
 
     fn lock_fail_closed(&self) -> MutexGuard<'_, Inner> {
@@ -255,8 +483,7 @@ impl ModelReadReceiptStore {
             Ok(inner) => inner,
             Err(poisoned) => {
                 let mut inner = poisoned.into_inner();
-                inner.staged.clear();
-                inner.active.clear();
+                Self::clear_inner(&mut inner, ReceiptClearReason::LockPoisoned);
                 inner
             }
         }
@@ -382,6 +609,12 @@ mod tests {
     use crate::file_state_cache::{FileMetadataHint, FileTarget};
     use octos_core::ToolCall;
 
+    fn store() -> ModelReadReceiptStore {
+        ModelReadReceiptStore::for_owner(
+            ReadReceiptOwner::new("workspace", "task", "session", "branch").unwrap(),
+        )
+    }
+
     fn version(bytes: &[u8]) -> FileVersion {
         FileVersion::from_bytes(
             FileTarget::new("workspace", "/workspace/file.txt"),
@@ -426,7 +659,7 @@ mod tests {
 
     #[test]
     fn exact_source_activates_only_after_success_is_committed() {
-        let store = ModelReadReceiptStore::new();
+        let store = store();
         let args = serde_json::json!({"path": "file.txt"});
         let file_version = version(b"body");
         store.stage(
@@ -446,7 +679,10 @@ mod tests {
         assert_eq!(store.active_len(), 0);
 
         store.activate(pending);
-        assert!(store.receipt_for(&file_version, &FileView::Full).is_some());
+        let receipt = store
+            .receipt_for(&file_version, &FileView::Full)
+            .expect("matching source should activate a receipt");
+        assert_eq!(&receipt.owner, store.owner().unwrap());
         assert!(
             store
                 .receipt_for(&file_version, &FileView::Bytes { start: 0, end: 4 })
@@ -464,7 +700,7 @@ mod tests {
             ],
             vec![assistant("call_1", serde_json::json!({"path": "file.txt"}))],
         ] {
-            let store = ModelReadReceiptStore::new();
+            let store = store();
             store.stage(
                 "call_1",
                 &serde_json::json!({"path": "file.txt"}),
@@ -482,7 +718,7 @@ mod tests {
 
     #[test]
     fn partial_receipt_covers_only_matching_coordinate_space_and_subranges() {
-        let store = ModelReadReceiptStore::new();
+        let store = store();
         let args = serde_json::json!({"path": "file.txt", "start_line": 2, "end_line": 5});
         let file_version = version(b"one\ntwo\nthree\nfour\nfive\n");
         store.stage(
@@ -519,7 +755,7 @@ mod tests {
 
     #[test]
     fn repeated_call_id_binds_new_candidate_to_latest_exact_occurrence() {
-        let store = ModelReadReceiptStore::new();
+        let store = store();
         let args = serde_json::json!({"path": "file.txt"});
         let file_version = version(b"body");
         store.stage(
@@ -538,8 +774,8 @@ mod tests {
         ];
         let pending = store.prepare_dispatch(&both_occurrences, "policy-v1");
 
-        assert_eq!(pending.0.len(), 1);
-        assert_eq!(pending.0[0].source_occurrence(), 2);
+        assert_eq!(pending.receipts.len(), 1);
+        assert_eq!(pending.receipts[0].source_occurrence(), 2);
         store.activate(pending);
         assert_eq!(store.active_len(), 1);
 
@@ -557,7 +793,7 @@ mod tests {
 
     #[test]
     fn later_dispatch_without_source_revokes_active_receipt() {
-        let store = ModelReadReceiptStore::new();
+        let store = store();
         let args = serde_json::json!({"path": "file.txt"});
         let file_version = version(b"body");
         store.stage(
@@ -583,7 +819,7 @@ mod tests {
 
     #[test]
     fn changed_projection_policy_revokes_active_receipt() {
-        let store = ModelReadReceiptStore::new();
+        let store = store();
         let args = serde_json::json!({"path": "file.txt"});
         let file_version = version(b"body");
         let source = [assistant("call_1", args.clone()), tool("call_1", "body")];
@@ -602,11 +838,15 @@ mod tests {
         let pending = store.prepare_dispatch(&source, "policy-v2");
         store.activate(pending);
         assert_eq!(store.active_len(), 0);
+        assert_eq!(
+            store.last_clear().map(|event| event.reason),
+            Some(ReceiptClearReason::ProjectionPolicyChanged)
+        );
     }
 
     #[test]
     fn changed_file_version_cannot_use_an_active_receipt() {
-        let store = ModelReadReceiptStore::new();
+        let store = store();
         let args = serde_json::json!({"path": "file.txt"});
         let old_version = version(b"body");
         let current_version = version(b"B0dy");
@@ -628,5 +868,170 @@ mod tests {
                 .is_none()
         );
         assert_eq!(store.active_len(), 0);
+    }
+
+    #[test]
+    fn clear_consumes_pending_receipts_and_records_reason() {
+        let store = store();
+        let args = serde_json::json!({"path": "file.txt"});
+        let file_version = version(b"body");
+        store.stage(
+            "call_1",
+            &args,
+            file_version.clone(),
+            FileView::Full,
+            FileView::Full,
+            "body",
+        );
+        let pending = store.prepare_dispatch(
+            &[assistant("call_1", args), tool("call_1", "body")],
+            "policy-v1",
+        );
+
+        store.clear(ReceiptClearReason::Compaction);
+        store.activate(pending);
+
+        assert_eq!(store.active_len(), 0);
+        assert_eq!(store.staged_len(), 0);
+        assert_eq!(store.clear_count(), 1);
+        assert_eq!(
+            store.last_clear(),
+            Some(ReceiptClearEvent {
+                reason: ReceiptClearReason::Compaction,
+                staged_removed: 0,
+                active_removed: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn owner_workspace_mismatch_never_stages_or_hits() {
+        let store = ModelReadReceiptStore::for_owner(
+            ReadReceiptOwner::new("workspace-a", "task", "session", "branch").unwrap(),
+        );
+        let file_version = version(b"body");
+
+        store.stage(
+            "call_1",
+            &serde_json::json!({"path": "file.txt"}),
+            file_version.clone(),
+            FileView::Full,
+            FileView::Full,
+            "body",
+        );
+
+        assert_eq!(store.staged_len(), 0);
+        assert!(store.receipt_for(&file_version, &FileView::Full).is_none());
+    }
+
+    #[test]
+    fn bounded_receipt_eviction_is_a_safe_miss() {
+        let store = store();
+        let first_version = FileVersion::from_bytes(
+            FileTarget::new("workspace", "/workspace/file-0.txt"),
+            None,
+            b"body-0",
+            FileMetadataHint::new(6, None, None, None, None),
+        );
+        let mut messages = Vec::new();
+
+        for index in 0..=MAX_ACTIVE_RECEIPTS {
+            let path = format!("/workspace/file-{index}.txt");
+            let body = format!("body-{index}");
+            let args = serde_json::json!({"path": path});
+            let file_version = FileVersion::from_bytes(
+                FileTarget::new("workspace", path),
+                None,
+                body.as_bytes(),
+                FileMetadataHint::new(body.len() as u64, None, None, None, None),
+            );
+            let call_id = format!("call_{index}");
+            store.stage(
+                &call_id,
+                &args,
+                file_version,
+                FileView::Full,
+                FileView::Full,
+                &body,
+            );
+            messages.push(assistant(&call_id, args));
+            messages.push(tool(&call_id, &body));
+            let pending = store.prepare_dispatch(&messages, "policy-v1");
+            store.activate(pending);
+        }
+
+        assert_eq!(store.active_len(), MAX_ACTIVE_RECEIPTS);
+        assert!(store.receipt_for(&first_version, &FileView::Full).is_none());
+    }
+
+    #[test]
+    fn bounded_candidate_eviction_drops_the_oldest_unconfirmed_read() {
+        let store = store();
+        let mut messages = Vec::new();
+
+        for index in 0..=MAX_STAGED_CANDIDATES {
+            let path = format!("/workspace/file-{index}.txt");
+            let body = format!("body-{index}");
+            let args = serde_json::json!({"path": path});
+            let file_version = FileVersion::from_bytes(
+                FileTarget::new("workspace", path),
+                None,
+                body.as_bytes(),
+                FileMetadataHint::new(body.len() as u64, None, None, None, None),
+            );
+            let call_id = format!("call_{index}");
+            store.stage(
+                &call_id,
+                &args,
+                file_version,
+                FileView::Full,
+                FileView::Full,
+                &body,
+            );
+            messages.push(assistant(&call_id, args));
+            messages.push(tool(&call_id, &body));
+        }
+
+        let pending = store.prepare_dispatch(&messages, "policy-v1");
+
+        assert_eq!(pending.receipts.len(), MAX_STAGED_CANDIDATES);
+        assert!(
+            pending
+                .receipts
+                .iter()
+                .all(|receipt| receipt.candidate_id() != "read-candidate-1")
+        );
+    }
+
+    #[test]
+    fn poisoned_store_clears_receipts_before_any_future_hit() {
+        let store = store();
+        let args = serde_json::json!({"path": "file.txt"});
+        let file_version = version(b"body");
+        store.stage(
+            "call_1",
+            &args,
+            file_version.clone(),
+            FileView::Full,
+            FileView::Full,
+            "body",
+        );
+        let pending = store.prepare_dispatch(
+            &[assistant("call_1", args), tool("call_1", "body")],
+            "policy-v1",
+        );
+        store.activate(pending);
+        assert_eq!(store.active_len(), 1);
+
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = store.inner.lock().unwrap();
+            panic!("poison receipt store");
+        });
+
+        assert!(store.receipt_for(&file_version, &FileView::Full).is_none());
+        assert_eq!(
+            store.last_clear().map(|event| event.reason),
+            Some(ReceiptClearReason::LockPoisoned)
+        );
     }
 }

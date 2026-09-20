@@ -153,7 +153,9 @@ pub use memory_segment::{
     MEMORY_CAPTURE_POLICY, MEMORY_SEGMENT_NAME, MemorySegmentProvider, compose_memory_segment,
     stable_memory_instructions, volatile_memory_content,
 };
-pub use model_read_receipts::ModelReadReceiptStore;
+pub use model_read_receipts::{
+    ModelReadReceiptStore, ReadReceiptOwner, ReceiptClearEvent, ReceiptClearReason,
+};
 pub use permissions::{InvalidSafetyTier, SafetyTier};
 pub use plugins::{
     PluginLoadError, PluginLoadOptions, PluginLoadResult, PluginLoader, SynthesisConfig,

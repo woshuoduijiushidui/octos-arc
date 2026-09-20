@@ -6,9 +6,16 @@ use tracing::{info, warn};
 use super::Agent;
 use crate::compaction::CompactionPhase;
 use crate::compaction_tiered::Tier1Report;
+use crate::model_read_receipts::ReceiptClearReason;
 use crate::prompt_context::{PromptContextPhase, PromptContextRequest};
 
 impl Agent {
+    pub(super) fn clear_model_read_receipts(&self, reason: ReceiptClearReason) {
+        if let Some(receipts) = self.model_read_receipts.as_ref() {
+            receipts.clear(reason);
+        }
+    }
+
     pub(super) fn trim_to_context_window(&self, messages: &mut Vec<Message>) -> bool {
         use crate::compaction::{MIN_RECENT_MESSAGES, compact_messages, find_recent_boundary};
         use octos_llm::context::{estimate_message_tokens, estimate_tokens};
@@ -107,6 +114,9 @@ impl Agent {
             return Ok(None);
         }
         let outcome = runner.run(messages, CompactionPhase::Preflight);
+        if outcome.performed {
+            self.clear_model_read_receipts(ReceiptClearReason::Compaction);
+        }
         info!(
             phase = "preflight",
             performed = outcome.performed,
@@ -148,6 +158,7 @@ impl Agent {
         };
         let report = runner.run_tier1(messages, protected_tool_call_ids, pass);
         if report.performed() {
+            self.clear_model_read_receipts(ReceiptClearReason::ToolResultReplacement);
             info!(
                 results_pruned = report.results_pruned,
                 bytes_reclaimed = report.bytes_reclaimed,
@@ -204,6 +215,7 @@ impl Agent {
         }
         let outcome = runner.run(messages, CompactionPhase::TurnEnd);
         if outcome.performed {
+            self.clear_model_read_receipts(ReceiptClearReason::Compaction);
             info!(
                 phase = "turn_end",
                 iteration,
@@ -244,6 +256,11 @@ impl Agent {
         };
         match manager.prepare_prompt(request, messages) {
             Ok(report) => {
+                if report.compaction_performed {
+                    self.clear_model_read_receipts(ReceiptClearReason::Compaction);
+                } else if report.prompt_replaced {
+                    self.clear_model_read_receipts(ReceiptClearReason::PromptReplacement);
+                }
                 if report.prompt_replaced || report.compaction_performed {
                     info!(
                         phase = phase.as_str(),
@@ -354,5 +371,184 @@ impl Agent {
             return dropped > 0;
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use octos_core::{AgentId, ToolCall};
+    use octos_llm::{ChatConfig, ChatResponse, LlmProvider, ToolSpec};
+    use octos_memory::EpisodeStore;
+
+    use super::*;
+    use crate::abi_schema::COMPACTION_POLICY_SCHEMA_VERSION;
+    use crate::compaction::CompactionRunner;
+    use crate::compaction_tiered::{
+        ApiMicroCompactionConfig, FullCompactor, MicroCompactionPolicy, Tier1Pass,
+        TieredCompactionRunner,
+    };
+    use crate::file_state_cache::{FileMetadataHint, FileTarget, FileVersion};
+    use crate::model_read_receipts::{
+        FileView, ModelReadReceiptStore, ReadReceiptOwner, ReceiptClearReason,
+    };
+    use crate::tools::ToolRegistry;
+    use crate::workspace_policy::{CompactionPolicy, CompactionSummarizerKind};
+
+    struct NoopProvider;
+
+    #[async_trait]
+    impl LlmProvider for NoopProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> eyre::Result<ChatResponse> {
+            eyre::bail!("not used")
+        }
+
+        fn model_id(&self) -> &str {
+            "h02-m3"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    struct NeverCompact;
+
+    impl FullCompactor for NeverCompact {
+        fn needs_compaction(&self, _messages: &[Message]) -> Option<u32> {
+            None
+        }
+
+        fn compact(
+            &self,
+            _messages: &mut Vec<Message>,
+            _phase: CompactionPhase,
+        ) -> crate::compaction::CompactionOutcome {
+            crate::compaction::CompactionOutcome::default()
+        }
+    }
+
+    async fn agent() -> Agent {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = Arc::new(EpisodeStore::open(dir.path()).await.unwrap());
+        Agent::new(
+            AgentId::new("h02-m3-compaction"),
+            Arc::new(NoopProvider),
+            ToolRegistry::new(),
+            memory,
+        )
+    }
+
+    fn primed_receipts() -> Arc<ModelReadReceiptStore> {
+        let store = Arc::new(ModelReadReceiptStore::for_owner(
+            ReadReceiptOwner::new("workspace", "task", "session", "branch").unwrap(),
+        ));
+        let arguments = serde_json::json!({"path": "file.txt"});
+        let version = FileVersion::from_bytes(
+            FileTarget::new("workspace", "/workspace/file.txt"),
+            None,
+            b"body",
+            FileMetadataHint::new(4, None, None, None, None),
+        );
+        store.stage(
+            "call_read",
+            &arguments,
+            version,
+            FileView::Full,
+            FileView::Full,
+            "body",
+        );
+        let mut call = Message::assistant("");
+        call.tool_calls = Some(vec![ToolCall {
+            id: "call_read".to_owned(),
+            name: "read_file".to_owned(),
+            arguments,
+            metadata: None,
+        }]);
+        let mut result = Message::assistant("body");
+        result.role = MessageRole::Tool;
+        result.tool_call_id = Some("call_read".to_owned());
+        let pending = store.prepare_dispatch(&[call, result], "policy-v1");
+        store.activate(pending);
+        assert_eq!(store.active_len(), 1);
+        store
+    }
+
+    #[tokio::test]
+    async fn declarative_compaction_clears_model_read_receipts() {
+        let receipts = primed_receipts();
+        let policy = CompactionPolicy {
+            schema_version: COMPACTION_POLICY_SCHEMA_VERSION,
+            token_budget: 500,
+            preflight_threshold: Some(1),
+            prune_tool_results_after_turns: None,
+            preserved_artifacts: Vec::new(),
+            preserved_invariants: Vec::new(),
+            summarizer: CompactionSummarizerKind::Extractive,
+        };
+        let agent = agent()
+            .await
+            .with_compaction_runner(Arc::new(CompactionRunner::new(policy)))
+            .with_model_read_receipts(receipts.clone());
+        let filler = "word ".repeat(500);
+        let mut messages = vec![Message::system("prompt")];
+        for _ in 0..8 {
+            messages.push(Message::user(&filler));
+            messages.push(Message::assistant(&filler));
+        }
+
+        agent.maybe_run_preflight_compaction(&mut messages).unwrap();
+
+        assert_eq!(receipts.active_len(), 0);
+        assert_eq!(
+            receipts.last_clear().map(|event| event.reason),
+            Some(ReceiptClearReason::Compaction)
+        );
+    }
+
+    #[tokio::test]
+    async fn tier1_tool_result_replacement_clears_model_read_receipts() {
+        let receipts = primed_receipts();
+        let tiered = TieredCompactionRunner::new(
+            MicroCompactionPolicy {
+                max_age_turns: 0,
+                max_size_bytes_per_result: 10,
+                pin_recent_files: 0,
+                dedup_duplicate_reads: false,
+            },
+            ApiMicroCompactionConfig::default(),
+            Box::new(NeverCompact),
+        );
+        let agent = agent()
+            .await
+            .with_tiered_compaction(Arc::new(tiered))
+            .with_model_read_receipts(receipts.clone());
+        let mut call = Message::assistant("");
+        call.tool_calls = Some(vec![ToolCall {
+            id: "call_shell".to_owned(),
+            name: "shell".to_owned(),
+            arguments: serde_json::json!({"command": "large output"}),
+            metadata: None,
+        }]);
+        let mut result = Message::assistant("x".repeat(100));
+        result.role = MessageRole::Tool;
+        result.tool_call_id = Some("call_shell".to_owned());
+        let mut messages = vec![Message::system("prompt"), call, result];
+
+        let report = agent.run_tier1_compaction(&mut messages, &[], Tier1Pass::Full);
+
+        assert!(report.performed());
+        assert_eq!(receipts.active_len(), 0);
+        assert_eq!(
+            receipts.last_clear().map(|event| event.reason),
+            Some(ReceiptClearReason::ToolResultReplacement)
+        );
     }
 }

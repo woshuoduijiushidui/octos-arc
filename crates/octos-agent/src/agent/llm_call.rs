@@ -812,7 +812,7 @@ mod tests {
     use super::super::Agent;
     use super::super::turn_state::LoopTurnState;
     use crate::file_state_cache::{FileMetadataHint, FileTarget, FileVersion};
-    use crate::model_read_receipts::{FileView, ModelReadReceiptStore};
+    use crate::model_read_receipts::{FileView, ModelReadReceiptStore, ReadReceiptOwner};
     use crate::prompt_context::{PromptContextManager, PromptContextReport, PromptContextRequest};
     use crate::tools::ToolRegistry;
 
@@ -1162,6 +1162,12 @@ mod tests {
         LoopTurnState::new(Instant::now())
     }
 
+    fn receipt_store() -> ModelReadReceiptStore {
+        ModelReadReceiptStore::for_owner(
+            ReadReceiptOwner::new("workspace", "task", "session", "branch").unwrap(),
+        )
+    }
+
     fn stage_read_candidate(store: &ModelReadReceiptStore) -> Vec<Message> {
         let arguments = serde_json::json!({"path": "file.txt"});
         let version = FileVersion::from_bytes(
@@ -1207,7 +1213,7 @@ mod tests {
             fail: false,
         });
         let (agent, _dir) = build_agent(provider).await;
-        let receipts = Arc::new(ModelReadReceiptStore::new());
+        let receipts = Arc::new(receipt_store());
         let agent = agent.with_model_read_receipts(receipts.clone());
         let messages = stage_read_candidate(&receipts);
 
@@ -1238,7 +1244,7 @@ mod tests {
             fail: false,
         });
         let (agent, _dir) = build_agent(provider).await;
-        let receipts = Arc::new(ModelReadReceiptStore::new());
+        let receipts = Arc::new(receipt_store());
         let hooks = Arc::new(HookExecutor::new(vec![HookConfig {
             event: HookEvent::BeforeLlmCall,
             command: vec!["false".to_owned()],
@@ -1272,7 +1278,7 @@ mod tests {
     async fn cancelled_llm_call_consumes_without_activating_read_candidates() {
         let provider: Arc<dyn LlmProvider> = Arc::new(HangingBuildProvider);
         let (agent, _dir) = build_agent(provider).await;
-        let receipts = Arc::new(ModelReadReceiptStore::new());
+        let receipts = Arc::new(receipt_store());
         let agent = agent.with_model_read_receipts(receipts.clone());
         let messages = stage_read_candidate(&receipts);
 
