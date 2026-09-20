@@ -215,6 +215,7 @@ fn expand_profile_tool_entries(entries: &[String]) -> HashSet<String> {
 /// the ToolContext carries a shared handle.
 pub use crate::file_state_cache::FileStateCache;
 use crate::model_read_receipts::ModelReadReceiptStore;
+use crate::task_file_state::TaskFileState;
 
 /// Inbox of in-flight notifications surfaced to tools and the agent loop.
 ///
@@ -282,6 +283,9 @@ pub struct ToolContext {
     pub file_state_cache: Option<Arc<FileStateCache>>,
     /// Model-visible read state for the current model branch.
     pub model_read_receipts: Option<Arc<ModelReadReceiptStore>>,
+    /// Complete task-local carrier used by child Agent builders. Children
+    /// share its ledger but always mint a new branch-local receipt store.
+    pub task_file_state: Option<TaskFileState>,
     /// Notification inbox surfaced to tools. M8.2/M8.3 will populate this.
     pub notifications: Arc<Notifications>,
     /// Handle to the ambient app state. M8.3 will populate this.
@@ -407,6 +411,7 @@ impl ToolContext {
             permissions: ToolPermissions::default(),
             file_state_cache: None,
             model_read_receipts: None,
+            task_file_state: None,
             notifications: Arc::new(Notifications::new()),
             app_state: AppStateHandle::new(),
             subagent_output_router: None,

@@ -28,6 +28,7 @@ use crate::role_template::RoleTemplate;
 use crate::sandbox::{SandboxConfig, create_sandbox};
 use crate::subagent_output::SubAgentOutputRouter;
 use crate::subagent_summary::AgentSummaryGenerator;
+use crate::task_file_state::{ModelBranchFileState, TaskFileState};
 use crate::task_supervisor::{TaskSupervisor, TaskTerminalGuard};
 use crate::workspace_git::{
     WorkspaceContractStatus, WorkspaceProjectKind,
@@ -51,6 +52,30 @@ pub struct ChildPromptContextRequest {
     pub task_id: Option<String>,
     pub worker_id: String,
     pub task_label: String,
+}
+
+fn child_file_state(
+    parent: &TaskFileState,
+    workspace: &Path,
+    task_id: Option<&str>,
+    child_session_key: Option<&str>,
+    parent_session_key: Option<&str>,
+    worker_id: &AgentId,
+) -> Option<ModelBranchFileState> {
+    let logical_session_id = child_session_key.or(parent_session_key)?;
+    let generated_task_id;
+    let task_id = match task_id {
+        Some(task_id) if !task_id.trim().is_empty() => task_id,
+        _ => {
+            generated_task_id = format!("spawn-{worker_id}");
+            &generated_task_id
+        }
+    };
+    parent.for_workspace(workspace).ok()?.for_branch(
+        task_id,
+        logical_session_id,
+        worker_id.to_string(),
+    )
 }
 
 pub type ChildPromptContextManagerFactory =
@@ -1113,9 +1138,9 @@ pub struct SpawnTool {
     /// When combined with a budget policy, the dispatcher rejects
     /// spawns whose projected spend breaches the ceiling.
     cost_accountant: Option<Arc<crate::cost_ledger::CostAccountant>>,
-    /// Parent task's strong file-version ledger. Children may share disk
-    /// observations, but model-visible read receipts remain branch-local.
-    parent_file_state_cache: Option<Arc<FileStateCache>>,
+    /// Parent task's file state. Children share only its version ledger and
+    /// mint a new model-visible receipt store when each worker is created.
+    parent_file_state: Option<TaskFileState>,
     /// M8 Runtime Parity W2.B1: parent session's M8.7 output router so
     /// the child Agent's spawn_only background tools route output
     /// through the same on-disk log the dashboard tails.
@@ -1202,7 +1227,7 @@ impl SpawnTool {
             mcp_agent_backend: None,
             mcp_agent_tool_name: None,
             cost_accountant: None,
-            parent_file_state_cache: None,
+            parent_file_state: None,
             parent_subagent_output_router: None,
             child_stream_callback: None,
             parent_subagent_summary_generator: None,
@@ -1249,7 +1274,7 @@ impl SpawnTool {
             mcp_agent_backend: None,
             mcp_agent_tool_name: None,
             cost_accountant: None,
-            parent_file_state_cache: None,
+            parent_file_state: None,
             parent_subagent_output_router: None,
             child_stream_callback: None,
             parent_subagent_summary_generator: None,
@@ -1310,7 +1335,7 @@ impl SpawnTool {
             mcp_agent_backend: self.mcp_agent_backend.clone(),
             mcp_agent_tool_name: self.mcp_agent_tool_name.clone(),
             cost_accountant: self.cost_accountant.clone(),
-            parent_file_state_cache: self.parent_file_state_cache.clone(),
+            parent_file_state: self.parent_file_state.clone(),
             parent_subagent_output_router: self.parent_subagent_output_router.clone(),
             child_stream_callback: self.child_stream_callback.clone(),
             parent_subagent_summary_generator: self.parent_subagent_summary_generator.clone(),
@@ -1551,9 +1576,19 @@ impl SpawnTool {
         self
     }
 
-    /// Share the parent task's strong file-version ledger.
+    /// Share the parent task's ledger while keeping branch receipts private.
+    pub fn with_parent_file_state(mut self, state: TaskFileState) -> Self {
+        self.parent_file_state = Some(state);
+        self
+    }
+
+    /// Compatibility builder for callers that only have the old ledger.
+    ///
+    /// If the workspace cannot be canonicalized, children still run with
+    /// deduplication disabled.
     pub fn with_parent_file_state_cache(mut self, cache: Arc<FileStateCache>) -> Self {
-        self.parent_file_state_cache = Some(cache);
+        self.parent_file_state =
+            TaskFileState::with_ledger_for_local_workspace(&self.working_dir, cache).ok();
         self
     }
 
@@ -1612,7 +1647,12 @@ impl SpawnTool {
     /// and the parity audit harness to assert that a SpawnTool was
     /// fully wired with parent caches.
     pub fn parent_file_state_cache(&self) -> Option<&Arc<FileStateCache>> {
-        self.parent_file_state_cache.as_ref()
+        self.parent_file_state.as_ref().map(TaskFileState::ledger)
+    }
+
+    /// Complete parent task state, when the runtime supplied one.
+    pub fn parent_file_state(&self) -> Option<&TaskFileState> {
+        self.parent_file_state.as_ref()
     }
 
     /// M8 Runtime Parity W2.B1 introspection helper.
@@ -3154,6 +3194,10 @@ impl Tool for SpawnTool {
 
         let worker_num = self.worker_count.fetch_add(1, Ordering::SeqCst);
         let worker_id = AgentId::new(format!("subagent-{worker_num}"));
+        let parent_file_state = ctx
+            .task_file_state
+            .clone()
+            .or_else(|| self.parent_file_state.clone());
         let label = input
             .label
             .unwrap_or_else(|| input.task.chars().take(60).collect());
@@ -3934,12 +3978,17 @@ impl Tool for SpawnTool {
             if let Some(ref pp) = self.provider_policy {
                 tools.set_provider_policy(pp.clone());
             }
-            let mut worker = Agent::new(worker_id, sub_llm.clone(), tools, self.memory.clone())
-                // Guard C (issue #607): stamp the child agent's spawn
-                // nesting depth as `parent_depth + 1` so the child's
-                // own spawn tool calls see the higher value and the
-                // [`MAX_SPAWN_DEPTH`] gate fires at the bounded limit.
-                .with_spawn_depth(ctx.spawn_depth.saturating_add(1));
+            let mut worker = Agent::new(
+                worker_id.clone(),
+                sub_llm.clone(),
+                tools,
+                self.memory.clone(),
+            )
+            // Guard C (issue #607): stamp the child agent's spawn
+            // nesting depth as `parent_depth + 1` so the child's
+            // own spawn tool calls see the higher value and the
+            // [`MAX_SPAWN_DEPTH`] gate fires at the bounded limit.
+            .with_spawn_depth(ctx.spawn_depth.saturating_add(1));
             // Phase 2-D of the SessionScope migration: propagate the
             // parent's scope into the child Agent so the child's tools
             // (shell, read_file, write_file, edit_file, plugin tool,
@@ -3973,10 +4022,20 @@ impl Tool for SpawnTool {
                 }
             }
 
-            // Share disk versions and the existing output infrastructure with
-            // the child. Model-visible read receipts are not stored here.
-            if let Some(ref cache) = self.parent_file_state_cache {
-                worker = worker.with_file_state_cache(cache.clone());
+            // Share disk versions, but mint a receipt store for this exact
+            // child only. A missing session owner keeps deduplication off.
+            if let Some(ref task_state) = parent_file_state {
+                worker = worker.with_file_state_cache(task_state.ledger().clone());
+                if let Some(file_state) = child_file_state(
+                    task_state,
+                    &child_working_dir,
+                    None,
+                    None,
+                    self.session_key.as_deref(),
+                    &worker_id,
+                ) {
+                    worker = worker.with_file_state(file_state);
+                }
             }
             if let Some(ref router) = self.parent_subagent_output_router {
                 worker = worker.with_subagent_output_router(router.clone());
@@ -4315,7 +4374,7 @@ impl Tool for SpawnTool {
             // path. Without these the detached subagent silently runs
             // without M8.4/M8.7 wiring even when the session actor
             // configured everything.
-            let parent_file_state_cache = self.parent_file_state_cache.clone();
+            let parent_file_state = parent_file_state.clone();
             let parent_subagent_output_router = self.parent_subagent_output_router.clone();
             let parent_subagent_summary_generator = self.parent_subagent_summary_generator.clone();
             // Issue #1125: invoke the child prompt-context factory
@@ -4596,10 +4655,20 @@ impl Tool for SpawnTool {
                 effective_config.suppress_auto_send_files = true;
                 effective_config.max_iterations = bg_max_iters;
                 worker = worker.with_config(effective_config);
-                // Share disk versions with the detached child before it starts.
-                // Model-visible read receipts are separate branch-local state.
-                if let Some(ref cache) = parent_file_state_cache {
-                    worker = worker.with_file_state_cache(cache.clone());
+                // Share disk versions with the detached child, then mint this
+                // worker's independent model-visible receipt store.
+                if let Some(ref task_state) = parent_file_state {
+                    worker = worker.with_file_state_cache(task_state.ledger().clone());
+                    if let Some(file_state) = child_file_state(
+                        task_state,
+                        &working_dir,
+                        tracked_task_id.as_deref(),
+                        tracked_child_session_key.as_deref(),
+                        parent_session_key.as_deref(),
+                        &wid,
+                    ) {
+                        worker = worker.with_file_state(file_state);
+                    }
                 }
                 if let Some(ref router) = parent_subagent_output_router {
                     worker = worker.with_subagent_output_router(router.clone());

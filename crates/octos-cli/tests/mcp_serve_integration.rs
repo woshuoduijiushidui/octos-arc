@@ -137,6 +137,15 @@ fn tool_use(call: ToolCall) -> ChatResponse {
     }
 }
 
+fn read_file_call(id: &str, path: &str) -> ChatResponse {
+    tool_use(ToolCall {
+        id: id.to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({"path": path}),
+        metadata: None,
+    })
+}
+
 /// Harness that pairs a real dispatch with the [`TempDir`] it runs against.
 /// Holding the [`TempDir`] ensures the workspace outlives the [`Agent`] run;
 /// relying on the caller to keep it alive avoids `std::mem::forget` leaks.
@@ -298,6 +307,92 @@ async fn should_execute_real_agent_session_via_mcp_dispatch_and_return_artifact(
     // cost must be a real token bundle, never a placeholder zero struct.
     assert_eq!(outcome.cost.input_tokens, 42);
     assert_eq!(outcome.cost.output_tokens, 17);
+}
+
+#[tokio::test]
+async fn repeated_read_through_mcp_dispatch_uses_verified_receipt() {
+    let workspace = TempDir::new().unwrap();
+    std::fs::write(workspace.path().join("notes.txt"), "alpha\nbeta\n").unwrap();
+    let artifact_path = workspace.path().join("result.txt");
+    std::fs::write(&artifact_path, "ready").unwrap();
+    let provider = ScriptedLlmProvider::new(vec![
+        read_file_call("read-1", "notes.txt"),
+        read_file_call("read-2", "notes.txt"),
+        end_turn("done"),
+    ]);
+    let recording_provider = provider.clone();
+    let harness = DispatchHarness::build(provider, workspace);
+    let observer = RecordingObserver::new();
+
+    let outcome = harness
+        .dispatch
+        .run_session(
+            "read-check",
+            &json!({
+                "prompt": "read notes twice",
+                "expected_artifact": artifact_path.display().to_string(),
+            }),
+            &observer,
+        )
+        .await
+        .expect("MCP dispatch");
+
+    assert_eq!(outcome.final_state, TaskLifecycleState::Ready);
+    let requests = recording_provider.requests();
+    let repeated_output = requests[2]
+        .iter()
+        .rev()
+        .find(|message| message.role == MessageRole::Tool)
+        .expect("second read output reaches the provider");
+    assert!(
+        repeated_output.content.starts_with("[FILE_UNCHANGED]"),
+        "{}",
+        repeated_output.content
+    );
+}
+
+#[tokio::test]
+async fn separate_mcp_invocations_do_not_share_read_receipts() {
+    let workspace = TempDir::new().unwrap();
+    std::fs::write(workspace.path().join("notes.txt"), "alpha\nbeta\n").unwrap();
+    let artifact_path = workspace.path().join("result.txt");
+    std::fs::write(&artifact_path, "ready").unwrap();
+    let provider = ScriptedLlmProvider::new(vec![
+        read_file_call("read-1", "notes.txt"),
+        end_turn("first done"),
+        read_file_call("read-2", "notes.txt"),
+        end_turn("second done"),
+    ]);
+    let recording_provider = provider.clone();
+    let harness = DispatchHarness::build(provider, workspace);
+
+    for prompt in ["first invocation", "second invocation"] {
+        let observer = RecordingObserver::new();
+        let outcome = harness
+            .dispatch
+            .run_session(
+                "read-check",
+                &json!({
+                    "prompt": prompt,
+                    "expected_artifact": artifact_path.display().to_string(),
+                }),
+                &observer,
+            )
+            .await
+            .expect("MCP dispatch");
+        assert_eq!(outcome.final_state, TaskLifecycleState::Ready);
+    }
+
+    let requests = recording_provider.requests();
+    for request_index in [1, 3] {
+        let output = requests[request_index]
+            .iter()
+            .rev()
+            .find(|message| message.role == MessageRole::Tool)
+            .expect("read output reaches the provider");
+        assert!(output.content.contains("alpha"));
+        assert!(!output.content.contains("[FILE_UNCHANGED]"));
+    }
 }
 
 #[tokio::test]

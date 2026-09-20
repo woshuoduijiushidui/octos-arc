@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use octos_agent::{
-    Agent, AgentConfig, FileStateCache, Tool, ToolRegistry, ToolResult,
+    Agent, AgentConfig, FileStateCache, TaskFileState, Tool, ToolRegistry, ToolResult,
     agents::{AgentDefinition, AgentDefinitions},
     tools::ToolContext,
 };
@@ -42,6 +42,7 @@ struct CtxProbeTool {
 struct CapturedCtx {
     agent_definition_ids: Vec<String>,
     file_state_cache_present: bool,
+    task_file_state_present: bool,
     /// Whether the captured `ToolContext.permissions` permits each
     /// of the named tools. Used by the gap-4b coverage to prove the
     /// profile-derived envelope reaches the call site.
@@ -93,6 +94,7 @@ impl Tool for CtxProbeTool {
         let captured = CapturedCtx {
             agent_definition_ids: ctx.agent_definitions.ids().map(|s| s.to_string()).collect(),
             file_state_cache_present: ctx.file_state_cache.is_some(),
+            task_file_state_present: ctx.task_file_state.is_some(),
             permissions_for: perms,
         };
         *self.captured.lock().unwrap() = Some(captured);
@@ -348,6 +350,10 @@ async fn spawn_only_background_path_receives_full_tool_context_after_m8_8_schedu
         .expect("parse manifest"),
     );
     let cache = Arc::new(FileStateCache::new());
+    let file_state = TaskFileState::with_ledger_for_local_workspace(dir.path(), cache.clone())
+        .unwrap()
+        .for_branch("task", "session", "root")
+        .unwrap();
 
     let mut tools = ToolRegistry::new();
     tools.register(probe);
@@ -367,7 +373,7 @@ async fn spawn_only_background_path_receives_full_tool_context_after_m8_8_schedu
             ..Default::default()
         })
         .with_agent_definitions(Arc::new(registry))
-        .with_file_state_cache(cache.clone());
+        .with_file_state(file_state);
 
     // Agent loop runs the spawn_only branch synchronously up to the
     // `tokio::spawn` for the background body; the body itself runs after
@@ -405,6 +411,10 @@ async fn spawn_only_background_path_receives_full_tool_context_after_m8_8_schedu
         captured.file_state_cache_present,
         "spawn-only background ToolContext.file_state_cache was None — \
          M8.8 reconciliation must populate it"
+    );
+    assert!(
+        captured.task_file_state_present,
+        "spawn-only background ToolContext.task_file_state was None"
     );
 }
 

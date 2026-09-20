@@ -12,8 +12,8 @@ use eyre::{Result, WrapErr};
 use octos_agent::sandbox::create_sandbox;
 use octos_agent::workspace_policy::{WorkspacePolicy, write_workspace_policy_if_absent};
 use octos_agent::{
-    Agent, AgentConfig, AgentSummaryGenerator, EffectivePermissions, FileStateCache, SandboxConfig,
-    SubAgentOutputRouter, ToolRegistry,
+    Agent, AgentConfig, AgentSummaryGenerator, EffectivePermissions, SandboxConfig,
+    SubAgentOutputRouter, TaskFileState, ToolRegistry,
 };
 use octos_bus::SessionManager;
 use octos_core::{
@@ -426,7 +426,20 @@ impl SessionRuntime {
             subagent_output_router.clone(),
             supervisor_for_summary,
         ));
-        let file_state_cache = Arc::new(FileStateCache::new());
+        let file_state = match TaskFileState::for_local_workspace(&workspace_root) {
+            Ok(task_state) => {
+                task_state.for_branch(session_key.to_string(), session_key.to_string(), "root")
+            }
+            Err(error) => {
+                tracing::warn!(
+                    session = %session_key,
+                    workspace_root = %workspace_root.display(),
+                    error = %error,
+                    "file state initialization failed; read deduplication remains disabled",
+                );
+                None
+            }
+        };
 
         // SessionScope construction (#1377 Phase-3-B reconciliation).
         //
@@ -597,7 +610,6 @@ impl SessionRuntime {
         // `Agent::new_shared` default and the LLM would lose its
         // skill-aware routing.
         .with_system_prompt(profile.prompt_parts.pre_memory.clone())
-        .with_file_state_cache(file_state_cache)
         .with_subagent_output_router(subagent_output_router)
         .with_subagent_summary_generator(subagent_summary_generator)
         .with_sandbox_config(sandbox.clone())
@@ -606,6 +618,9 @@ impl SessionRuntime {
         // runtime-held agent exactly like the per-turn AppUI rebuild does.
         .with_parent_session_key(session_key.to_string())
         .with_workspace_root(workspace_root.clone());
+        if let Some(file_state) = file_state {
+            agent = agent.with_file_state(file_state);
+        }
 
         if let Some(coding_profile) = profile.agent_profile.clone() {
             let definitions = Arc::new(octos_agent::agents::AgentDefinitions::load_dir(
@@ -2000,6 +2015,44 @@ tools = ["read_file"]
         // points at the per-session workspace dir, not the profile root.
         assert_eq!(turn_scope.workspace(), runtime_scope.workspace());
         assert_eq!(turn_scope.root(), data_dir.as_path());
+    }
+
+    #[tokio::test]
+    async fn ui_protocol_ws_turn_agent_inherits_complete_root_file_state() {
+        use octos_agent::Agent;
+
+        let tmp = TempDir::new().unwrap();
+        let profile = make_profile(tmp.path().join("profile-data")).await;
+        let session_key = SessionKey("web-1779000000000-file-state".to_string());
+        let rt = SessionRuntime::bootstrap(&profile, session_key, None)
+            .await
+            .expect("bootstrap session runtime");
+        let runtime_state = rt
+            .agent
+            .file_state()
+            .expect("bootstrap agent must carry complete file state")
+            .clone();
+
+        let request_agent = Agent::new_shared(
+            AgentId::new("ui-protocol-file-state-test"),
+            profile.llm.clone(),
+            Arc::new(rt.tools.snapshot_excluding(&[])),
+            profile.memory.clone(),
+        )
+        .with_file_state(runtime_state.clone());
+        let request_state = request_agent
+            .file_state()
+            .expect("per-turn agent must carry complete file state");
+
+        assert!(Arc::ptr_eq(runtime_state.ledger(), request_state.ledger()));
+        assert!(Arc::ptr_eq(
+            runtime_state.receipts(),
+            request_state.receipts()
+        ));
+        assert_eq!(
+            request_state.receipts().owner(),
+            runtime_state.receipts().owner()
+        );
     }
 
     /// #1377 Phase-3-B (formerly the Phase-3-A round-4 skip-pin): when a

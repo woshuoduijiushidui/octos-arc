@@ -3766,7 +3766,10 @@ fn appui_prompt_context_bridge_preserves_current_user_turn() {
         )
         .expect("context manager bridge should prepare prompt");
 
-    assert!(report.prompt_replaced);
+    assert!(
+        !report.prompt_replaced,
+        "re-applying the unchanged runtime System message is not a destructive prompt replacement"
+    );
     assert!(
         prompt.iter().any(|message| {
             message.role == MessageRole::System && message.content == "runtime system"
@@ -3939,6 +3942,10 @@ fn in_loop_compaction_emits_lifecycle_notifications() {
     assert!(
         report.compaction_performed,
         "the tiny window must force an in-loop compaction"
+    );
+    assert!(
+        report.prompt_replaced,
+        "a compacted provider frame must revoke receipts from the prior frame"
     );
 
     let events = captured.lock().unwrap_or_else(|error| error.into_inner());
@@ -30199,6 +30206,85 @@ impl octos_llm::LlmProvider for M11EStubLlm {
     }
 }
 
+struct H02OupLlm {
+    responses: StdMutex<Vec<octos_llm::ChatResponse>>,
+    requests: StdMutex<Vec<Vec<Message>>>,
+}
+
+impl H02OupLlm {
+    fn new(responses: Vec<octos_llm::ChatResponse>) -> Self {
+        Self {
+            responses: StdMutex::new(responses),
+            requests: StdMutex::new(Vec::new()),
+        }
+    }
+
+    fn requests(&self) -> Vec<Vec<Message>> {
+        self.requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl octos_llm::LlmProvider for H02OupLlm {
+    async fn chat(
+        &self,
+        messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &octos_llm::ChatConfig,
+    ) -> eyre::Result<octos_llm::ChatResponse> {
+        self.requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(messages.to_vec());
+        let mut responses = self
+            .responses
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if responses.is_empty() {
+            eyre::bail!("H02 OUP scripted responses exhausted");
+        }
+        Ok(responses.remove(0))
+    }
+
+    fn model_id(&self) -> &str {
+        "h02-oup-scripted"
+    }
+
+    fn provider_name(&self) -> &str {
+        "scripted"
+    }
+}
+
+fn h02_oup_read(id: &str) -> octos_llm::ChatResponse {
+    octos_llm::ChatResponse {
+        content: None,
+        reasoning_content: None,
+        tool_calls: vec![octos_core::ToolCall {
+            id: id.to_string(),
+            name: "read_file".to_string(),
+            arguments: json!({"path": "notes.txt"}),
+            metadata: None,
+        }],
+        stop_reason: octos_llm::StopReason::ToolUse,
+        usage: octos_llm::TokenUsage::default(),
+        provider_index: None,
+    }
+}
+
+fn h02_oup_end(text: &str) -> octos_llm::ChatResponse {
+    octos_llm::ChatResponse {
+        content: Some(text.to_string()),
+        reasoning_content: None,
+        tool_calls: Vec::new(),
+        stop_reason: octos_llm::StopReason::EndTurn,
+        usage: octos_llm::TokenUsage::default(),
+        provider_index: None,
+    }
+}
+
 async fn make_m11e_profile_with_llm_and_sandbox(
     profile_id: &str,
     data_dir: &std::path::Path,
@@ -31620,6 +31706,154 @@ async fn appui_session_with_custom_cwd_reads_supplied_workspace() {
         result.output.contains("session-A reads its own workspace"),
         "expected session A's sentinel content, got: {}",
         result.output
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn h02_m5_stdio_open_and_two_turns_reuse_verified_read_receipt() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(workspace.join("notes.txt"), "alpha\nbeta\n").unwrap();
+    let provider = Arc::new(H02OupLlm::new(vec![
+        h02_oup_read("read-1"),
+        h02_oup_end("first done"),
+        h02_oup_read("read-2"),
+        h02_oup_end("second done"),
+    ]));
+    let profile_id = "h02-oup";
+    let (state, profile_runtime) = state_with_profile_llm_and_sandbox(
+        temp.path(),
+        profile_id,
+        provider.clone(),
+        octos_agent::SandboxConfig {
+            mode: octos_agent::SandboxMode::None,
+            ..Default::default()
+        },
+    )
+    .await;
+    let session_id = SessionKey::with_profile(profile_id, "api", "file-state");
+    let features = ConnectionUiFeatures {
+        session_workspace_cwd: true,
+        header_present: true,
+        ..ConnectionUiFeatures::default()
+    };
+    let ledger = Arc::new(UiProtocolLedger::new(256));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+
+    open_session_result(
+        &state,
+        &ledger,
+        &contracts.approvals,
+        &contracts.user_questions,
+        ConnectionId::next(),
+        Some(profile_id),
+        None,
+        features,
+        SessionOpenParams {
+            session_id: session_id.clone(),
+            topic: None,
+            profile_id: Some(profile_id.to_string()),
+            cwd: Some(workspace.to_string_lossy().into_owned()),
+            sandbox: None,
+            after: None,
+        },
+    )
+    .await
+    .expect("stdio session/open");
+
+    let active_turns = active_turns_registry();
+    let connection_turns: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let (ws, mut rx) = ws_connection_for_test(256);
+    for (index, prompt) in ["read once", "read again"].into_iter().enumerate() {
+        let turn_id = TurnId::new();
+        let request_id = format!("h02-turn-{index}");
+        handle_turn_start(
+            &ws,
+            &state,
+            &ledger,
+            &contracts,
+            &active_turns,
+            &connection_turns,
+            Some(profile_id),
+            None,
+            features,
+            request_id.clone(),
+            TurnStartParams {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                input: vec![InputItem::Text {
+                    text: prompt.to_string(),
+                }],
+                media: Vec::new(),
+                topic: None,
+                rewrite_for: None,
+                reasoning_effort: None,
+                tool_context: None,
+                live_video: false,
+            },
+        )
+        .await;
+        let accepted = recv_rpc_response_with_id(&mut rx, &request_id).await;
+        assert_eq!(accepted["result"]["accepted"], true, "{accepted}");
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let terminal = {
+                    let registry = active_turns.lock().await;
+                    match registry.get(&session_id) {
+                        Some(entry) if entry.turn_id == turn_id => {
+                            matches!(*entry.state.lock().await, TurnState::Terminal(_))
+                        }
+                        _ => false,
+                    }
+                };
+                if terminal {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("stdio turn must settle");
+        if index == 0 {
+            let runtime = state
+                .session_cache
+                .get_or_init(&profile_runtime, session_id.clone(), None)
+                .await
+                .expect("cached session runtime");
+            let receipts = runtime
+                .agent
+                .model_read_receipts()
+                .expect("root branch receipt store");
+            assert_eq!(
+                receipts.active_len(),
+                1,
+                "first stdio turn must activate one verified receipt; last clear: {:?}",
+                receipts.last_clear()
+            );
+        }
+    }
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 4, "{requests:#?}");
+    let second_read = requests[3]
+        .iter()
+        .rev()
+        .find(|message| message.role == MessageRole::Tool)
+        .expect("second read output reaches the provider");
+    assert!(
+        second_read.content.starts_with("[FILE_UNCHANGED]"),
+        "{}; final receipt state: {:?}",
+        second_read.content,
+        state
+            .session_cache
+            .get_or_init(&profile_runtime, session_id.clone(), None)
+            .await
+            .expect("cached session runtime")
+            .agent
+            .model_read_receipts()
+            .and_then(|receipts| receipts.last_clear())
     );
 }
 
@@ -43320,14 +43554,14 @@ fn standalone_turn_reapplies_hook_context() {
 }
 
 #[test]
-fn h02_m0_characterization_oup_and_mcp_agents_omit_file_cache_wiring() {
+fn h02_m5_oup_and_mcp_agents_receive_complete_file_state() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
 
     let session =
         std::fs::read_to_string(manifest.join("src/runtime/session.rs")).expect("read session.rs");
     assert!(
-        session.contains(".with_file_state_cache(file_state_cache)"),
-        "the bootstrap SessionRuntime agent must remain the control showing cache wiring exists"
+        session.contains("agent = agent.with_file_state(file_state);"),
+        "the bootstrap SessionRuntime agent must receive both ledger and branch receipts"
     );
 
     let transport = std::fs::read_to_string(manifest.join("src/api/ui_protocol_transport.rs"))
@@ -43340,8 +43574,9 @@ fn h02_m0_characterization_oup_and_mcp_agents_omit_file_cache_wiring() {
         .map(|offset| oup_start + offset)
         .expect("end of OUP per-turn Agent builder");
     assert!(
-        !transport[oup_start..oup_end].contains("with_file_state_cache"),
-        "M0 records that the OUP per-turn Agent does not inherit the bootstrap cache"
+        transport[oup_start..oup_end]
+            .contains("request_agent = request_agent.with_file_state(file_state.clone());"),
+        "the OUP per-turn Agent must inherit the runtime's complete root-branch state"
     );
 
     let mcp = std::fs::read_to_string(manifest.join("src/commands/mcp_serve.rs"))
@@ -43354,7 +43589,7 @@ fn h02_m0_characterization_oup_and_mcp_agents_omit_file_cache_wiring() {
         .map(|offset| mcp_start + offset)
         .expect("end of MCP Agent builder");
     assert!(
-        !mcp[mcp_start..mcp_end].contains("with_file_state_cache"),
-        "M0 records that each MCP run_session Agent starts without a file cache"
+        mcp[mcp_start..mcp_end].contains("agent = agent.with_file_state(file_state)"),
+        "each MCP run_session must create and attach complete invocation-local file state"
     );
 }

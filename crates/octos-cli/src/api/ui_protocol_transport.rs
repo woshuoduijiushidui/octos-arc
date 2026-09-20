@@ -4493,12 +4493,8 @@ impl PromptContextManager for AppUiPromptContextBridge {
         // passes so the persisted transcript is never re-recorded from a
         // trimmed view.
         let out_policy = self.outgoing_prompt_policy(&request);
+        let original_messages = std::mem::take(messages);
         let frame = scratch.manager.for_prompt(&out_policy);
-        let prompt_replaced = messages.len() != frame.messages.len()
-            || messages
-                .iter()
-                .zip(frame.messages.iter())
-                .any(|(left, right)| !prompt_message_matches(left, right));
         *messages = frame.messages;
         if let Some(system) = runtime_system {
             // Re-apply the agent's runtime System prompt. Two cases:
@@ -4538,6 +4534,15 @@ impl PromptContextManager for AppUiPromptContextBridge {
                 _ => messages.insert(0, system),
             }
         }
+        // Compare the caller's prompt with the FINAL provider-facing frame.
+        // Comparing before the runtime System message was restored marked
+        // every ordinary AppUI dispatch as a destructive replacement and
+        // revoked read receipts before they could be activated.
+        let prompt_replaced = original_messages.len() != messages.len()
+            || original_messages
+                .iter()
+                .zip(messages.iter())
+                .any(|(left, right)| !prompt_message_matches(left, right));
         scratch.observed_messages = messages.len();
         {
             let mut canonical = self
@@ -33651,8 +33656,8 @@ async fn run_standalone_turn(
         if let Some(hooks) = session_runtime.profile.hook_executor.clone() {
             spawn_tool = spawn_tool.with_hooks(hooks);
         }
-        if let Some(cache) = session_runtime.agent.file_state_cache().cloned() {
-            spawn_tool = spawn_tool.with_parent_file_state_cache(cache);
+        if let Some(file_state) = session_runtime.agent.file_state() {
+            spawn_tool = spawn_tool.with_parent_file_state(file_state.task_state().clone());
         }
         if let Some(router) = session_runtime.agent.subagent_output_router().cloned() {
             spawn_tool = spawn_tool.with_parent_subagent_output_router(router);
@@ -34634,6 +34639,9 @@ async fn run_standalone_turn(
     // session and read an empty state. A missing/malformed file is silently
     // treated as goal-less (the peer still runs, just without goal context).
     let mut request_agent = request_agent;
+    if let Some(file_state) = session_runtime.agent.file_state() {
+        request_agent = request_agent.with_file_state(file_state.clone());
+    }
     if let Some(profile) = session_runtime.agent.profile() {
         request_agent = request_agent
             .with_profile(profile)
