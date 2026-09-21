@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use serde::Deserialize;
+use serde_json::json;
 use tracing::warn;
 
 use super::{ConcurrencyClass, Tool, ToolContext, ToolResult};
@@ -15,6 +16,7 @@ pub struct DiffEditTool {
     base_dir: PathBuf,
     filesystem_scope: FilesystemScope,
     file_access: FileAccessMode,
+    local_edit_enabled: bool,
 }
 
 impl DiffEditTool {
@@ -23,6 +25,7 @@ impl DiffEditTool {
             base_dir: base_dir.into(),
             filesystem_scope: FilesystemScope::Workspace,
             file_access: FileAccessMode::ReadWrite,
+            local_edit_enabled: false,
         }
     }
 
@@ -33,6 +36,12 @@ impl DiffEditTool {
 
     pub fn with_file_access(mut self, file_access: FileAccessMode) -> Self {
         self.file_access = file_access;
+        self
+    }
+
+    /// Enable typed no-op and final-change reporting.
+    pub fn with_local_edit_enabled(mut self, enabled: bool) -> Self {
+        self.local_edit_enabled = enabled;
         self
     }
 }
@@ -155,12 +164,18 @@ impl Tool for DiffEditTool {
             });
         }
         let hunk_count = hunks.len();
+        let local_edit_enabled =
+            self.local_edit_enabled || super::registry::local_edit_execution_enabled();
 
         let guarded = super::mutation_guard::rewrite_existing(
             ctx,
             &workspace_root,
             &path,
-            super::mutation_guard::ExpectedVersionPolicy::Optional,
+            if local_edit_enabled {
+                super::mutation_guard::ExpectedVersionPolicy::OptionalNoChange
+            } else {
+                super::mutation_guard::ExpectedVersionPolicy::Optional
+            },
             None,
             None,
             move |bytes| -> Result<_, String> {
@@ -172,19 +187,68 @@ impl Tool for DiffEditTool {
             },
         )
         .await;
-        let new_content = match guarded {
-            Ok(rewrite) => rewrite.value,
+        let guarded = match guarded {
+            Ok(rewrite) => rewrite,
             Err(error) => return Ok(error.into_tool_result(self.name(), &input.path)),
         };
+        let new_content = guarded.value;
+        if !guarded.changed {
+            let mut metadata = super::mutation_report::no_change_metadata(
+                self.name(),
+                &input.path,
+                &guarded.before,
+            );
+            super::mutation_report::insert(&mut metadata, "matcher", json!("diff_hunks"));
+            super::mutation_report::insert(&mut metadata, "hunk_count", json!(hunk_count));
+            return Ok(ToolResult {
+                output: format!(
+                    "[no_change] path={} matcher=diff_hunks hunks={} current={}",
+                    super::mutation_report::safe_path(&input.path),
+                    hunk_count,
+                    super::mutation_report::short_bytes_version(&guarded.before),
+                ),
+                success: true,
+                structured_metadata: Some(metadata),
+                ..Default::default()
+            });
+        }
 
         // #1774: opt-in post-edit formatting. Runs BEFORE cache invalidation
         // and the git snapshot so both observe the final on-disk content.
         // Best-effort by contract — a formatter failure never fails the edit.
-        let format_note = if ctx.format_after_edit {
+        let formatting = if local_edit_enabled {
+            Some(
+                super::mutation_report::FormattingRun::execute(&path, ctx.format_after_edit, true)
+                    .await,
+            )
+        } else {
+            None
+        };
+        let format_note = if !local_edit_enabled && ctx.format_after_edit {
             crate::format::post_edit_format_note(&path, &new_content).await
         } else {
             None
         };
+        let mut report = if let Some(formatting) = formatting.as_ref() {
+            Some(
+                super::mutation_report::MutationReport::collect(
+                    self.name(),
+                    &path,
+                    &workspace_root,
+                    &input.path,
+                    Some(&guarded.before),
+                    &guarded.written,
+                    formatting,
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        if let Some(report) = report.as_mut() {
+            super::mutation_report::insert(&mut report.metadata, "matcher", json!("diff_hunks"));
+            super::mutation_report::insert(&mut report.metadata, "hunk_count", json!(hunk_count));
+        }
 
         // Invalidate every recorded workspace-owned version for this path.
         super::mutation_guard::complete_mutation(ctx, &workspace_root, &path);
@@ -199,15 +263,27 @@ impl Tool for DiffEditTool {
             );
         }
 
-        Ok(ToolResult {
-            output: format!(
+        let output = if let Some(report) = report.as_ref() {
+            format!(
+                "Applied {} hunk(s) to {}: final={}, formatter={}",
+                hunk_count,
+                super::mutation_report::safe_path(&input.path),
+                report.final_label,
+                report.formatter_label,
+            )
+        } else {
+            format!(
                 "Applied {} hunk(s) to {}{}",
                 hunk_count,
                 input.path,
                 format_note.unwrap_or_default()
-            ),
+            )
+        };
+        Ok(ToolResult {
+            output,
             success: true,
             file_modified: Some(path),
+            structured_metadata: report.map(|report| report.metadata),
             ..Default::default()
         })
     }
@@ -415,6 +491,64 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tool = DiffEditTool::new(dir.path());
         assert_eq!(tool.concurrency_class(), ConcurrencyClass::Exclusive);
+    }
+
+    #[tokio::test]
+    async fn local_edit_identical_diff_is_no_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("same.txt");
+        std::fs::write(&path, "same\n").unwrap();
+        let before = std::fs::metadata(&path).unwrap();
+
+        let result = DiffEditTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .execute(&serde_json::json!({
+                "path": "same.txt",
+                "diff": "@@ -1 +1 @@\n-same\n+same\n"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{}", result.output);
+        assert!(result.file_modified.is_none());
+        let metadata = result.structured_metadata.as_ref().unwrap();
+        assert_eq!(metadata["outcome"], "no_change");
+        assert_eq!(metadata["hunk_count"], 1);
+        assert_eq!(metadata["file_modified"], false);
+        assert_eq!(
+            before.modified().unwrap(),
+            std::fs::metadata(path).unwrap().modified().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn local_edit_diff_success_reports_hunks_and_final_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file.txt"), "old\n").unwrap();
+
+        let result = DiffEditTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .execute(&serde_json::json!({
+                "path": "file.txt",
+                "diff": "@@ -1 +1 @@\n-old\n+new\n"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{}", result.output);
+        let metadata = result.structured_metadata.as_ref().unwrap();
+        assert_eq!(metadata["outcome"], "modified");
+        assert_eq!(metadata["matcher"], "diff_hunks");
+        assert_eq!(metadata["hunk_count"], 1);
+        assert_eq!(metadata["final_state"], "confirmed");
+        assert_eq!(metadata["changed_range"]["before"]["start"], 1);
+        assert_eq!(metadata["changed_range"]["after"]["count"], 1);
+        assert!(
+            metadata["diff_preview"][0]["diff"]
+                .as_str()
+                .unwrap()
+                .contains("+new")
+        );
     }
 
     #[tokio::test]

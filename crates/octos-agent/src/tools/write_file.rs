@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use serde::Deserialize;
+use serde_json::json;
 use tracing::warn;
 
 use super::write_grant::WritePathGrant;
@@ -26,6 +27,7 @@ pub struct WriteFileTool {
     /// `None` = the `OCTOS_READ_WINDOW` env flag decides (production);
     /// `Some` = explicit, for tests.
     window_enforcement: Option<bool>,
+    local_edit_enabled: bool,
 }
 
 impl WriteFileTool {
@@ -37,6 +39,7 @@ impl WriteFileTool {
             file_access: FileAccessMode::ReadWrite,
             write_grant: None,
             window_enforcement: None,
+            local_edit_enabled: false,
         }
     }
 
@@ -75,6 +78,12 @@ impl WriteFileTool {
         self.write_grant = Some(write_grant);
         self
     }
+
+    /// Enable typed no-op and final-change reporting.
+    pub fn with_local_edit_enabled(mut self, enabled: bool) -> Self {
+        self.local_edit_enabled = enabled;
+        self
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,6 +96,22 @@ struct WriteFileInput {
     #[serde(alias = "filePath")]
     path: String,
     content: String,
+}
+
+fn no_change_result(path: &str, bytes: &[u8]) -> ToolResult {
+    let mut metadata = super::mutation_report::no_change_metadata("write_file", path, bytes);
+    super::mutation_report::insert(&mut metadata, "matcher", json!("whole_file"));
+    super::mutation_report::insert(&mut metadata, "replacement_count", json!(0));
+    ToolResult {
+        output: format!(
+            "[no_change] path={} matcher=whole_file current={}",
+            octos_core::truncated_utf8(&super::mutation_report::safe_path(path), 96, "..."),
+            super::mutation_report::short_bytes_version(bytes),
+        ),
+        success: true,
+        structured_metadata: Some(metadata),
+        ..Default::default()
+    }
 }
 
 #[async_trait]
@@ -232,6 +257,9 @@ impl WriteFileTool {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
             Err(error) => return Ok(super::file_io_error(error, &input.path)),
         };
+        let local_edit_enabled =
+            self.local_edit_enabled || super::registry::local_edit_execution_enabled();
+        let mut mutation_before: Option<Vec<u8>> = None;
 
         // Observe-only (#read-paging probe): a whole-file overwrite of a path
         // that was previously read. If `read_file` were ever changed to return
@@ -436,7 +464,7 @@ impl WriteFileTool {
                 ctx.file_state_cache.is_some(),
                 authorized_epoch,
             ) {
-                (false, true, true, _) => {
+                (false, true, tracked, _) if tracked || local_edit_enabled => {
                     let opened = match super::write_grant::confined_open_existing(
                         workspace_root.clone(),
                         rel,
@@ -458,19 +486,34 @@ impl WriteFileTool {
                         }
                     };
                     let new_content = input.content.as_bytes().to_vec();
-                    if let Err(error) = super::mutation_guard::rewrite_existing(
+                    let policy = if local_edit_enabled {
+                        super::mutation_guard::ExpectedVersionPolicy::no_change(
+                            tracked,
+                            authorized_epoch,
+                        )
+                    } else {
+                        super::mutation_guard::ExpectedVersionPolicy::RequireWhenTracked
+                    };
+                    let rewrite = match super::mutation_guard::rewrite_existing(
                         ctx,
                         &workspace_root,
                         &path,
-                        super::mutation_guard::ExpectedVersionPolicy::RequireWhenTracked,
+                        policy,
                         None,
                         Some(opened),
                         move |_| Ok::<_, String>((new_content, ())),
                     )
                     .await
                     {
-                        return Ok(error.into_tool_result(self.name(), &input.path));
+                        Ok(rewrite) => rewrite,
+                        Err(error) => {
+                            return Ok(error.into_tool_result(self.name(), &input.path));
+                        }
+                    };
+                    if !rewrite.changed {
+                        return Ok(no_change_result(&input.path, &rewrite.before));
                     }
+                    mutation_before = Some(rewrite.before);
                 }
                 (false, true, false, Some(expected)) => {
                     match super::write_grant::confined_write_checked(
@@ -579,21 +622,36 @@ impl WriteFileTool {
                 ctx.file_state_cache.is_some(),
                 authorized_epoch,
             ) {
-                (true, true, _) => {
+                (true, tracked, _) if tracked || local_edit_enabled => {
                     let new_content = input.content.as_bytes().to_vec();
-                    if let Err(error) = super::mutation_guard::rewrite_existing(
+                    let policy = if local_edit_enabled {
+                        super::mutation_guard::ExpectedVersionPolicy::no_change(
+                            tracked,
+                            authorized_epoch,
+                        )
+                    } else {
+                        super::mutation_guard::ExpectedVersionPolicy::RequireWhenTracked
+                    };
+                    let rewrite = match super::mutation_guard::rewrite_existing(
                         ctx,
                         &workspace_root,
                         &path,
-                        super::mutation_guard::ExpectedVersionPolicy::RequireWhenTracked,
+                        policy,
                         None,
                         None,
                         move |_| Ok::<_, String>((new_content, ())),
                     )
                     .await
                     {
-                        return Ok(error.into_tool_result(self.name(), &input.path));
+                        Ok(rewrite) => rewrite,
+                        Err(error) => {
+                            return Ok(error.into_tool_result(self.name(), &input.path));
+                        }
+                    };
+                    if !rewrite.changed {
+                        return Ok(no_change_result(&input.path, &rewrite.before));
                     }
+                    mutation_before = Some(rewrite.before);
                 }
                 (true, false, Some(expected)) => {
                     match super::write_no_follow_checked(&path, input.content.as_bytes(), expected)
@@ -644,6 +702,7 @@ impl WriteFileTool {
                         return Ok(super::file_io_error(e, &input.path));
                     }
                 }
+                (true, true, _) => unreachable!("tracked writes use mutation_guard"),
             }
         }
 
@@ -666,11 +725,43 @@ impl WriteFileTool {
         // and the git snapshot so both observe the final on-disk content.
         // Best-effort by contract — a formatter failure never fails the write.
         // Never runs under a fence (see above).
-        let format_note = if ctx.format_after_edit && !fenced {
+        let formatting = if local_edit_enabled {
+            Some(
+                super::mutation_report::FormattingRun::execute(
+                    &path,
+                    ctx.format_after_edit,
+                    !fenced,
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        let format_note = if !local_edit_enabled && ctx.format_after_edit && !fenced {
             crate::format::post_edit_format_note(&path, &input.content).await
         } else {
             None
         };
+        let mut report = if let Some(formatting) = formatting.as_ref() {
+            Some(
+                super::mutation_report::MutationReport::collect(
+                    self.name(),
+                    &path,
+                    &workspace_root,
+                    &input.path,
+                    mutation_before.as_deref(),
+                    input.content.as_bytes(),
+                    formatting,
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        if let Some(report) = report.as_mut() {
+            super::mutation_report::insert(&mut report.metadata, "matcher", json!("whole_file"));
+            super::mutation_report::insert(&mut report.metadata, "replacement_count", json!(1));
+        }
 
         // Invalidate every recorded workspace-owned version for this path.
         // A later read establishes the new version from the bytes on disk.
@@ -699,7 +790,11 @@ impl WriteFileTool {
         // re-reads the formatted result, which is correct.
         if self.window_armed() {
             let session = ctx.parent_session_key.clone().unwrap_or_default();
-            if format_note.is_none() {
+            let final_matches_written = report
+                .as_ref()
+                .and_then(|report| report.final_matches_written)
+                .unwrap_or_else(|| format_note.is_none());
+            if final_matches_written {
                 super::read_window::note_full_write(&session, &path, input.content.len());
             } else {
                 super::read_window::forget(&session, &path);
@@ -707,15 +802,31 @@ impl WriteFileTool {
         }
 
         let line_count = input.content.lines().count();
-        Ok(ToolResult {
-            output: format!(
+        let output = if let Some(report) = report.as_ref() {
+            format!(
+                "Wrote {} lines to {}: matcher=whole_file, final={}, formatter={}",
+                line_count,
+                octos_core::truncated_utf8(
+                    &super::mutation_report::safe_path(&input.path),
+                    96,
+                    "..."
+                ),
+                report.final_label,
+                report.formatter_label,
+            )
+        } else {
+            format!(
                 "Successfully wrote {} lines to {}{}",
                 line_count,
                 octos_core::truncated_utf8(&input.path, 200, "..."),
                 format_note.unwrap_or_default()
-            ),
+            )
+        };
+        Ok(ToolResult {
+            output,
             success: true,
             file_modified: Some(path),
+            structured_metadata: report.map(|report| report.metadata),
             ..Default::default()
         })
     }
@@ -776,6 +887,136 @@ mod tests {
         assert!(result.output.contains("Successfully wrote"));
         let content = std::fs::read_to_string(dir.path().join("new.txt")).unwrap();
         assert_eq!(content, "hello world\n");
+    }
+
+    #[tokio::test]
+    async fn local_edit_existing_same_content_is_no_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = dir.path().join("sites/demo");
+        std::fs::create_dir_all(&site).unwrap();
+        let path = site.join("index.html");
+        std::fs::write(&path, "<h1>same</h1>\n").unwrap();
+        let before = std::fs::metadata(&path).unwrap();
+
+        let result = WriteFileTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .execute(&serde_json::json!({
+                "path": "sites/demo/index.html",
+                "content": "<h1>same</h1>\n"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{}", result.output);
+        assert!(result.file_modified.is_none());
+        let metadata = result.structured_metadata.as_ref().unwrap();
+        assert_eq!(metadata["outcome"], "no_change");
+        assert_eq!(metadata["matcher"], "whole_file");
+        assert_eq!(metadata["file_modified"], false);
+        assert_eq!(
+            before.modified().unwrap(),
+            std::fs::metadata(&path).unwrap().modified().unwrap()
+        );
+        assert!(!site.join(".git").exists());
+    }
+
+    #[tokio::test]
+    async fn local_edit_no_change_does_not_bypass_read_only_access() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("same.txt"), "same\n").unwrap();
+
+        let result = WriteFileTool::new(dir.path())
+            .with_file_access(FileAccessMode::ReadOnly)
+            .with_local_edit_enabled(true)
+            .execute(&serde_json::json!({"path": "same.txt", "content": "same\n"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.output.contains("read-only"));
+        assert!(result.structured_metadata.is_none());
+    }
+
+    #[tokio::test]
+    async fn local_edit_stale_version_wins_over_no_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("same.txt");
+        std::fs::write(&path, "old\n").unwrap();
+        let target =
+            crate::file_state_cache::FileTarget::for_local_workspace(dir.path(), &path).unwrap();
+        let ledger = std::sync::Arc::new(crate::file_state_cache::FileStateCache::new());
+        ledger.record(crate::file_state_cache::FileVersion::from_bytes(
+            target,
+            None,
+            b"old\n",
+            crate::file_state_cache::FileMetadataHint::from_metadata(
+                &std::fs::metadata(&path).unwrap(),
+            ),
+        ));
+        std::fs::write(&path, "same\n").unwrap();
+        let mut ctx = ToolContext::zero();
+        ctx.file_state_cache = Some(ledger);
+
+        let result = WriteFileTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({"path": "same.txt", "content": "same\n"}),
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert_eq!(
+            result.structured_metadata.as_ref().unwrap()["error_code"],
+            "stale_file_version"
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "same\n");
+    }
+
+    #[tokio::test]
+    async fn local_edit_new_empty_file_is_a_real_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.txt");
+
+        let result = WriteFileTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .execute(&serde_json::json!({"path": "empty.txt", "content": ""}))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{}", result.output);
+        assert_eq!(result.file_modified.as_deref(), Some(path.as_path()));
+        let metadata = result.structured_metadata.as_ref().unwrap();
+        assert_eq!(metadata["outcome"], "modified");
+        assert!(metadata["before_version"].is_null());
+        assert_eq!(metadata["final_version"]["size"], 0);
+        assert!(path.exists());
+    }
+
+    #[tokio::test]
+    async fn local_edit_whole_file_success_reports_final_change() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file.txt"), "old\n").unwrap();
+
+        let result = WriteFileTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .execute(&serde_json::json!({"path": "file.txt", "content": "new\n"}))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{}", result.output);
+        let metadata = result.structured_metadata.as_ref().unwrap();
+        assert_eq!(metadata["outcome"], "modified");
+        assert_eq!(metadata["matcher"], "whole_file");
+        assert_eq!(metadata["replacement_count"], 1);
+        assert_eq!(metadata["final_state"], "confirmed");
+        assert!(
+            metadata["diff_preview"][0]["diff"]
+                .as_str()
+                .unwrap()
+                .contains("+new")
+        );
     }
 
     #[tokio::test]
@@ -1245,6 +1486,28 @@ mod tests {
             "v1\n",
             "refused overwrite must leave the original bytes"
         );
+    }
+
+    #[tokio::test]
+    async fn local_edit_no_change_does_not_bypass_create_only_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("exemplar.card");
+        std::fs::write(&path, "same\n").unwrap();
+        let tool = fenced_tool(dir.path(), &["exemplar.card"], true).with_local_edit_enabled(true);
+
+        let result = tool
+            .execute(&serde_json::json!({"path": "exemplar.card", "content": "same\n"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result
+                .output
+                .contains(crate::tools::write_grant::DENIED_MARKER)
+        );
+        assert!(!result.output.contains("[no_change]"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "same\n");
     }
 
     #[tokio::test]

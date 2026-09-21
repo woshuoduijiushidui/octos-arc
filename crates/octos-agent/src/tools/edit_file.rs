@@ -410,7 +410,11 @@ impl Tool for EditFileTool {
             ctx,
             &workspace_root,
             &path,
-            super::mutation_guard::ExpectedVersionPolicy::Optional,
+            if local_edit_enabled {
+                super::mutation_guard::ExpectedVersionPolicy::OptionalNoChange
+            } else {
+                super::mutation_guard::ExpectedVersionPolicy::Optional
+            },
             None,
             opened_file,
             move |bytes| -> Result<_, super::mutation_guard::MutationTransformError> {
@@ -448,6 +452,9 @@ impl Tool for EditFileTool {
                             .into());
                     }
                 };
+                if local_edit_enabled && old_string == new_string {
+                    return Ok((bytes.to_vec(), ("identical_input", String::new())));
+                }
                 let evidence = super::replacer::find_replacement_evidence(content, &old_string);
                 let (range, replacer_name) = match evidence.outcome.clone() {
                     super::replacer::ChainOutcome::Match { range, replacer } => (range, replacer),
@@ -544,10 +551,31 @@ impl Tool for EditFileTool {
             },
         )
         .await;
-        let (replacer_name, new_content) = match guarded {
-            Ok(rewrite) => rewrite.value,
+        let guarded = match guarded {
+            Ok(rewrite) => rewrite,
             Err(error) => return Ok(error.into_tool_result(self.name(), &input.path)),
         };
+        let (replacer_name, new_content) = guarded.value;
+        if !guarded.changed {
+            let mut metadata = super::mutation_report::no_change_metadata(
+                self.name(),
+                &input.path,
+                &guarded.before,
+            );
+            super::mutation_report::insert(&mut metadata, "matcher", json!(replacer_name));
+            super::mutation_report::insert(&mut metadata, "replacement_count", json!(0));
+            return Ok(ToolResult {
+                output: format!(
+                    "[no_change] path={} matcher={} current={}",
+                    displayed_path(&input.path),
+                    replacer_name,
+                    super::mutation_report::short_bytes_version(&guarded.before),
+                ),
+                success: true,
+                structured_metadata: Some(metadata),
+                ..Default::default()
+            });
+        }
 
         if replacer_name != "exact" {
             tracing::info!(
@@ -573,11 +601,43 @@ impl Tool for EditFileTool {
         // and the git snapshot so both observe the final on-disk content.
         // Best-effort by contract — a formatter failure never fails the edit.
         // Never runs under a fence (see above).
-        let format_note = if ctx.format_after_edit && !fence_active {
+        let formatting = if local_edit_enabled {
+            Some(
+                super::mutation_report::FormattingRun::execute(
+                    &path,
+                    ctx.format_after_edit,
+                    !fence_active,
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        let format_note = if !local_edit_enabled && ctx.format_after_edit && !fence_active {
             crate::format::post_edit_format_note(&path, &new_content).await
         } else {
             None
         };
+        let mut report = if let Some(formatting) = formatting.as_ref() {
+            Some(
+                super::mutation_report::MutationReport::collect(
+                    self.name(),
+                    &path,
+                    &workspace_root,
+                    &input.path,
+                    Some(&guarded.before),
+                    &guarded.written,
+                    formatting,
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        if let Some(report) = report.as_mut() {
+            super::mutation_report::insert(&mut report.metadata, "matcher", json!(replacer_name));
+            super::mutation_report::insert(&mut report.metadata, "replacement_count", json!(1));
+        }
 
         // Invalidate every recorded workspace-owned version for this path.
         super::mutation_guard::complete_mutation(ctx, &workspace_root, &path);
@@ -596,7 +656,15 @@ impl Tool for EditFileTool {
 
         // Report which replacer produced the match. The exact-match wording
         // is kept identical to the historical output for compatibility.
-        let output = if replacer_name == "exact" {
+        let output = if let Some(report) = report.as_ref() {
+            format!(
+                "Edited {}: matcher={}, replacements=1, final={}, formatter={}",
+                displayed_path(&input.path),
+                replacer_name,
+                report.final_label,
+                report.formatter_label,
+            )
+        } else if replacer_name == "exact" {
             format!("Successfully edited {}", input.path)
         } else {
             format!(
@@ -609,6 +677,7 @@ impl Tool for EditFileTool {
             output: format!("{output}{}", format_note.unwrap_or_default()),
             success: true,
             file_modified: Some(path),
+            structured_metadata: report.map(|report| report.metadata),
             ..Default::default()
         })
     }
@@ -617,6 +686,7 @@ impl Tool for EditFileTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn edit_file_tool_is_exclusive() {
@@ -1014,7 +1084,6 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use octos_core::SessionScope;
-    use std::sync::Arc;
 
     fn ctx_with_scope(scope: SessionScope) -> ToolContext {
         let mut ctx = ToolContext::zero();
@@ -1642,6 +1711,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_edit_no_change_has_no_write_or_post_processors() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = dir.path().join("sites/demo");
+        std::fs::create_dir_all(&site).unwrap();
+        let path = site.join("index.html");
+        std::fs::write(&path, "<h1>same</h1>\n").unwrap();
+        let before = std::fs::metadata(&path).unwrap();
+        let target =
+            crate::file_state_cache::FileTarget::for_local_workspace(dir.path(), &path).unwrap();
+        let ledger = Arc::new(crate::file_state_cache::FileStateCache::new());
+        let version = crate::file_state_cache::FileVersion::from_bytes(
+            target.clone(),
+            None,
+            b"<h1>same</h1>\n",
+            crate::file_state_cache::FileMetadataHint::from_metadata(&before),
+        );
+        ledger.record(version.clone());
+        let receipts = Arc::new(
+            crate::model_read_receipts::ModelReadReceiptStore::for_owner(
+                crate::model_read_receipts::ReadReceiptOwner::new(
+                    target.workspace_id(),
+                    "task",
+                    "session",
+                    "branch",
+                )
+                .unwrap(),
+            ),
+        );
+        let read_args = serde_json::json!({"path": "sites/demo/index.html"});
+        receipts.stage(
+            "call_read",
+            &read_args,
+            version,
+            crate::model_read_receipts::FileView::Full,
+            crate::model_read_receipts::FileView::Full,
+            "visible",
+        );
+        let mut assistant = octos_core::Message::assistant("");
+        assistant.tool_calls = Some(vec![octos_core::ToolCall {
+            id: "call_read".into(),
+            name: "read_file".into(),
+            arguments: read_args,
+            metadata: None,
+        }]);
+        let tool_output = octos_core::Message {
+            role: octos_core::MessageRole::Tool,
+            content: "visible".into(),
+            media: Vec::new(),
+            tool_calls: None,
+            tool_call_id: Some("call_read".into()),
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        };
+        let pending = receipts.prepare_dispatch(&[assistant, tool_output], "policy-v1");
+        receipts.activate(pending);
+        assert_eq!(receipts.active_len(), 1);
+        let mut ctx = ToolContext::zero();
+        ctx.file_state_cache = Some(ledger.clone());
+        ctx.model_read_receipts = Some(receipts.clone());
+        ctx.format_after_edit = true;
+
+        let result = EditFileTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "path": "sites/demo/index.html",
+                    "old_string": "same",
+                    "new_string": "same"
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "{}", result.output);
+        assert!(result.file_modified.is_none());
+        let metadata = result.structured_metadata.as_ref().unwrap();
+        assert_eq!(metadata["outcome"], "no_change");
+        assert_eq!(metadata["file_modified"], false);
+        assert_eq!(metadata["formatter"]["status"], "not_run");
+        assert!(ledger.peek(&target).is_some());
+        assert_eq!(receipts.active_len(), 1);
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+        assert!(!site.join(".git").exists());
+    }
+
+    #[tokio::test]
+    async fn local_edit_identical_arguments_are_no_change_without_matching() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        std::fs::write(&path, "current\n").unwrap();
+
+        let result = EditFileTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .execute(&serde_json::json!({
+                "path": "file.txt",
+                "old_string": "absent",
+                "new_string": "absent"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{}", result.output);
+        assert!(result.file_modified.is_none());
+        let metadata = result.structured_metadata.as_ref().unwrap();
+        assert_eq!(metadata["outcome"], "no_change");
+        assert_eq!(metadata["matcher"], "identical_input");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "current\n");
+    }
+
+    #[tokio::test]
+    async fn local_edit_success_reports_final_actual_change() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("s.txt"), "hello world\n").unwrap();
+
+        let result = EditFileTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .execute(&serde_json::json!({
+                "path": "s.txt",
+                "old_string": "hello",
+                "new_string": "goodbye"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{}", result.output);
+        assert!(result.file_modified.is_some());
+        let metadata = result.structured_metadata.as_ref().unwrap();
+        assert_eq!(metadata["outcome"], "modified");
+        assert_eq!(metadata["matcher"], "exact");
+        assert_eq!(metadata["replacement_count"], 1);
+        assert_eq!(metadata["final_state"], "confirmed");
+        assert!(metadata["before_version"].is_object());
+        assert!(metadata["write_version"].is_object());
+        assert!(metadata["final_version"].is_object());
+        assert_eq!(metadata["changed_range"]["before"]["start"], 1);
+        assert_eq!(metadata["changed_range"]["before"]["count"], 1);
+        assert_eq!(metadata["changed_range"]["after"]["count"], 1);
+        assert_eq!(metadata["formatter"]["status"], "disabled");
+        assert_eq!(metadata["diff_preview"][0]["op"], "update");
+        assert!(
+            metadata["diff_preview"][0]["diff"]
+                .as_str()
+                .unwrap()
+                .contains("goodbye")
+        );
+        assert!(result.output.contains("final=sha256:"));
+    }
+
+    #[tokio::test]
     async fn should_splice_fuzzy_match_at_located_span_not_first_substring() {
         // The fuzzy-matched span's exact text ("    a();\n    b();") ALSO
         // occurs earlier in the file, but mid-line (inside a string-ish
@@ -1904,6 +2126,87 @@ mod tests {
         assert!(
             on_disk.contains("let x = 2;"),
             "edit must survive: {on_disk}"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_edit_formatter_metadata_uses_final_disk_content() {
+        if !crate::format::binary_on_path("rustfmt") {
+            eprintln!("skipping: rustfmt not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("code.rs");
+        std::fs::write(&path, "fn main(){let x=1;println!(\"{}\",x);}\n").unwrap();
+        let mut ctx = ToolContext::zero();
+        ctx.format_after_edit = true;
+
+        let result = EditFileTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "path": "code.rs",
+                    "old_string": "let x=1",
+                    "new_string": "let x=2",
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "{}", result.output);
+        let metadata = result.structured_metadata.as_ref().unwrap();
+        let status = metadata["formatter"]["status"].as_str().unwrap();
+        if status == "timed_out" {
+            eprintln!("skipping final formatter assertions: rustfmt timed out");
+            return;
+        }
+        assert_eq!(status, "formatted");
+        assert_eq!(metadata["formatter"]["changed"], true);
+        assert_eq!(metadata["formatter_expanded_change"], true);
+        assert_ne!(metadata["write_version"], metadata["final_version"]);
+        let on_disk = std::fs::read(&path).unwrap();
+        assert_eq!(
+            metadata["final_version"]["content_sha256"],
+            crate::file_state_cache::FileVersion::sha256(&on_disk)
+        );
+        assert!(result.output.contains("formatter=formatted"));
+    }
+
+    #[tokio::test]
+    async fn local_edit_formatter_failure_keeps_modified_result() {
+        if !crate::format::binary_on_path("rustfmt") {
+            eprintln!("skipping: rustfmt not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broken.rs");
+        std::fs::write(&path, "fn main( { let a=1 \n").unwrap();
+        let mut ctx = ToolContext::zero();
+        ctx.format_after_edit = true;
+
+        let result = EditFileTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "path": "broken.rs",
+                    "old_string": "let a=1",
+                    "new_string": "let a=2",
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "{}", result.output);
+        assert_eq!(result.file_modified.as_deref(), Some(path.as_path()));
+        let metadata = result.structured_metadata.as_ref().unwrap();
+        let status = metadata["formatter"]["status"].as_str().unwrap();
+        assert!(matches!(status, "failed" | "timed_out"));
+        assert_eq!(metadata["final_state"], "confirmed");
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "fn main( { let a=2 \n"
         );
     }
 

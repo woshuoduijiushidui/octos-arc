@@ -22,11 +22,63 @@ pub(crate) enum ExpectedVersionPolicy {
     RequireWhenTracked,
     /// Current patch context can authorize the edit when no version exists.
     Optional,
+    /// [`Optional`] plus byte-identical candidates return without writing.
+    OptionalNoChange,
+    /// [`RequireWhenTracked`] plus byte-identical candidates return without writing.
+    RequireWhenTrackedNoChange,
+    /// [`OptionalNoChange`] bound to an independently authorized descriptor epoch.
+    OptionalNoChangeAtEpoch(super::read_window::ViewEpoch),
+    /// [`RequireWhenTrackedNoChange`] bound to an authorized descriptor epoch.
+    RequireWhenTrackedNoChangeAtEpoch(super::read_window::ViewEpoch),
+}
+
+impl ExpectedVersionPolicy {
+    pub(crate) fn no_change(
+        require_when_tracked: bool,
+        expected_epoch: Option<super::read_window::ViewEpoch>,
+    ) -> Self {
+        match (require_when_tracked, expected_epoch) {
+            (false, None) => Self::OptionalNoChange,
+            (true, None) => Self::RequireWhenTrackedNoChange,
+            (false, Some(epoch)) => Self::OptionalNoChangeAtEpoch(epoch),
+            (true, Some(epoch)) => Self::RequireWhenTrackedNoChangeAtEpoch(epoch),
+        }
+    }
+
+    fn require_when_tracked(self) -> bool {
+        matches!(
+            self,
+            Self::RequireWhenTracked
+                | Self::RequireWhenTrackedNoChange
+                | Self::RequireWhenTrackedNoChangeAtEpoch(_)
+        )
+    }
+
+    fn detect_no_change(self) -> bool {
+        matches!(
+            self,
+            Self::OptionalNoChange
+                | Self::RequireWhenTrackedNoChange
+                | Self::OptionalNoChangeAtEpoch(_)
+                | Self::RequireWhenTrackedNoChangeAtEpoch(_)
+        )
+    }
+
+    fn expected_epoch(self) -> Option<super::read_window::ViewEpoch> {
+        match self {
+            Self::OptionalNoChangeAtEpoch(epoch)
+            | Self::RequireWhenTrackedNoChangeAtEpoch(epoch) => Some(epoch),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug)]
 pub(crate) struct GuardedRewrite<T> {
     pub value: T,
+    pub before: Vec<u8>,
+    pub written: Vec<u8>,
+    pub changed: bool,
 }
 
 #[derive(Debug)]
@@ -235,14 +287,15 @@ impl MutationAuthorization {
                 claim: Some(claim),
                 ledger: Some(ledger),
                 blocked_reason: None,
-                enforce_expected: matches!(policy, ExpectedVersionPolicy::RequireWhenTracked),
+                enforce_expected: policy.require_when_tracked(),
             }),
             Err(MutationClaimError::MissingExpectedVersion) => Ok(Self {
                 target,
                 expected: None,
                 claim: None,
                 ledger: Some(ledger),
-                blocked_reason: matches!(policy, ExpectedVersionPolicy::RequireWhenTracked)
+                blocked_reason: policy
+                    .require_when_tracked()
                     .then_some("missing_expected_version"),
                 enforce_expected: false,
             }),
@@ -389,6 +442,8 @@ where
     let expected = authorization.expected.clone();
     let blocked_reason = authorization.blocked_reason;
     let enforce_expected = authorization.enforce_expected;
+    let detect_no_change = policy.detect_no_change();
+    let expected_epoch = policy.expected_epoch();
     let path = path.to_path_buf();
     let workspace_root = workspace_root.to_path_buf();
     let lock = target_lock(&workspace_root, &path);
@@ -411,6 +466,18 @@ where
                     return Err(RewriteFailure::IoBeforeWrite(error));
                 }
             };
+            if let Some(expected_epoch) = expected_epoch {
+                let found_epoch = file
+                    .metadata()
+                    .ok()
+                    .and_then(|metadata| super::read_window::ViewEpoch::from_metadata(&metadata));
+                if found_epoch != Some(expected_epoch) {
+                    return Ok(RewriteOutcome::Stale {
+                        reason: "version_mismatch",
+                        current: Some(Box::new(current)),
+                    });
+                }
+            }
             if let Some(reason) = blocked_reason {
                 return Ok(RewriteOutcome::Stale {
                     reason,
@@ -475,6 +542,9 @@ where
                     current: Some(Box::new(before_write)),
                 });
             }
+            if detect_no_change && new_bytes == bytes {
+                return Ok(RewriteOutcome::Unchanged { value, bytes });
+            }
 
             file.seek(SeekFrom::Start(0))
                 .map_err(RewriteFailure::IoBeforeWrite)?;
@@ -483,23 +553,56 @@ where
                 .map_err(RewriteFailure::IoAfterWrite)?;
             file.flush().map_err(RewriteFailure::IoAfterWrite)?;
             if !descriptor_still_at_path(&file, &path) {
-                let current = observe_path_once(&path, &workspace_root)
-                    .ok()
-                    .map(|(_, version)| Box::new(version));
-                return Ok(RewriteOutcome::Stale {
-                    reason: "target_replaced",
-                    current,
-                });
+                return Err(RewriteFailure::IoAfterWrite(std::io::Error::other(
+                    "target changed after write",
+                )));
             }
-            Ok(RewriteOutcome::Written(value))
+            let (written, _) =
+                read_current(&mut file, &path, &workspace_root).map_err(|error| {
+                    let error = match error {
+                        ObservationError::Concurrent => {
+                            std::io::Error::other("file changed while verifying completed write")
+                        }
+                        ObservationError::Io(error) => error,
+                    };
+                    RewriteFailure::IoAfterWrite(error)
+                })?;
+            if written != new_bytes {
+                return Err(RewriteFailure::IoAfterWrite(std::io::Error::other(
+                    "completed write could not be verified",
+                )));
+            }
+            Ok(RewriteOutcome::Written {
+                value,
+                before: bytes,
+                written,
+            })
         })
         .await
         .unwrap_or_else(|error| Err(RewriteFailure::IoBeforeWrite(std::io::Error::other(error))));
 
     match outcome {
-        Ok(RewriteOutcome::Written(value)) => {
+        Ok(RewriteOutcome::Written {
+            value,
+            before,
+            written,
+        }) => {
             authorization.success(ctx);
-            Ok(GuardedRewrite { value })
+            Ok(GuardedRewrite {
+                value,
+                before,
+                written,
+                changed: true,
+            })
+        }
+        Ok(RewriteOutcome::Unchanged { value, bytes }) => {
+            drop(authorization);
+            Ok(GuardedRewrite {
+                value,
+                before: bytes.clone(),
+                written: bytes,
+                changed: false,
+            })
         }
         Ok(RewriteOutcome::Stale { reason, current }) => {
             Err(authorization.stale(reason, current.as_deref()))
@@ -707,7 +810,15 @@ pub(crate) async fn remove_existing(
 }
 
 enum RewriteOutcome<T> {
-    Written(T),
+    Written {
+        value: T,
+        before: Vec<u8>,
+        written: Vec<u8>,
+    },
+    Unchanged {
+        value: T,
+        bytes: Vec<u8>,
+    },
     Stale {
         reason: &'static str,
         current: Option<Box<FileVersion>>,
@@ -852,6 +963,74 @@ fn descriptor_still_at_path(file: &File, path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn no_change_policy_returns_without_touching_the_file() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join("target.txt");
+        std::fs::write(&path, "same\n").unwrap();
+        let before = std::fs::metadata(&path).unwrap();
+
+        let rewrite = rewrite_existing(
+            &ToolContext::zero(),
+            workspace.path(),
+            &path,
+            ExpectedVersionPolicy::OptionalNoChange,
+            None,
+            None,
+            move |_| Ok::<_, String>((b"same\n".to_vec(), ())),
+        )
+        .await
+        .unwrap();
+
+        assert!(!rewrite.changed);
+        assert_eq!(rewrite.before, b"same\n");
+        assert_eq!(rewrite.written, b"same\n");
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(before.len(), after.len());
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(before.ino(), after.ino());
+            assert_eq!(before.ctime(), after.ctime());
+            assert_eq!(before.ctime_nsec(), after.ctime_nsec());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn no_change_policy_still_checks_the_authorized_epoch() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join("target.txt");
+        let replacement = workspace.path().join("replacement.txt");
+        std::fs::write(&path, "same\n").unwrap();
+        let expected_epoch =
+            super::super::read_window::ViewEpoch::from_metadata(&std::fs::metadata(&path).unwrap())
+                .unwrap();
+        std::fs::write(&replacement, "same\n").unwrap();
+        std::fs::rename(replacement, &path).unwrap();
+
+        let error = rewrite_existing(
+            &ToolContext::zero(),
+            workspace.path(),
+            &path,
+            ExpectedVersionPolicy::OptionalNoChangeAtEpoch(expected_epoch),
+            None,
+            None,
+            move |_| Ok::<_, String>((b"same\n".to_vec(), ())),
+        )
+        .await
+        .expect_err("a replacement inode must invalidate the authorized view");
+        let result = error.into_tool_result("write_file", "target.txt");
+
+        assert!(!result.success);
+        assert_eq!(
+            result.structured_metadata.as_ref().unwrap()["error_code"],
+            json!("stale_file_version")
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "same\n");
+    }
 
     #[cfg(unix)]
     #[tokio::test]

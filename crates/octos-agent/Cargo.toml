@@ -79,7 +79,7 @@ flate2 = { workspace = true }
 tar = { workspace = true }
 libc = { workspace = true }
 gix = { workspace = true, optional = true }
-similar = { workspace = true, optional = true }
+similar = { workspace = true }
 tree-sitter = { workspace = true, optional = true }
 tree-sitter-rust = { workspace = true, optional = true }
 tree-sitter-python = { workspace = true, optional = true }
@@ -125,7 +125,7 @@ rustix = { workspace = true }
 # pre-existing HTTP-only `web_search` behaviour byte-for-byte.
 default = ["browser"]
 browser = []
-git = ["dep:gix", "dep:similar"]
+git = ["dep:gix"]
 ast = ["dep:tree-sitter", "dep:tree-sitter-rust", "dep:tree-sitter-python", "dep:tree-sitter-javascript", "dep:tree-sitter-typescript"]
 # Enable MP3 decoding for the `AudioNonSilent` workspace-policy validator.
 # WAV decoding is always-on via `hound`; MP3 pulls in `symphonia` which is
