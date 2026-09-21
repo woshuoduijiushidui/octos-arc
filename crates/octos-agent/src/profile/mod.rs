@@ -803,6 +803,9 @@ mod tests {
         // assertion proves the lean profile keeps it (#2133 softened: spawn
         // stays in the default surface).
         tools.register(StubTool { name: "spawn" });
+        // Output recovery is session-scoped and registered after the builtin
+        // registry is cloned, so use a stub to pin the profile allow-list.
+        tools.register(StubTool { name: "recall" });
 
         let coding = ProfileDefinition::builtin("coding").expect("coding");
         coding.apply_to_registry(&mut tools);
@@ -824,6 +827,7 @@ mod tests {
             "glob",
             "grep",
             "list_dir",
+            "recall",
             "spawn",
             "check",
             "update_plan",

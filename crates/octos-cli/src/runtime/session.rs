@@ -330,6 +330,26 @@ impl SessionRuntime {
             )
         })?;
 
+        // Resolve and create the durable session root before output recovery is
+        // wired. OutputStore opens beneath this root and requires it to exist;
+        // using the same root as the transcript keeps cwd-scoped AppUI sessions
+        // self-contained and makes a cold SessionRuntime rebuild deterministic.
+        let sessions_root = resolve_sessions_root(
+            profile,
+            &workspace_root,
+            had_workspace_hint,
+            sessions_in_cwd,
+        );
+        std::fs::create_dir_all(&sessions_root).wrap_err_with(|| {
+            format!(
+                "create session storage root failed: {}",
+                sessions_root.display()
+            )
+        })?;
+        if sessions_root != profile.data_dir {
+            ensure_session_store_gitignore(&sessions_root);
+        }
+
         // Step 4: clone the profile tool registry and ACTUALLY rebind
         // it to this session's workspace. `set_workspace_root` only
         // updates registry metadata; `rebind_cwd` re-registers every
@@ -354,6 +374,16 @@ impl SessionRuntime {
             create_sandbox(&sandbox),
             permissions,
         );
+        let output_policy = octos_agent::output_recovery::OutputPolicy::from_env();
+        if output_policy.enabled {
+            // Register before every narrowing pass below. A profile/global
+            // policy or the stdio explicit allow-list can therefore remove
+            // recall exactly like any other tool; recovery storage is enabled
+            // only after final visibility is known.
+            tools.register(octos_agent::tools::RecallTool::for_output_recovery(
+                output_policy,
+            ));
+        }
         // The stdio/solo transport (ARC harness) may narrow the session's tools
         // further than the built-in coding set; the CWD rebind above re-created
         // sandbox-bound tools, so the allow-list is applied here as well.
@@ -400,6 +430,7 @@ impl SessionRuntime {
         // enabled tool is emitted every turn, so there is no per-session
         // meta-tool to re-register or wire.
         profile.apply_tool_envelope(&mut tools);
+        let output_recovery_visible = tools.is_tool_visible("recall");
         let tools = Arc::new(tools);
 
         // Step 5: build the per-session Agent. This is the only
@@ -440,6 +471,10 @@ impl SessionRuntime {
                 None
             }
         };
+        let output_owner = file_state
+            .as_ref()
+            .and_then(|state| state.receipts().owner())
+            .cloned();
 
         // SessionScope construction (#1377 Phase-3-B reconciliation).
         //
@@ -621,6 +656,22 @@ impl SessionRuntime {
         if let Some(file_state) = file_state {
             agent = agent.with_file_state(file_state);
         }
+        if let Some(owner) = output_owner {
+            let output_state = Arc::new(octos_agent::output_recovery::OutputState::new(
+                output_policy,
+                owner,
+            ));
+            if output_recovery_visible && let Err(error) = output_state.enable_store(&sessions_root)
+            {
+                tracing::warn!(
+                    session = %session_key,
+                    root = %sessions_root.display(),
+                    error = %error,
+                    "tool output recovery unavailable",
+                );
+            }
+            agent = agent.with_output_state(output_state);
+        }
 
         if let Some(coding_profile) = profile.agent_profile.clone() {
             let definitions = Arc::new(octos_agent::agents::AgentDefinitions::load_dir(
@@ -730,18 +781,6 @@ impl SessionRuntime {
         // session has explicitly opted in. Sidecars that build their path
         // from `sessions.data_dir()` (reasoning-effort, task ledger) follow to
         // the same root by construction.
-        let sessions_root = resolve_sessions_root(
-            profile,
-            &workspace_root,
-            had_workspace_hint,
-            sessions_in_cwd,
-        );
-        // Keep a project-local `.gitignore` under a freshly-created
-        // `<cwd>/.octos` so transcripts never leak into the user's repo. No-op
-        // for the profile-data-dir root (not a project working tree).
-        if sessions_root != profile.data_dir {
-            ensure_session_store_gitignore(&sessions_root);
-        }
         let sessions = Arc::new(tokio::sync::Mutex::new(
             SessionManager::open(&sessions_root).wrap_err("failed to open session manager")?,
         ));
@@ -2053,6 +2092,36 @@ tools = ["read_file"]
             request_state.receipts().owner(),
             runtime_state.receipts().owner()
         );
+    }
+
+    #[tokio::test]
+    async fn ui_protocol_ws_turn_agent_reuses_session_output_state() {
+        let tmp = TempDir::new().unwrap();
+        let profile = make_profile(tmp.path().join("profile-data")).await;
+        let session_key = SessionKey("web-1779000000000-output-state".to_string());
+        let rt = SessionRuntime::bootstrap(&profile, session_key.clone(), None)
+            .await
+            .expect("bootstrap session runtime");
+        let runtime_output_state = rt.agent.output_state().clone();
+
+        let request_agent = Agent::new_shared(
+            AgentId::new("ui-protocol-output-state-test"),
+            profile.llm.clone(),
+            Arc::new(rt.tools.snapshot_excluding(&[])),
+            profile.memory.clone(),
+        )
+        .with_file_state(rt.agent.file_state().expect("runtime file state").clone())
+        .with_output_state(runtime_output_state.clone());
+
+        assert!(
+            Arc::ptr_eq(request_agent.output_state(), &runtime_output_state),
+            "every turn must reuse the cached session OutputState"
+        );
+        assert_eq!(
+            request_agent.output_state().owner.logical_session_id(),
+            session_key.to_string()
+        );
+        assert_eq!(request_agent.output_state().owner.model_branch_id(), "root");
     }
 
     /// #1377 Phase-3-B (formerly the Phase-3-A round-4 skip-pin): when a

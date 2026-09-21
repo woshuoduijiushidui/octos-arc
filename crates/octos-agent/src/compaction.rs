@@ -486,8 +486,92 @@ pub struct ToolResultPlaceholder {
     /// Byte length of the original tool output, preserved for diagnostics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_byte_len: Option<u64>,
+    /// Typed arguments that identify the saved output without re-executing
+    /// the original tool. Present only when the original output view declared
+    /// recovery available to the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<ToolResultRecovery>,
+    /// Typed reason recovery was unavailable in the original output view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_error: Option<String>,
     /// Free-form reason string (e.g. `"pruned_after_turns"`).
     pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolResultRecovery {
+    pub output_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<crate::output_recovery::OutputStream>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u64>,
+}
+
+pub(crate) fn tool_result_recovery(tool_name: &str, content: &str) -> Option<ToolResultRecovery> {
+    if !crate::output_recovery::OutputState::supports(tool_name) {
+        return None;
+    }
+    let header: serde_json::Value =
+        serde_json::from_str(content.lines().next().unwrap_or_default()).ok()?;
+    if header
+        .get("recoverable")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return None;
+    }
+    let recall = header.get("recall")?.as_object()?;
+    let header_output_id = header.get("output_id")?.as_str()?;
+    let output_id = recall
+        .get("output_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(header_output_id);
+    if output_id != header_output_id
+        || !uuid::Uuid::parse_str(output_id).is_ok_and(|parsed| {
+            parsed.to_string() == output_id || parsed.simple().to_string() == output_id
+        })
+    {
+        return None;
+    }
+    let output_id = output_id.to_owned();
+    let cursor = recall
+        .get("cursor")
+        .and_then(serde_json::Value::as_str)
+        .filter(|cursor| cursor.len() <= 2048)
+        .map(str::to_owned);
+    let stream = match recall.get("stream") {
+        Some(value) => Some(serde_json::from_value(value.clone()).ok()?),
+        None => None,
+    };
+    let offset = recall.get("offset").and_then(serde_json::Value::as_u64);
+    Some(ToolResultRecovery {
+        output_id,
+        cursor,
+        stream,
+        offset,
+    })
+}
+
+pub(crate) fn tool_result_recovery_error(tool_name: &str, content: &str) -> Option<String> {
+    if !crate::output_recovery::OutputState::supports(tool_name) {
+        return None;
+    }
+    let header: serde_json::Value =
+        serde_json::from_str(content.lines().next().unwrap_or_default()).ok()?;
+    (header
+        .get("recoverable")
+        .and_then(serde_json::Value::as_bool)
+        == Some(false))
+    .then(|| {
+        header
+            .get("recovery_error")
+            .and_then(serde_json::Value::as_str)
+            .filter(|error| *error == "recovery_tool_unavailable")
+            .map(str::to_owned)
+    })
+    .flatten()
 }
 
 #[derive(Debug)]
@@ -515,7 +599,7 @@ impl ToolResultPlaceholder {
     /// Serialize into a marker-prefixed JSON string suitable for storage in a
     /// `Message.content` field.
     pub fn to_placeholder_content(&self) -> String {
-        let envelope = serde_json::json!({
+        let mut envelope = serde_json::json!({
             "schema": TOOL_RESULT_PLACEHOLDER_SCHEMA_V1,
             "schema_version": self.schema_version,
             "tool_name": self.tool_name,
@@ -523,12 +607,13 @@ impl ToolResultPlaceholder {
             "turn_id": self.turn_id,
             "original_byte_len": self.original_byte_len,
             "reason": self.reason,
-            // #2131: the placeholder already carries `tool_call_id`, and the
-            // `recall` tool's description tells the model to restore an evicted
-            // output by exactly that id — so no in-placeholder call hint is
-            // needed. Emitting one here would also mislead the chat/acp/mcp
-            // paths, which build placeholders but register no recall tool.
         });
+        if let Some(recovery) = &self.recovery {
+            envelope["recovery"] = serde_json::json!(recovery);
+        }
+        if let Some(error) = &self.recovery_error {
+            envelope["recovery_error"] = serde_json::json!(error);
+        }
         format!(
             "{}{}",
             TOOL_RESULT_PLACEHOLDER_PREFIX,
@@ -904,12 +989,16 @@ impl CompactionRunner {
                 .get(&tool_id)
                 .cloned()
                 .unwrap_or_else(|| ("unknown_tool".to_string(), 0));
+            let recovery = tool_result_recovery(&tool_name, &msg.content);
+            let recovery_error = tool_result_recovery_error(&tool_name, &msg.content);
             let placeholder = ToolResultPlaceholder {
                 schema_version: TOOL_RESULT_PLACEHOLDER_SCHEMA_VERSION,
                 tool_name,
                 tool_call_id: tool_id,
                 turn_id: Some(turn_id),
                 original_byte_len: Some(msg.content.len() as u64),
+                recovery,
+                recovery_error,
                 reason: "pruned_after_turns".to_string(),
             };
             msg.content = placeholder.to_placeholder_content();
@@ -2014,6 +2103,13 @@ mod tests {
             tool_call_id: "id1".into(),
             turn_id: Some(2),
             original_byte_len: Some(1234),
+            recovery: Some(ToolResultRecovery {
+                output_id: "0199ca4d-f14a-7c40-9000-000000000001".into(),
+                cursor: Some("cursor".into()),
+                stream: None,
+                offset: None,
+            }),
+            recovery_error: None,
             reason: "pruned_after_turns".into(),
         };
         let content = p.to_placeholder_content();
@@ -2022,6 +2118,116 @@ mod tests {
         assert!(content.contains("id1"), "{content}");
         let parsed = ToolResultPlaceholder::from_placeholder_content(&content).unwrap();
         assert_eq!(parsed, p);
+    }
+
+    #[test]
+    fn tool_result_placeholder_preserves_typed_recovery_arguments_only_when_available() {
+        let output_id = "0199ca4d-f14a-7c40-9000-000000000002";
+        let available = format!(
+            "{{\"output_id\":\"{output_id}\",\"recoverable\":true,\"recall\":\
+             {{\"output_id\":\"{output_id}\",\"stream\":\"stdout\",\"offset\":8192}}}}\nbody"
+        );
+        assert_eq!(
+            tool_result_recovery("shell", &available),
+            Some(ToolResultRecovery {
+                output_id: output_id.into(),
+                cursor: None,
+                stream: Some(crate::output_recovery::OutputStream::Stdout),
+                offset: Some(8192),
+            })
+        );
+
+        let unavailable = format!(
+            "{{\"output_id\":\"{output_id}\",\"recoverable\":false,\
+             \"recovery_error\":\"recovery_tool_unavailable\"}}\nbody"
+        );
+        assert_eq!(tool_result_recovery("shell", &unavailable), None);
+        assert_eq!(
+            tool_result_recovery_error("shell", &unavailable).as_deref(),
+            Some("recovery_tool_unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn compacted_placeholder_recovery_arguments_restore_saved_output() {
+        use crate::model_read_receipts::ReadReceiptOwner;
+        use crate::output_recovery::{
+            ExecutionStatus, OutputDocument, OutputPart, OutputPolicy, OutputSource, OutputState,
+            OutputStream, PAGE_BYTES,
+        };
+        use crate::tools::{RecallTool, Tool, ToolContext};
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(OutputState::new(
+            OutputPolicy { enabled: true },
+            ReadReceiptOwner::new("workspace", "task", "session", "root").unwrap(),
+        ));
+        state.enable_store(dir.path()).unwrap();
+        let output_id = uuid::Uuid::new_v4().to_string();
+        let call_id = "source-call";
+        let prefix = "ordinary line\n".repeat(700);
+        let body = format!("{prefix}COMPACTED_RECOVERY_SENTINEL\n");
+        let rendered = state
+            .register(
+                output_id,
+                call_id,
+                &serde_json::json!({"path": "large.txt"}),
+                OutputDocument {
+                    source: OutputSource::File {
+                        target: "large.txt".into(),
+                        sha256: crate::output_recovery::digest(body.as_bytes()),
+                    },
+                    parts: vec![OutputPart {
+                        stream: OutputStream::File,
+                        text: body,
+                        start: 0,
+                        first_line: Some(1),
+                        total: Some((prefix.len() + "COMPACTED_RECOVERY_SENTINEL\n".len()) as u64),
+                    }],
+                    capture: crate::output_recovery::CaptureState::Complete,
+                    execution: ExecutionStatus::NotApplicable,
+                    transformed: false,
+                    loss_reason: None,
+                    file_read: None,
+                },
+                true,
+                PAGE_BYTES,
+            )
+            .unwrap();
+
+        let mut messages = vec![
+            user_msg("old turn"),
+            assistant_tool_call("read_file", call_id),
+            tool_result(call_id, &rendered.content),
+            user_msg("new turn"),
+        ];
+        CompactionRunner::new(CompactionPolicy {
+            prune_tool_results_after_turns: Some(1),
+            ..Default::default()
+        })
+        .prune_tool_results(&mut messages);
+        let placeholder = ToolResultPlaceholder::from_placeholder_content(&messages[2].content)
+            .expect("typed placeholder");
+        let recovery = placeholder.recovery.expect("recovery arguments");
+        let args = if let Some(cursor) = recovery.cursor {
+            serde_json::json!({"cursor": cursor})
+        } else {
+            serde_json::json!({
+                "output_id": recovery.output_id,
+                "stream": recovery.stream.unwrap_or(OutputStream::File),
+                "offset": recovery.offset.unwrap_or(0),
+            })
+        };
+        let mut ctx = ToolContext::zero();
+        ctx.tool_id = "recall-call".into();
+        ctx.output_id = uuid::Uuid::new_v4().to_string();
+        ctx.output_state = Some(state);
+        let result = RecallTool::for_output_recovery(OutputPolicy { enabled: true })
+            .execute_with_context(&ctx, &args)
+            .await
+            .unwrap();
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.contains("COMPACTED_RECOVERY_SENTINEL"));
     }
 
     #[test]

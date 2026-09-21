@@ -161,6 +161,7 @@ impl McpServeCommand {
             tool_policy,
             tool_policy_by_provider,
             provider_name,
+            output_recovery: octos_agent::output_recovery::OutputPolicy::from_env(),
         };
         let dispatch: Arc<dyn McpSessionDispatch> =
             Arc::new(RealSessionDispatch::new(dispatch_config, factory));
@@ -353,6 +354,9 @@ pub struct SessionDispatchConfig {
     /// Configured provider name, the fallback key when resolving the
     /// per-provider tool policy (model id wins over provider name).
     pub provider_name: String,
+    /// Invocation-local output recovery policy. Each MCP call gets a distinct
+    /// owner and may recover only outputs created during that call.
+    pub output_recovery: octos_agent::output_recovery::OutputPolicy,
 }
 
 impl SessionDispatchConfig {
@@ -446,6 +450,9 @@ impl AgentLlmFactory {
 /// * Emits `Running` on the supplied observer.
 /// * Builds a fresh [`Agent`] sharing the process-level LLM factory but with
 ///   per-call episode/memory state so sessions do not alias.
+/// * Gives that invocation its own output-recovery owner. Saved output may be
+///   recalled later in the same call, but is deliberately unavailable to a
+///   later MCP invocation.
 /// * Runs the supplied prompt as a [`Task`], which exercises the full
 ///   build-messages → call-llm → tool-use → end-turn loop.
 /// * Emits `Verifying`, resolves the contract artifact (either the
@@ -565,6 +572,11 @@ impl McpSessionDispatch for RealSessionDispatch {
         }
         let mut registry =
             ToolRegistry::with_builtins_and_permissions(&self.config.cwd, sandbox, permissions);
+        if self.config.output_recovery.enabled {
+            registry.register(octos_agent::tools::RecallTool::for_output_recovery(
+                self.config.output_recovery,
+            ));
+        }
         // Apply the operator's global tool deny/allow policy (parity with chat)
         // so a server that denies command tools doesn't re-expose them, then the
         // model-scoped policy resolved against the provider we actually built
@@ -587,6 +599,7 @@ impl McpSessionDispatch for RealSessionDispatch {
         if let Some(policy) = provider_policy {
             registry.set_provider_policy(policy);
         }
+        let output_recovery_visible = registry.is_tool_visible("recall");
         let tools = Arc::new(registry);
         let agent_config = AgentConfig {
             max_iterations: self.config.max_iterations,
@@ -604,23 +617,50 @@ impl McpSessionDispatch for RealSessionDispatch {
         )
         .with_config(agent_config);
         let invocation_id = format!("mcp-{}", uuid::Uuid::now_v7());
-        match TaskFileState::for_local_workspace(&self.config.cwd).and_then(|task_state| {
-            task_state
-                .for_branch(&invocation_id, &invocation_id, "root")
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "incomplete MCP file-state owner",
-                    )
-                })
-        }) {
-            Ok(file_state) => agent = agent.with_file_state(file_state),
-            Err(error) => tracing::warn!(
-                invocation = %invocation_id,
-                workspace = %self.config.cwd.display(),
-                error = %error,
-                "MCP file state initialization failed; read deduplication remains disabled",
-            ),
+        let file_state =
+            match TaskFileState::for_local_workspace(&self.config.cwd).and_then(|task_state| {
+                task_state
+                    .for_branch(&invocation_id, &invocation_id, "root")
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "incomplete MCP file-state owner",
+                        )
+                    })
+            }) {
+                Ok(file_state) => Some(file_state),
+                Err(error) => {
+                    tracing::warn!(
+                    invocation = %invocation_id,
+                    workspace = %self.config.cwd.display(),
+                    error = %error,
+                    "MCP file state initialization failed; read deduplication remains disabled",
+                    );
+                    None
+                }
+            };
+        let output_owner = file_state
+            .as_ref()
+            .and_then(|state| state.receipts().owner())
+            .cloned();
+        if let Some(file_state) = file_state {
+            agent = agent.with_file_state(file_state);
+        }
+        if let Some(owner) = output_owner {
+            let output_state = Arc::new(octos_agent::output_recovery::OutputState::new(
+                self.config.output_recovery,
+                owner,
+            ));
+            if output_recovery_visible
+                && let Err(error) = output_state.enable_store(&self.config.data_dir)
+            {
+                tracing::warn!(
+                    invocation = %invocation_id,
+                    error = %error,
+                    "MCP invocation output recovery unavailable",
+                );
+            }
+            agent = agent.with_output_state(output_state);
         }
         if let Some(request) = &arc_request {
             agent = agent.with_system_prompt(request.task.system_prompt.clone());
@@ -977,6 +1017,7 @@ mod tests {
             tool_policy: None,
             tool_policy_by_provider: HashMap::new(),
             provider_name: String::new(),
+            output_recovery: octos_agent::output_recovery::OutputPolicy::default(),
         };
 
         // A disabled policy must produce a pass-through backend, proving the

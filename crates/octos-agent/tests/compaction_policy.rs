@@ -472,6 +472,8 @@ fn tool_result_placeholder_roundtrips_through_json() {
         tool_call_id: "call_abc".into(),
         turn_id: Some(3),
         original_byte_len: Some(4096),
+        recovery: None,
+        recovery_error: None,
         reason: "pruned_after_turns".into(),
     };
     let json = placeholder.to_placeholder_content();

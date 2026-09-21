@@ -34431,6 +34431,15 @@ async fn run_standalone_turn(
     session_runtime
         .profile
         .apply_tool_envelope(&mut tool_registry);
+    if crate::runtime::profile::stdio_solo_lean_defaults_enabled() {
+        let allowlist = crate::runtime::profile::stdio_solo_tool_allowlist_from_env();
+        tool_registry.retain(|name| {
+            crate::runtime::profile::is_stdio_solo_coding_tool(name)
+                && allowlist
+                    .as_ref()
+                    .is_none_or(|allowed| allowed.iter().any(|allow| allow == name))
+        });
+    }
     let tool_registry = Arc::new(tool_registry);
 
     // C1 fix: `progress_tx` / `progress_dropped` are now created earlier

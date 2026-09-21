@@ -67,13 +67,14 @@ const STDIO_SOLO_CODING_TOOLS: &[&str] = &[
     "grep",
     "list_dir",
     "read_file",
+    "recall",
     "shell",
     "tool_search",
     "update_plan",
     "write_file",
 ];
 
-fn is_stdio_solo_coding_tool(name: &str) -> bool {
+pub(crate) fn is_stdio_solo_coding_tool(name: &str) -> bool {
     STDIO_SOLO_CODING_TOOLS.contains(&name)
 }
 
@@ -1851,8 +1852,9 @@ mod tests {
         assert!(is_bundled_skill_directory(Path::new("platform-skills")));
         assert!(!is_bundled_skill_directory(Path::new("skills")));
         assert!(!is_bundled_skill_directory(Path::new("plugins")));
-        assert_eq!(STDIO_SOLO_CODING_TOOLS.len(), 12);
+        assert_eq!(STDIO_SOLO_CODING_TOOLS.len(), 13);
         assert!(is_stdio_solo_coding_tool("shell"));
+        assert!(is_stdio_solo_coding_tool("recall"));
         assert!(!is_stdio_solo_coding_tool("run_pipeline"));
     }
 

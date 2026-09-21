@@ -3999,6 +3999,7 @@ impl ActorFactory {
             &self.plugin_dirs,
         );
 
+        let output_recovery_visible = tools.is_tool_visible("recall");
         let mut agent = Agent::new(agent_id, session_llm, tools, self.memory.clone())
             .with_config(self.agent_config.clone())
             .with_reporter(Arc::new(octos_agent::SilentReporter))
@@ -4018,7 +4019,8 @@ impl ActorFactory {
                 octos_agent::output_recovery::OutputPolicy::from_env(),
                 owner,
             ));
-            if let Err(error) = output_state.enable_store(&self.data_dir) {
+            if output_recovery_visible && let Err(error) = output_state.enable_store(&self.data_dir)
+            {
                 warn!(session = %session_key, error = %error, "tool output recovery unavailable");
             }
             agent = agent.with_output_state(output_state);

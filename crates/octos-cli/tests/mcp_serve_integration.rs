@@ -63,6 +63,7 @@ impl SessionLifecycleObserver for RecordingObserver {
 struct ScriptedLlmProvider {
     responses: Mutex<Vec<ChatResponse>>,
     requests: Mutex<Vec<Vec<Message>>>,
+    tool_requests: Mutex<Vec<Vec<ToolSpec>>>,
 }
 
 impl ScriptedLlmProvider {
@@ -70,11 +71,16 @@ impl ScriptedLlmProvider {
         Arc::new(Self {
             responses: Mutex::new(responses),
             requests: Mutex::new(Vec::new()),
+            tool_requests: Mutex::new(Vec::new()),
         })
     }
 
     fn requests(&self) -> Vec<Vec<Message>> {
         self.requests.lock().unwrap().clone()
+    }
+
+    fn tool_requests(&self) -> Vec<Vec<ToolSpec>> {
+        self.tool_requests.lock().unwrap().clone()
     }
 }
 
@@ -83,10 +89,11 @@ impl LlmProvider for ScriptedLlmProvider {
     async fn chat(
         &self,
         messages: &[Message],
-        _tools: &[ToolSpec],
+        tools: &[ToolSpec],
         _config: &ChatConfig,
     ) -> eyre::Result<ChatResponse> {
         self.requests.lock().unwrap().push(messages.to_vec());
+        self.tool_requests.lock().unwrap().push(tools.to_vec());
         let mut responses = self.responses.lock().unwrap();
         if responses.is_empty() {
             eyre::bail!("ScriptedLlmProvider: scripted responses exhausted");
@@ -146,6 +153,20 @@ fn read_file_call(id: &str, path: &str) -> ChatResponse {
     })
 }
 
+fn recall_call(id: &str, source_call_id: &str, offset: usize) -> ChatResponse {
+    tool_use(ToolCall {
+        id: id.to_string(),
+        name: "recall".to_string(),
+        arguments: json!({
+            "tool_call_id": source_call_id,
+            "stream": "file",
+            "offset": offset,
+            "limit": 256,
+        }),
+        metadata: None,
+    })
+}
+
 /// Harness that pairs a real dispatch with the [`TempDir`] it runs against.
 /// Holding the [`TempDir`] ensures the workspace outlives the [`Agent`] run;
 /// relying on the caller to keep it alive avoids `std::mem::forget` leaks.
@@ -201,17 +222,80 @@ impl DispatchHarness {
         sandbox: SandboxConfig,
         max_iterations: u32,
     ) -> Self {
+        Self::build_custom(
+            provider,
+            workspace,
+            sandbox,
+            max_iterations,
+            None,
+            None,
+            octos_agent::output_recovery::OutputPolicy::default(),
+        )
+    }
+
+    fn build_with_output_recovery(
+        provider: Arc<dyn LlmProvider>,
+        workspace: TempDir,
+        tool_policy: Option<octos_agent::ToolPolicy>,
+    ) -> Self {
+        Self::build_custom(
+            provider,
+            workspace,
+            SandboxConfig {
+                mode: SandboxMode::None,
+                ..SandboxConfig::default()
+            },
+            6,
+            tool_policy,
+            None,
+            octos_agent::output_recovery::OutputPolicy { enabled: true },
+        )
+    }
+
+    fn build_with_provider_output_recovery(
+        provider: Arc<dyn LlmProvider>,
+        workspace: TempDir,
+        provider_policy: octos_agent::ToolPolicy,
+    ) -> Self {
+        Self::build_custom(
+            provider,
+            workspace,
+            SandboxConfig {
+                mode: SandboxMode::None,
+                ..SandboxConfig::default()
+            },
+            4,
+            None,
+            Some(provider_policy),
+            octos_agent::output_recovery::OutputPolicy { enabled: true },
+        )
+    }
+
+    fn build_custom(
+        provider: Arc<dyn LlmProvider>,
+        workspace: TempDir,
+        sandbox: SandboxConfig,
+        max_iterations: u32,
+        tool_policy: Option<octos_agent::ToolPolicy>,
+        provider_policy: Option<octos_agent::ToolPolicy>,
+        output_recovery: octos_agent::output_recovery::OutputPolicy,
+    ) -> Self {
         let factory = AgentLlmFactory::scripted(provider);
         let data_dir = workspace.path().join(".octos-data");
         std::fs::create_dir_all(&data_dir).unwrap();
+        let mut tool_policy_by_provider = std::collections::HashMap::new();
+        if let Some(provider_policy) = provider_policy {
+            tool_policy_by_provider.insert("scripted-test".to_string(), provider_policy);
+        }
         let config = SessionDispatchConfig {
             cwd: workspace.path().to_path_buf(),
             data_dir,
             max_iterations,
             sandbox,
-            tool_policy: None,
-            tool_policy_by_provider: Default::default(),
+            tool_policy,
+            tool_policy_by_provider,
             provider_name: String::new(),
+            output_recovery,
         };
         Self {
             dispatch: RealSessionDispatch::new_for_test(config, factory),
@@ -393,6 +477,197 @@ async fn separate_mcp_invocations_do_not_share_read_receipts() {
         assert!(output.content.contains("alpha"));
         assert!(!output.content.contains("[FILE_UNCHANGED]"));
     }
+}
+
+#[tokio::test]
+async fn mcp_output_recovery_is_callable_within_one_invocation() {
+    let workspace = TempDir::new().unwrap();
+    let prefix = "ordinary prefix line\n".repeat(600);
+    let source = format!("{prefix}MCP_RECOVERY_SENTINEL\n{}", "z".repeat(12_000));
+    std::fs::write(workspace.path().join("large.txt"), source).unwrap();
+    let artifact_path = workspace.path().join("result.txt");
+    std::fs::write(&artifact_path, "ready").unwrap();
+    let provider = ScriptedLlmProvider::new(vec![
+        read_file_call("source-call", "large.txt"),
+        recall_call("recall-call", "source-call", prefix.len()),
+        end_turn("done"),
+    ]);
+    let recording_provider = provider.clone();
+    let harness = DispatchHarness::build_with_output_recovery(provider, workspace, None);
+    let observer = RecordingObserver::new();
+
+    let outcome = harness
+        .dispatch
+        .run_session(
+            "output-recovery",
+            &json!({
+                "prompt": "read and recover the saved output",
+                "expected_artifact": artifact_path.display().to_string(),
+            }),
+            &observer,
+        )
+        .await
+        .expect("MCP recovery dispatch");
+
+    assert_eq!(outcome.final_state, TaskLifecycleState::Ready);
+    let tools = recording_provider.tool_requests();
+    let recall = tools[0]
+        .iter()
+        .find(|tool| tool.name == "recall")
+        .expect("recall reaches the provider schema");
+    assert!(recall.input_schema["properties"]["output_id"].is_object());
+    let requests = recording_provider.requests();
+    let recalled = requests[2]
+        .iter()
+        .rev()
+        .find(|message| message.role == MessageRole::Tool)
+        .expect("recalled output reaches the provider");
+    assert!(
+        recalled.content.contains("MCP_RECOVERY_SENTINEL"),
+        "{}",
+        recalled.content
+    );
+}
+
+#[tokio::test]
+async fn mcp_recall_policy_deny_removes_schema_and_recovery_reference() {
+    let workspace = TempDir::new().unwrap();
+    std::fs::write(workspace.path().join("large.txt"), "x".repeat(24_000)).unwrap();
+    let artifact_path = workspace.path().join("result.txt");
+    std::fs::write(&artifact_path, "ready").unwrap();
+    let provider = ScriptedLlmProvider::new(vec![
+        read_file_call("source-call", "large.txt"),
+        end_turn("done"),
+    ]);
+    let recording_provider = provider.clone();
+    let harness = DispatchHarness::build_with_output_recovery(
+        provider,
+        workspace,
+        Some(octos_agent::ToolPolicy {
+            deny: vec!["recall".into()],
+            ..Default::default()
+        }),
+    );
+    let observer = RecordingObserver::new();
+
+    harness
+        .dispatch
+        .run_session(
+            "output-recovery-denied",
+            &json!({
+                "prompt": "read without recovery",
+                "expected_artifact": artifact_path.display().to_string(),
+            }),
+            &observer,
+        )
+        .await
+        .expect("MCP denied-recovery dispatch");
+
+    assert!(
+        recording_provider
+            .tool_requests()
+            .iter()
+            .flatten()
+            .all(|tool| tool.name != "recall")
+    );
+    let requests = recording_provider.requests();
+    let output = requests[1]
+        .iter()
+        .rev()
+        .find(|message| message.role == MessageRole::Tool)
+        .expect("read output reaches the provider");
+    let header: Value =
+        serde_json::from_str(output.content.lines().next().unwrap()).expect("typed output header");
+    assert_eq!(header["recoverable"], false);
+    assert!(header.get("recall").is_none());
+}
+
+#[tokio::test]
+async fn mcp_provider_policy_deny_hides_recall_schema() {
+    let workspace = TempDir::new().unwrap();
+    let artifact_path = workspace.path().join("result.txt");
+    std::fs::write(&artifact_path, "ready").unwrap();
+    let provider = ScriptedLlmProvider::new(vec![end_turn("done")]);
+    let recording_provider = provider.clone();
+    let harness = DispatchHarness::build_with_provider_output_recovery(
+        provider,
+        workspace,
+        octos_agent::ToolPolicy {
+            deny: vec!["recall".into()],
+            ..Default::default()
+        },
+    );
+
+    harness
+        .dispatch
+        .run_session(
+            "provider-policy",
+            &json!({
+                "prompt": "finish",
+                "expected_artifact": artifact_path.display().to_string(),
+            }),
+            &RecordingObserver::new(),
+        )
+        .await
+        .expect("MCP provider-policy dispatch");
+
+    assert!(
+        recording_provider
+            .tool_requests()
+            .first()
+            .expect("provider request")
+            .iter()
+            .all(|tool| tool.name != "recall")
+    );
+}
+
+#[tokio::test]
+async fn separate_mcp_invocations_do_not_share_output_recovery_owner() {
+    let workspace = TempDir::new().unwrap();
+    let prefix = "ordinary prefix line\n".repeat(600);
+    std::fs::write(
+        workspace.path().join("large.txt"),
+        format!("{prefix}CROSS_INVOCATION_SENTINEL\n{}", "z".repeat(12_000)),
+    )
+    .unwrap();
+    let artifact_path = workspace.path().join("result.txt");
+    std::fs::write(&artifact_path, "ready").unwrap();
+    let provider = ScriptedLlmProvider::new(vec![
+        read_file_call("shared-call-id", "large.txt"),
+        end_turn("first done"),
+        recall_call("recall-call", "shared-call-id", prefix.len()),
+        end_turn("second done"),
+    ]);
+    let recording_provider = provider.clone();
+    let harness = DispatchHarness::build_with_output_recovery(provider, workspace, None);
+
+    for prompt in ["save output", "try prior output"] {
+        harness
+            .dispatch
+            .run_session(
+                "output-recovery-isolation",
+                &json!({
+                    "prompt": prompt,
+                    "expected_artifact": artifact_path.display().to_string(),
+                }),
+                &RecordingObserver::new(),
+            )
+            .await
+            .expect("MCP invocation");
+    }
+
+    let requests = recording_provider.requests();
+    let denied = requests[3]
+        .iter()
+        .rev()
+        .find(|message| message.role == MessageRole::Tool)
+        .expect("second invocation recall result");
+    assert!(
+        denied.content.contains("source_incomplete"),
+        "{}",
+        denied.content
+    );
+    assert!(!denied.content.contains("CROSS_INVOCATION_SENTINEL"));
 }
 
 #[tokio::test]

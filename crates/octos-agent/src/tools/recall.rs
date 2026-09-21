@@ -26,11 +26,36 @@ pub trait ToolOutputLedger: Send + Sync {
 /// Tool that restores an evicted tool output by its `tool_call_id`.
 pub struct RecallTool {
     ledger: Arc<dyn ToolOutputLedger>,
+    output_recovery_enabled: bool,
 }
 
 impl RecallTool {
     pub fn new(ledger: Arc<dyn ToolOutputLedger>) -> Self {
-        Self { ledger }
+        Self {
+            ledger,
+            output_recovery_enabled: crate::output_recovery::OutputPolicy::from_env().enabled,
+        }
+    }
+
+    /// Build a recall tool that only reads through the typed, owner-bound
+    /// [`crate::output_recovery::OutputState`] supplied in [`ToolContext`].
+    ///
+    /// SessionRuntime and MCP do not own the legacy ContextManager ledger.
+    /// Their durable source of truth is OutputStore, so falling back to a
+    /// process-local string map would make cold recovery appear supported when
+    /// it is not.
+    pub fn for_output_recovery(policy: crate::output_recovery::OutputPolicy) -> Self {
+        struct NoLegacyLedger;
+        impl ToolOutputLedger for NoLegacyLedger {
+            fn fetch(&self, _tool_call_id: &str) -> Option<String> {
+                None
+            }
+        }
+
+        Self {
+            ledger: Arc::new(NoLegacyLedger),
+            output_recovery_enabled: policy.enabled,
+        }
     }
 }
 
@@ -108,7 +133,7 @@ impl Tool for RecallTool {
     }
 
     fn description(&self) -> &str {
-        if crate::output_recovery::OutputPolicy::from_env().enabled {
+        if self.output_recovery_enabled {
             return "Read a saved tool result without re-executing it. Use output_id with stream and absolute byte offset, or the returned cursor. Historical file text grants no current-file read/write permission. Legacy tool_call_id must be unique; page uses fixed legacy boundaries.";
         }
         "Restore a tool output that compaction replaced with a placeholder, by \
@@ -118,7 +143,7 @@ impl Tool for RecallTool {
     }
 
     fn input_schema(&self) -> serde_json::Value {
-        if crate::output_recovery::OutputPolicy::from_env().enabled {
+        if self.output_recovery_enabled {
             return serde_json::json!({
                 "type": "object",
                 "properties": {

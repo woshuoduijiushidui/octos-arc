@@ -32,7 +32,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::compaction::{
     CompactionOutcome, CompactionPhase, CompactionRunner as FullCompactionRunner,
-    TOOL_RESULT_PLACEHOLDER_SCHEMA_VERSION, ToolResultPlaceholder,
+    TOOL_RESULT_PLACEHOLDER_SCHEMA_VERSION, ToolResultPlaceholder, tool_result_recovery,
+    tool_result_recovery_error,
 };
 
 // ─── Tier 1: MicroCompactionPolicy ───────────────────────────────────────────
@@ -291,12 +292,16 @@ impl MicroCompactionPolicy {
             {
                 truncate_tool_output_head_tail(&msg.content, size_threshold)
             } else {
+                let recovery = tool_result_recovery(&tool_name, &msg.content);
+                let recovery_error = tool_result_recovery_error(&tool_name, &msg.content);
                 let placeholder = ToolResultPlaceholder {
                     schema_version: TOOL_RESULT_PLACEHOLDER_SCHEMA_VERSION,
                     tool_name,
                     tool_call_id: id.clone(),
                     turn_id: Some(turn_id),
                     original_byte_len: Some(content_len as u64),
+                    recovery,
+                    recovery_error,
                     reason: reason.to_string(),
                 };
                 placeholder.to_placeholder_content()
