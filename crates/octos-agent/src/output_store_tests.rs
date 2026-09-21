@@ -1072,3 +1072,283 @@ fn h03_m6_transformed_coordinates_report_unknown_instead_of_false_omission() {
     );
     assert!(!format!("{observations:?}").contains(&secret));
 }
+
+#[test]
+fn h03_m7_literal_search_finds_multiple_and_cross_block_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path(), "root");
+    let query = "CROSS_BLOCK_TARGET";
+    let first = BLOCK_BYTES - 5;
+    let second = BLOCK_BYTES + 97;
+    let mut text = "x".repeat(first);
+    text.push_str(query);
+    text.push_str(&"y".repeat(second - first - query.len()));
+    text.push_str(query);
+    text.push_str("\nend");
+    let saved = save(&state, &text, "search-call", 0);
+    let store = state.store().unwrap();
+
+    let found = store
+        .search(&RecallRequest {
+            output_id: Some(saved.view.output_id.clone()),
+            query: Some(query.into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        found
+            .matches
+            .iter()
+            .map(|matched| matched.start)
+            .collect::<Vec<_>>(),
+        vec![first as u64, second as u64]
+    );
+    assert!(found.matches.iter().all(|matched| {
+        matched.end - matched.start == query.len() as u64
+            && matched.snippet.len() <= SEARCH_SNIPPET_BYTES
+    }));
+    assert!(found.stored_search_complete);
+    assert!(found.search_complete);
+    assert!(found.artifact_complete);
+    assert_eq!(found.incomplete_reason, None);
+    assert_eq!(found.scan_limit_bytes, SEARCH_SCAN_BYTES);
+    assert_eq!(found.match_limit, SEARCH_MATCHES);
+    assert_eq!(found.snippet_limit_bytes, SEARCH_SNIPPET_BYTES);
+    assert!(found.render().unwrap().len() <= SEARCH_RESULT_BYTES);
+    state.observe_search_result(&Ok(found.clone()), false);
+    let observed = state
+        .observations()
+        .into_iter()
+        .find(|event| event.operation == "search")
+        .unwrap();
+    assert_eq!(observed.reason, "complete");
+    assert_eq!(observed.match_count, 2);
+    assert_eq!(observed.search_complete, Some(true));
+    assert_eq!(observed.range, Some(found.searched_range));
+
+    let missing = store
+        .search(&RecallRequest {
+            output_id: Some(saved.view.output_id),
+            query: Some("NOT_PRESENT".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(missing.matches.is_empty());
+    assert!(missing.search_complete);
+    assert_eq!(missing.next_offset, None);
+
+    let overlapping = save(&state, "aaaa", "overlap-search", 0);
+    let overlapping = store
+        .search(&RecallRequest {
+            output_id: Some(overlapping.view.output_id),
+            query: Some("aa".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        overlapping
+            .matches
+            .iter()
+            .map(|matched| matched.start)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+}
+
+#[test]
+fn h03_m7_search_limits_resume_without_skipping_and_partial_stays_explicit() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path(), "root");
+    let query = "TARGET_AFTER_SCAN_LIMIT";
+    let first_match = SEARCH_SCAN_BYTES + 41;
+    let mut text = "x".repeat(first_match);
+    text.push_str(query);
+    let saved = save(&state, &text, "scan-limit", 0);
+    let store = state.store().unwrap();
+    let first = store
+        .search(&RecallRequest {
+            output_id: Some(saved.view.output_id.clone()),
+            query: Some(query.into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(first.matches.is_empty());
+    assert!(!first.stored_search_complete);
+    assert!(!first.search_complete);
+    assert_eq!(first.incomplete_reason, Some("scan_limit"));
+    let next = first.next_offset.unwrap();
+    assert_eq!(next, SEARCH_SCAN_BYTES as u64);
+    let resumed = store
+        .search(&RecallRequest {
+            output_id: Some(saved.view.output_id),
+            offset: Some(next),
+            query: Some(query.into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(resumed.matches[0].start, first_match as u64);
+    assert!(resumed.search_complete);
+
+    let repeated = "hit ".repeat(20);
+    let saved = save(&state, &repeated, "match-limit", 0);
+    let limited = store
+        .search(&RecallRequest {
+            output_id: Some(saved.view.output_id.clone()),
+            query: Some("hit".into()),
+            max_matches: Some(3),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(limited.matches.len(), 3);
+    assert_eq!(limited.incomplete_reason, Some("match_limit"));
+    assert!(!limited.stored_search_complete);
+    assert!(limited.next_offset.unwrap() > limited.searched_range.0);
+    let continued = store
+        .search(&RecallRequest {
+            output_id: Some(saved.view.output_id),
+            offset: limited.next_offset,
+            query: Some("hit".into()),
+            max_matches: Some(3),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(continued.matches[0].start > limited.matches[2].start);
+
+    let mut partial = document("retained prefix", 0);
+    partial.capture = CaptureState::Partial;
+    partial.parts[0].total = Some(10_000);
+    partial.loss_reason = Some("capture_limit".into());
+    let saved = state
+        .register(
+            uuid::Uuid::new_v4().to_string(),
+            "partial-search",
+            &serde_json::json!({}),
+            partial,
+            false,
+            PAGE_BYTES,
+        )
+        .unwrap();
+    let searched = store
+        .search(&RecallRequest {
+            output_id: Some(saved.view.output_id),
+            query: Some("absent".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(searched.stored_search_complete);
+    assert!(!searched.search_complete);
+    assert!(!searched.artifact_complete);
+    assert_eq!(searched.next_offset, None);
+    assert_eq!(searched.incomplete_reason, Some("artifact_partial"));
+}
+
+#[test]
+fn h03_m7_search_rejects_invalid_and_foreign_requests_and_uses_safe_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path(), "root");
+    let secret = format!("sk-{}", "searchsecret".repeat(20));
+    let saved = save(&state, &format!("before {secret} after"), "safe-search", 0);
+    let store = state.store().unwrap();
+
+    for request in [
+        RecallRequest {
+            output_id: Some(saved.view.output_id.clone()),
+            query: Some(String::new()),
+            ..Default::default()
+        },
+        RecallRequest {
+            output_id: Some(saved.view.output_id.clone()),
+            query: Some("x".repeat(SEARCH_QUERY_CHARS + 1)),
+            ..Default::default()
+        },
+        RecallRequest {
+            tool_call_id: Some("safe-search".into()),
+            query: Some("before".into()),
+            ..Default::default()
+        },
+        RecallRequest {
+            output_id: Some(saved.view.output_id.clone()),
+            query: Some("before".into()),
+            cursor: Some("cursor".into()),
+            ..Default::default()
+        },
+        RecallRequest {
+            output_id: Some(saved.view.output_id.clone()),
+            query: Some("before".into()),
+            max_matches: Some(SEARCH_MATCHES + 1),
+            ..Default::default()
+        },
+    ] {
+        assert_eq!(
+            store.search(&request).unwrap_err(),
+            OutputError::InvalidSearch
+        );
+    }
+    assert_eq!(
+        store
+            .read(
+                &RecallRequest {
+                    output_id: Some(saved.view.output_id.clone()),
+                    query: Some("before".into()),
+                    ..Default::default()
+                },
+                PAGE_BYTES,
+            )
+            .unwrap_err(),
+        OutputError::InvalidSearch
+    );
+
+    let safe = store
+        .search(&RecallRequest {
+            output_id: Some(saved.view.output_id.clone()),
+            query: Some(secret.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(safe.matches.is_empty());
+    assert!(safe.search_complete);
+    assert!(!safe.render().unwrap().contains(&secret));
+
+    let foreign = OutputStore::open(dir.path(), owner("other")).unwrap();
+    assert_eq!(
+        foreign
+            .search(&RecallRequest {
+                output_id: Some(saved.view.output_id),
+                query: Some("before".into()),
+                ..Default::default()
+            })
+            .unwrap_err(),
+        OutputError::OwnerMismatch
+    );
+}
+
+#[tokio::test]
+async fn h03_m7_cancelled_search_is_bounded_and_does_not_change_the_artifact() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path(), "root");
+    let saved = save(
+        &state,
+        &"bounded cancellation fixture\n".repeat(80_000),
+        "cancel-search",
+        0,
+    );
+    let store = state.store().unwrap();
+    let before = store.directory.read("index.json", CATALOG_BYTES).unwrap();
+    let request = RecallRequest {
+        output_id: Some(saved.view.output_id),
+        query: Some("not present".into()),
+        ..Default::default()
+    };
+    let search_store = store.clone();
+    let search_request = request.clone();
+    let task = tokio::task::spawn_blocking(move || search_store.search(&search_request));
+    task.abort();
+    let _ = task.await;
+
+    let searched = store.search(&request).unwrap();
+    assert!(searched.searched_range.1 - searched.searched_range.0 <= SEARCH_SCAN_BYTES as u64);
+    assert_eq!(
+        before,
+        store.directory.read("index.json", CATALOG_BYTES).unwrap()
+    );
+}

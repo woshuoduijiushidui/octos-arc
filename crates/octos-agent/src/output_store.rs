@@ -27,6 +27,12 @@ pub const STREAM_BYTES: usize = 8 * 1024 * 1024;
 pub const SESSION_BYTES: u64 = 64 * 1024 * 1024;
 pub const SESSION_ENTRIES: usize = 256;
 pub const MANIFEST_BYTES: usize = 16 * 1024;
+pub(crate) const SEARCH_SCAN_BYTES: usize = 1024 * 1024;
+pub(crate) const SEARCH_QUERY_CHARS: usize = 256;
+pub(crate) const SEARCH_QUERY_BYTES: usize = SEARCH_QUERY_CHARS * 4;
+pub(crate) const SEARCH_MATCHES: usize = 8;
+pub(crate) const SEARCH_SNIPPET_BYTES: usize = 64;
+pub(crate) const SEARCH_RESULT_BYTES: usize = PAGE_BYTES - 512;
 const CATALOG_BYTES: u64 = 4 * 1024 * 1024;
 const GLOBAL_BYTES: u64 = 256 * 1024 * 1024;
 const GLOBAL_ENTRIES: usize = 4096;
@@ -43,6 +49,8 @@ pub struct RecallRequest {
     pub limit: Option<u64>,
     pub cursor: Option<String>,
     pub page: Option<u64>,
+    pub query: Option<String>,
+    pub max_matches: Option<usize>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -60,6 +68,46 @@ struct Cursor {
 pub struct RecalledOutput {
     pub rendered: RenderedOutput,
     pub document: OutputDocument,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct SearchMatch {
+    pub(crate) start: u64,
+    pub(crate) end: u64,
+    pub(crate) snippet_start: u64,
+    pub(crate) snippet_end: u64,
+    pub(crate) snippet: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct SearchedOutput {
+    pub(crate) schema_version: u32,
+    pub(crate) output_id: String,
+    pub(crate) stream: OutputStream,
+    pub(crate) coordinates: &'static str,
+    pub(crate) searched_range: (u64, u64),
+    pub(crate) stored_range: (u64, u64),
+    pub(crate) matches: Vec<SearchMatch>,
+    pub(crate) stored_search_complete: bool,
+    pub(crate) search_complete: bool,
+    pub(crate) artifact_complete: bool,
+    pub(crate) next_offset: Option<u64>,
+    pub(crate) incomplete_reason: Option<&'static str>,
+    pub(crate) scan_limit_bytes: usize,
+    pub(crate) match_limit: usize,
+    pub(crate) snippet_limit_bytes: usize,
+    pub(crate) capture: CaptureState,
+    pub(crate) historical: bool,
+}
+
+impl SearchedOutput {
+    pub(crate) fn render(&self) -> Result<String, OutputError> {
+        let output = serde_json::to_string(self).map_err(|_| OutputError::SourceIncomplete)?;
+        if output.len() > SEARCH_RESULT_BYTES {
+            return Err(OutputError::InsufficientBudget);
+        }
+        Ok(output)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -919,6 +967,9 @@ impl OutputStore {
         request: &RecallRequest,
         budget: usize,
     ) -> Result<RecalledOutput, OutputError> {
+        if request.query.is_some() || request.max_matches.is_some() {
+            return Err(OutputError::InvalidSearch);
+        }
         let (record, manifest, cursor) = self.resolve(request)?;
         let stream = cursor
             .as_ref()
@@ -994,6 +1045,144 @@ impl OutputStore {
         }
         let rendered = render(&document, &view, budget)?;
         Ok(RecalledOutput { rendered, document })
+    }
+
+    /// Search one bounded window of the persisted model-safe text.
+    pub(crate) fn search(&self, request: &RecallRequest) -> Result<SearchedOutput, OutputError> {
+        let query = request.query.as_deref().ok_or(OutputError::InvalidSearch)?;
+        if query.is_empty()
+            || query.len() > SEARCH_QUERY_BYTES
+            || query.chars().count() > SEARCH_QUERY_CHARS
+            || request.output_id.is_none()
+            || request.tool_call_id.is_some()
+            || request.cursor.is_some()
+            || request.page.is_some()
+            || request.limit.is_some()
+            || request.max_matches == Some(0)
+            || request
+                .max_matches
+                .is_some_and(|limit| limit > SEARCH_MATCHES)
+        {
+            return Err(OutputError::InvalidSearch);
+        }
+        let max_matches = request.max_matches.unwrap_or(SEARCH_MATCHES);
+        let (_, manifest, _) = self.resolve(request)?;
+        let stream = request.stream.unwrap_or(manifest.parts[0].stream);
+        let part = manifest
+            .parts
+            .iter()
+            .find(|part| part.stream == stream)
+            .ok_or(OutputError::OutOfRange)?;
+        let part_end = part
+            .start
+            .checked_add(part.bytes)
+            .ok_or(OutputError::Corrupt)?;
+        let position = request.offset.unwrap_or(part.start);
+        if position < part.start
+            || position > part_end
+            || !self.char_boundary(part, position - part.start)?
+        {
+            return Err(OutputError::OutOfRange);
+        }
+
+        let mut core_end = (position - part.start + SEARCH_SCAN_BYTES as u64).min(part.bytes);
+        while !self.char_boundary(part, core_end)? {
+            core_end -= 1;
+        }
+        let mut read_end = (core_end + query.len().saturating_sub(1) as u64).min(part.bytes);
+        while read_end < part.bytes && !self.char_boundary(part, read_end)? {
+            read_end += 1;
+        }
+        let text = self.range(part, position - part.start, read_end)?;
+        let core_len = (core_end - (position - part.start)) as usize;
+        let mut matches = Vec::new();
+        let mut match_limited = false;
+        let mut next_position = part.start + core_end;
+        let mut search_from = 0usize;
+        while search_from < core_len {
+            let Some(found) = text[search_from..].find(query) else {
+                break;
+            };
+            let local_start = search_from + found;
+            if local_start >= core_len {
+                break;
+            }
+            if matches.len() >= max_matches {
+                match_limited = true;
+                next_position = position + local_start as u64;
+                break;
+            }
+            let local_end = local_start + query.len();
+            let mut snippet_start = local_start.saturating_sub(SEARCH_SNIPPET_BYTES / 3);
+            while snippet_start < local_start && !text.is_char_boundary(snippet_start) {
+                snippet_start += 1;
+            }
+            let mut snippet_end = (snippet_start + SEARCH_SNIPPET_BYTES).min(text.len());
+            while snippet_end > snippet_start && !text.is_char_boundary(snippet_end) {
+                snippet_end -= 1;
+            }
+            matches.push(SearchMatch {
+                start: position + local_start as u64,
+                end: position + local_end as u64,
+                snippet_start: position + snippet_start as u64,
+                snippet_end: position + snippet_end as u64,
+                snippet: text[snippet_start..snippet_end].to_string(),
+            });
+            search_from = local_start
+                + text[local_start..]
+                    .chars()
+                    .next()
+                    .map(char::len_utf8)
+                    .unwrap_or(1);
+        }
+
+        let stored_search_complete = !match_limited && part.start + core_end >= part_end;
+        let captured = manifest
+            .view
+            .captured_ranges
+            .iter()
+            .find(|range| range.stream == stream);
+        let artifact_complete = manifest.view.capture == CaptureState::Complete
+            && if part.bytes == 0 {
+                captured.is_none_or(|range| range.start == range.end)
+            } else {
+                captured.is_some_and(|range| part.start <= range.start && part_end >= range.end)
+            };
+        let search_complete = stored_search_complete && artifact_complete;
+        let incomplete_reason = if match_limited {
+            Some("match_limit")
+        } else if !stored_search_complete {
+            Some("scan_limit")
+        } else if manifest.view.capture == CaptureState::Running {
+            Some("artifact_pending")
+        } else if !artifact_complete {
+            Some("artifact_partial")
+        } else {
+            None
+        };
+        Ok(SearchedOutput {
+            schema_version: SCHEMA,
+            output_id: manifest.view.output_id,
+            stream,
+            coordinates: if manifest.view.transformed {
+                "safe_text_bytes"
+            } else {
+                "source_bytes_except_display"
+            },
+            searched_range: (position, next_position),
+            stored_range: (part.start, part_end),
+            matches,
+            stored_search_complete,
+            search_complete,
+            artifact_complete,
+            next_offset: (!stored_search_complete).then_some(next_position),
+            incomplete_reason,
+            scan_limit_bytes: SEARCH_SCAN_BYTES,
+            match_limit: max_matches,
+            snippet_limit_bytes: SEARCH_SNIPPET_BYTES,
+            capture: manifest.view.capture,
+            historical: true,
+        })
     }
 }
 

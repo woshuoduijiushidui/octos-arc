@@ -402,6 +402,7 @@ pub enum OutputError {
     Expired,
     OwnerMismatch,
     InvalidCursor,
+    InvalidSearch,
     StaleSource,
     OutOfRange,
     AmbiguousCallId,
@@ -421,6 +422,7 @@ impl std::fmt::Display for OutputError {
             Self::Expired => "output_expired",
             Self::OwnerMismatch => "owner_mismatch",
             Self::InvalidCursor => "invalid_cursor",
+            Self::InvalidSearch => "invalid_search",
             Self::StaleSource => "stale_source",
             Self::OutOfRange => "out_of_range",
             Self::AmbiguousCallId => "ambiguous_call_id",
@@ -447,6 +449,8 @@ pub(crate) struct OutputRecoveryObservation {
     pub(crate) stream: Option<OutputStream>,
     pub(crate) range: Option<(u64, u64)>,
     pub(crate) repeated: bool,
+    pub(crate) match_count: u64,
+    pub(crate) search_complete: Option<bool>,
     pub(crate) termination: Option<&'static str>,
     pub(crate) artifact: Option<&'static str>,
 }
@@ -472,6 +476,8 @@ impl OutputRecoveryObservation {
             stream: None,
             range: None,
             repeated: false,
+            match_count: 0,
+            search_complete: None,
             termination: None,
             artifact: None,
         }
@@ -496,6 +502,7 @@ fn output_error_reason(error: OutputError) -> &'static str {
         OutputError::Expired => "expired",
         OutputError::OwnerMismatch => "owner_mismatch",
         OutputError::InvalidCursor => "invalid_cursor",
+        OutputError::InvalidSearch => "invalid_search",
         OutputError::StaleSource => "stale_source",
         OutputError::OutOfRange => "out_of_range",
         OutputError::AmbiguousCallId => "ambiguous_call_id",
@@ -996,6 +1003,8 @@ impl OutputState {
             range_start = observation.range.map(|range| range.0),
             range_end = observation.range.map(|range| range.1),
             repeated = observation.repeated,
+            match_count = observation.match_count,
+            search_complete = observation.search_complete,
             termination = observation.termination.unwrap_or("none"),
             artifact = observation.artifact.unwrap_or("none"),
             "output recovery event"
@@ -1079,7 +1088,9 @@ impl OutputState {
             }
             repeated
         };
-        let reason = if request.cursor.is_some() {
+        let reason = if request.query.is_some() {
+            "search"
+        } else if request.cursor.is_some() {
             "cursor"
         } else if request.page.is_some() {
             "page"
@@ -1167,6 +1178,64 @@ impl OutputState {
         self.observe(observation);
     }
 
+    pub(crate) fn observe_search_result(
+        &self,
+        result: &Result<crate::output_store::SearchedOutput, OutputError>,
+        repeated: bool,
+    ) {
+        let mut observation = match result {
+            Ok(searched) => {
+                let reason = searched.incomplete_reason.unwrap_or("complete");
+                let mut event =
+                    OutputRecoveryObservation::event("search", "result", "success", reason);
+                event.visible_bytes = searched
+                    .searched_range
+                    .1
+                    .saturating_sub(searched.searched_range.0);
+                event.stream = Some(searched.stream);
+                event.range = Some(searched.searched_range);
+                event.match_count = searched.matches.len() as u64;
+                event.search_complete = Some(searched.search_complete);
+                event.artifact = Some(if searched.artifact_complete {
+                    "complete"
+                } else {
+                    "partial"
+                });
+                event
+            }
+            Err(error) => OutputRecoveryObservation::event(
+                "search",
+                "result",
+                "failure",
+                output_error_reason(*error),
+            ),
+        };
+        observation.repeated = repeated;
+        metrics::counter!(
+            "octos_output_recovery_search_total",
+            "outcome" => observation.outcome,
+            "reason" => observation.reason,
+            "complete" => match observation.search_complete {
+                Some(true) => "true",
+                Some(false) => "false",
+                None => "unknown",
+            },
+            "policy" => observation.policy_id,
+        )
+        .increment(1);
+        metrics::counter!(
+            "octos_output_recovery_search_bytes_total",
+            "policy" => observation.policy_id,
+        )
+        .increment(observation.visible_bytes);
+        metrics::counter!(
+            "octos_output_recovery_search_matches_total",
+            "policy" => observation.policy_id,
+        )
+        .increment(observation.match_count);
+        self.observe(observation);
+    }
+
     fn observe_command_terminal(&self, view: &OutputView) {
         if !matches!(view.source, OutputSource::Command { .. })
             || matches!(view.execution, ExecutionStatus::Running)
@@ -1238,6 +1307,10 @@ impl OutputState {
         )
     }
 
+    fn is_recall_search(name: &str, args: &serde_json::Value) -> bool {
+        name == "recall" && (args.get("query").is_some() || args.get("max_matches").is_some())
+    }
+
     pub fn finish_result(
         &self,
         id: &str,
@@ -1248,6 +1321,20 @@ impl OutputState {
         feedback: Option<&str>,
     ) {
         if !self.policy.enabled {
+            return;
+        }
+        if Self::is_recall_search(name, args) {
+            if let Some(feedback) = feedback {
+                let marker = "\n\n[hook] ";
+                let remaining = PAGE_BYTES
+                    .saturating_sub(result.output.len())
+                    .saturating_sub(marker.len());
+                if remaining > 0 {
+                    let end = prefix_end(feedback, remaining);
+                    result.output.push_str(marker);
+                    result.output.push_str(&feedback[..end]);
+                }
+            }
             return;
         }
         if name == "recall" && self.lookup(call_id, &result.output).is_some() {
@@ -1668,7 +1755,10 @@ impl OutputState {
                 .and_then(|id| calls.remove(id));
             if let Some(call) = call {
                 let known = self.lookup(&call.id, &message.content);
-                if known.is_some() || Self::supports(&call.name) {
+                if known.is_some()
+                    || (Self::supports(&call.name)
+                        && !Self::is_recall_search(&call.name, &call.arguments))
+                {
                     targets.push((index, call, known));
                     continue;
                 }

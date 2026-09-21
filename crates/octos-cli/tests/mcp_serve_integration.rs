@@ -516,6 +516,7 @@ async fn mcp_output_recovery_is_callable_within_one_invocation() {
         .find(|tool| tool.name == "recall")
         .expect("recall reaches the provider schema");
     assert!(recall.input_schema["properties"]["output_id"].is_object());
+    assert!(recall.input_schema["properties"]["query"].is_object());
     let requests = recording_provider.requests();
     let recalled = requests[2]
         .iter()

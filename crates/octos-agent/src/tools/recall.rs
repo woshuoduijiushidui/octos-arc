@@ -134,7 +134,7 @@ impl Tool for RecallTool {
 
     fn description(&self) -> &str {
         if self.output_recovery_enabled {
-            return "Read a saved tool result without re-executing it. Use output_id with stream and absolute byte offset, or the returned cursor. Historical file text grants no current-file read/write permission. Legacy tool_call_id must be unique; page uses fixed legacy boundaries.";
+            return "Read or search a saved tool result without re-executing it. For a case-sensitive literal search, pass output_id and query, then read a returned match with stream and absolute byte offset. Repeat an incomplete search from next_offset. Historical file text grants no current-file read/write permission. Legacy tool_call_id must be unique; page uses fixed legacy boundaries.";
         }
         "Restore a tool output that compaction replaced with a placeholder, by \
          its tool_call_id (shown on the placeholder). Returns the exact recorded \
@@ -153,7 +153,18 @@ impl Tool for RecallTool {
                     "offset": {"type": "integer", "minimum": 0},
                     "limit": {"type": "integer", "minimum": 1},
                     "cursor": {"type": "string"},
-                    "page": {"type": "integer", "minimum": 0}
+                    "page": {"type": "integer", "minimum": 0},
+                    "query": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": crate::output_store::SEARCH_QUERY_CHARS,
+                        "description": "Case-sensitive literal search. Requires output_id; cannot be combined with cursor, page, limit, or tool_call_id."
+                    },
+                    "max_matches": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": crate::output_store::SEARCH_MATCHES
+                    }
                 },
                 "additionalProperties": false
             });
@@ -176,7 +187,11 @@ impl Tool for RecallTool {
     }
 
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
-        if args.get("output_id").is_some() || args.get("cursor").is_some() {
+        if args.get("output_id").is_some()
+            || args.get("cursor").is_some()
+            || args.get("query").is_some()
+            || args.get("max_matches").is_some()
+        {
             return Ok(ToolResult {
                 output: "recovery_tool_unavailable".into(),
                 success: false,
@@ -214,21 +229,37 @@ impl Tool for RecallTool {
         else {
             return self.execute(args).await;
         };
+        let search_requested = args.get("query").is_some() || args.get("max_matches").is_some();
         let request =
             match serde_json::from_value::<crate::output_store::RecallRequest>(args.clone()) {
                 Ok(request) => request,
                 Err(_) => {
-                    state.observe_recall_result(
-                        &Err(crate::output_recovery::OutputError::InvalidCursor),
-                        false,
-                    );
+                    let error = if search_requested {
+                        crate::output_recovery::OutputError::InvalidSearch
+                    } else {
+                        crate::output_recovery::OutputError::InvalidCursor
+                    };
+                    if search_requested {
+                        state.observe_search_result(&Err(error), false);
+                    } else {
+                        state.observe_recall_result(&Err(error), false);
+                    }
                     return Ok(ToolResult {
-                        output: "invalid_cursor".into(),
+                        output: error.to_string(),
                         success: false,
                         ..Default::default()
                     });
                 }
             };
+        if search_requested && request.query.is_none() {
+            let error = crate::output_recovery::OutputError::InvalidSearch;
+            state.observe_search_result(&Err(error), false);
+            return Ok(ToolResult {
+                output: error.to_string(),
+                success: false,
+                ..Default::default()
+            });
+        }
         let repeated = state.observe_recall_request(&request);
         let Some(store) = state.store() else {
             state.observe_recall_result(
@@ -241,6 +272,22 @@ impl Tool for RecallTool {
                 ..Default::default()
             });
         };
+        if request.query.is_some() {
+            let searched = tokio::task::spawn_blocking(move || store.search(&request)).await?;
+            state.observe_search_result(&searched, repeated);
+            return Ok(match searched.and_then(|result| result.render()) {
+                Ok(output) => ToolResult {
+                    output,
+                    success: true,
+                    ..Default::default()
+                },
+                Err(error) => ToolResult {
+                    output: error.to_string(),
+                    success: false,
+                    ..Default::default()
+                },
+            });
+        }
         let recalled = tokio::task::spawn_blocking(move || {
             store.read(&request, crate::output_recovery::PAGE_BYTES)
         })
@@ -280,6 +327,17 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
         )))
+    }
+
+    fn disabled_tool(map: &[(&str, &str)]) -> RecallTool {
+        RecallTool {
+            ledger: Arc::new(MapLedger(
+                map.iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            )),
+            output_recovery_enabled: false,
+        }
     }
 
     #[tokio::test]
@@ -345,5 +403,65 @@ mod tests {
             "{}",
             last.output
         );
+    }
+
+    #[test]
+    fn h03_m7_search_schema_is_bounded_and_absent_when_recovery_is_off() {
+        let enabled =
+            RecallTool::for_output_recovery(crate::output_recovery::OutputPolicy { enabled: true });
+        let schema = enabled.input_schema();
+        assert_eq!(
+            schema["properties"]["query"]["maxLength"],
+            crate::output_store::SEARCH_QUERY_CHARS
+        );
+        assert_eq!(
+            schema["properties"]["max_matches"]["maximum"],
+            crate::output_store::SEARCH_MATCHES
+        );
+        let declaration = format!("{}{}", enabled.description(), schema);
+        assert!(octos_llm::context::estimate_tokens(&declaration) < 300);
+
+        let disabled = disabled_tool(&[]);
+        assert!(disabled.input_schema()["properties"].get("query").is_none());
+    }
+
+    #[tokio::test]
+    async fn h03_m7_search_is_unavailable_when_output_recovery_is_off() {
+        let result = disabled_tool(&[("call", "needle")])
+            .execute(&serde_json::json!({
+                "tool_call_id": "call",
+                "query": "needle",
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert_eq!(result.output, "recovery_tool_unavailable");
+    }
+
+    #[tokio::test]
+    async fn h03_m7_null_query_and_orphan_match_limit_fail_as_search_requests() {
+        use crate::model_read_receipts::ReadReceiptOwner;
+        use crate::output_recovery::{OutputPolicy, OutputState};
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(OutputState::new(
+            OutputPolicy { enabled: true },
+            ReadReceiptOwner::new("workspace", "task", "session", "branch").unwrap(),
+        ));
+        state.enable_store(dir.path()).unwrap();
+        let mut context = ToolContext::zero();
+        context.tool_id = "search-call".into();
+        context.output_id = uuid::Uuid::new_v4().to_string();
+        context.output_state = Some(state);
+        let tool = RecallTool::for_output_recovery(OutputPolicy { enabled: true });
+
+        for args in [
+            serde_json::json!({"output_id": uuid::Uuid::new_v4(), "query": null}),
+            serde_json::json!({"output_id": uuid::Uuid::new_v4(), "max_matches": 2}),
+        ] {
+            let result = tool.execute_with_context(&context, &args).await.unwrap();
+            assert!(!result.success);
+            assert_eq!(result.output, "invalid_search");
+        }
     }
 }
