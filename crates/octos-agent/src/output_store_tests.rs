@@ -1,5 +1,5 @@
 use super::*;
-use crate::output_recovery::{ExecutionStatus, OutputPolicy, OutputState};
+use crate::output_recovery::{ExecutionStatus, OBSERVATION_ENTRIES, OutputPolicy, OutputState};
 
 fn owner(branch: &str) -> ReadReceiptOwner {
     ReadReceiptOwner::new("workspace", "task", "session", branch).unwrap()
@@ -102,6 +102,9 @@ fn h03_m2_hot_and_cold_unicode_ranges_reconstruct_exact_hash() {
     assert!(saved.view.recoverable);
     let id = saved.view.output_id;
     let store = state.store().unwrap();
+    let historical = store.read(&request(&id), PAGE_BYTES).unwrap();
+    assert!(historical.rendered.view.historical);
+    assert!(historical.document.file_read.is_none());
     assert_eq!(
         digest(restore(&store, &id).as_bytes()),
         digest(text.as_bytes())
@@ -905,4 +908,167 @@ fn h03_m4_command_store_failure_preserves_output_and_exit_status_without_false_r
         }
     );
     assert!(saved.content.contains("captured before store failure"));
+}
+
+#[test]
+fn h03_m6_observes_bytes_recall_progress_and_repetition_without_payloads() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path(), "root");
+    let marker = "M6_SECRET_PATH_AND_ARGUMENT";
+    let text = format!("{marker}\n{}", "saved output\n".repeat(2_000));
+    let output_id = uuid::Uuid::new_v4().to_string();
+    let saved = state
+        .register(
+            output_id.clone(),
+            "observed-call",
+            &serde_json::json!({"path": marker, "command": marker}),
+            document(&text, 0),
+            true,
+            PAGE_BYTES,
+        )
+        .unwrap();
+    let request = request(&saved.view.output_id);
+    let store = state.store().unwrap();
+
+    for repeated in [false, true] {
+        assert_eq!(state.observe_recall_request(&request), repeated);
+        let recalled = store.read(&request, PAGE_BYTES).unwrap();
+        let rendered = state.register_recalled(
+            "recall-call",
+            &serde_json::json!({"output_id": output_id}),
+            recalled,
+        );
+        state.observe_recall_result(&rendered, repeated);
+        assert!(rendered.is_ok());
+    }
+
+    let observations = state.observations();
+    let capture = observations
+        .iter()
+        .find(|event| event.operation == "capture" && event.outcome == "success")
+        .unwrap();
+    assert_eq!(capture.captured_bytes, text.len() as u64);
+    assert!(!capture.unknown_total);
+    let saved_event = observations
+        .iter()
+        .find(|event| event.operation == "save" && event.outcome == "success")
+        .unwrap();
+    assert_eq!(saved_event.stored_bytes, text.len() as u64);
+    assert_eq!(saved_event.known_omitted_bytes, 0);
+    assert_eq!(saved_event.artifact, Some("available"));
+    let initial_render = observations
+        .iter()
+        .find(|event| event.operation == "render" && event.layer == "initial")
+        .unwrap();
+    assert_eq!(initial_render.reason, "output_budget");
+    assert!(initial_render.visible_bytes < initial_render.captured_bytes);
+    let recall_results: Vec<_> = observations
+        .iter()
+        .filter(|event| event.operation == "recall" && event.layer == "result")
+        .collect();
+    assert_eq!(recall_results.len(), 2);
+    assert_eq!(recall_results[0].reason, "strict_progress");
+    assert!(!recall_results[0].repeated);
+    assert!(recall_results[1].repeated);
+    assert!(recall_results.iter().all(|event| {
+        event
+            .range
+            .is_some_and(|(start, end)| end > start && event.visible_bytes == end - start)
+    }));
+
+    let diagnostic = format!("{observations:?}");
+    assert!(!diagnostic.contains(marker));
+    assert!(!diagnostic.contains(&saved.view.output_id));
+    assert!(!diagnostic.contains("observed-call"));
+}
+
+#[test]
+fn h03_m6_counts_one_terminal_command_and_bounds_observation_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path(), "root");
+    let command = || OutputDocument {
+        source: OutputSource::Command {
+            run_id: String::new(),
+        },
+        parts: vec![OutputPart {
+            stream: OutputStream::Stdout,
+            text: "bounded command output".into(),
+            start: 0,
+            first_line: None,
+            total: Some(22),
+        }],
+        capture: CaptureState::Complete,
+        execution: ExecutionStatus::TimedOut,
+        transformed: false,
+        loss_reason: None,
+        file_read: None,
+    };
+    let command_id = uuid::Uuid::new_v4().to_string();
+    for _ in 0..2 {
+        state
+            .register(
+                command_id.clone(),
+                "command-call",
+                &serde_json::json!({"command": "not-recorded"}),
+                command(),
+                false,
+                PAGE_BYTES,
+            )
+            .unwrap();
+    }
+    let command_events: Vec<_> = state
+        .observations()
+        .into_iter()
+        .filter(|event| event.operation == "command")
+        .collect();
+    assert_eq!(command_events.len(), 1);
+    assert_eq!(command_events[0].termination, Some("timed_out"));
+    assert_eq!(command_events[0].artifact, Some("available"));
+
+    state.observe_recall_result(&Err(OutputError::StaleSource), false);
+    assert!(
+        state
+            .observations()
+            .iter()
+            .any(|event| event.operation == "recall" && event.reason == "stale_source")
+    );
+    for _ in 0..(OBSERVATION_ENTRIES * 2) {
+        state.observe_recall_result(&Err(OutputError::Missing), false);
+    }
+    let observations = state.observations();
+    assert_eq!(observations.len(), OBSERVATION_ENTRIES);
+    assert!(
+        observations
+            .iter()
+            .all(|event| event.operation == "recall" && event.reason == "missing")
+    );
+}
+
+#[test]
+fn h03_m6_transformed_coordinates_report_unknown_instead_of_false_omission() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path(), "root");
+    let secret = format!("sk-{}", "observabilitysecret".repeat(20));
+    let saved = save(
+        &state,
+        &format!("before {secret} after"),
+        "sanitized-call",
+        0,
+    );
+    assert!(saved.view.transformed);
+
+    let observations = state.observations();
+    for event in observations
+        .iter()
+        .filter(|event| matches!(event.operation, "save" | "render"))
+    {
+        assert!(event.unknown_total);
+        assert_eq!(event.known_omitted_bytes, 0);
+    }
+    assert!(
+        observations
+            .iter()
+            .any(|event| event.operation == "render" && event.reason == "source_transformed")
+    );
+    assert!(!format!("{observations:?}").contains(&secret));
 }

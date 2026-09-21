@@ -218,6 +218,10 @@ impl Tool for RecallTool {
             match serde_json::from_value::<crate::output_store::RecallRequest>(args.clone()) {
                 Ok(request) => request,
                 Err(_) => {
+                    state.observe_recall_result(
+                        &Err(crate::output_recovery::OutputError::InvalidCursor),
+                        false,
+                    );
                     return Ok(ToolResult {
                         output: "invalid_cursor".into(),
                         success: false,
@@ -225,7 +229,12 @@ impl Tool for RecallTool {
                     });
                 }
             };
+        let repeated = state.observe_recall_request(&request);
         let Some(store) = state.store() else {
+            state.observe_recall_result(
+                &Err(crate::output_recovery::OutputError::RecoveryUnavailable),
+                repeated,
+            );
             return Ok(ToolResult {
                 output: "recovery_tool_unavailable".into(),
                 success: false,
@@ -237,6 +246,7 @@ impl Tool for RecallTool {
         })
         .await?;
         let result = recalled.and_then(|page| state.register_recalled(&ctx.tool_id, args, page));
+        state.observe_recall_result(&result, repeated);
         Ok(match result {
             Ok(rendered) => ToolResult {
                 output: rendered.content,

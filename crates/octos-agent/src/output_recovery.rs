@@ -15,6 +15,8 @@ pub const MIN_PAGE_BYTES: usize = 512;
 const MAX_ENTRIES: usize = crate::output_store::SESSION_ENTRIES;
 const MAX_PAYLOAD_BYTES: usize = crate::output_store::SESSION_BYTES as usize;
 const MAX_METADATA_BYTES: usize = crate::output_store::MANIFEST_BYTES;
+pub(crate) const OBSERVATION_ENTRIES: usize = 128;
+const OUTPUT_RECOVERY_POLICY_ID: &str = "output_recovery_v1";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct OutputPolicy {
@@ -430,6 +432,145 @@ impl std::fmt::Display for OutputError {
 
 impl std::error::Error for OutputError {}
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OutputRecoveryObservation {
+    pub(crate) operation: &'static str,
+    pub(crate) layer: &'static str,
+    pub(crate) outcome: &'static str,
+    pub(crate) reason: &'static str,
+    pub(crate) policy_id: &'static str,
+    pub(crate) captured_bytes: u64,
+    pub(crate) stored_bytes: u64,
+    pub(crate) visible_bytes: u64,
+    pub(crate) known_omitted_bytes: u64,
+    pub(crate) unknown_total: bool,
+    pub(crate) stream: Option<OutputStream>,
+    pub(crate) range: Option<(u64, u64)>,
+    pub(crate) repeated: bool,
+    pub(crate) termination: Option<&'static str>,
+    pub(crate) artifact: Option<&'static str>,
+}
+
+impl OutputRecoveryObservation {
+    fn event(
+        operation: &'static str,
+        layer: &'static str,
+        outcome: &'static str,
+        reason: &'static str,
+    ) -> Self {
+        Self {
+            operation,
+            layer,
+            outcome,
+            reason,
+            policy_id: OUTPUT_RECOVERY_POLICY_ID,
+            captured_bytes: 0,
+            stored_bytes: 0,
+            visible_bytes: 0,
+            known_omitted_bytes: 0,
+            unknown_total: false,
+            stream: None,
+            range: None,
+            repeated: false,
+            termination: None,
+            artifact: None,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ObservationState {
+    events: VecDeque<OutputRecoveryObservation>,
+    recall_digests: VecDeque<String>,
+    terminal_command_ids: VecDeque<String>,
+}
+
+fn output_error_reason(error: OutputError) -> &'static str {
+    match error {
+        OutputError::InsufficientBudget => "insufficient_budget",
+        OutputError::SourceIncomplete => "source_incomplete",
+        OutputError::StorageLimit => "storage_limit",
+        OutputError::Missing => "missing",
+        OutputError::StorageFailed => "storage_failed",
+        OutputError::Corrupt => "corrupt",
+        OutputError::Expired => "expired",
+        OutputError::OwnerMismatch => "owner_mismatch",
+        OutputError::InvalidCursor => "invalid_cursor",
+        OutputError::StaleSource => "stale_source",
+        OutputError::OutOfRange => "out_of_range",
+        OutputError::AmbiguousCallId => "ambiguous_call_id",
+        OutputError::UnsupportedSchema => "unsupported_schema",
+        OutputError::RecoveryUnavailable => "recovery_unavailable",
+    }
+}
+
+fn availability_reason(availability: &Availability) -> &'static str {
+    match availability {
+        Availability::Available => "available",
+        Availability::Missing => "missing",
+        Availability::Expired => "expired",
+        Availability::StoreFailed => "store_failed",
+        Availability::Corrupt => "corrupt",
+    }
+}
+
+fn continuation_reason(continuation: &Continuation) -> &'static str {
+    match continuation {
+        Continuation::Next { .. } => "next",
+        Continuation::SelectionEnd => "selection_end",
+        Continuation::Eof => "eof",
+        Continuation::Pending => "pending",
+        Continuation::Unavailable => "unavailable",
+    }
+}
+
+fn capture_reason(capture: &CaptureState) -> &'static str {
+    match capture {
+        CaptureState::Running => "running",
+        CaptureState::Complete => "complete",
+        CaptureState::Partial => "partial",
+    }
+}
+
+fn execution_reason(execution: &ExecutionStatus) -> &'static str {
+    match execution {
+        ExecutionStatus::NotApplicable => "not_applicable",
+        ExecutionStatus::Exited { code: Some(0), .. } => "exited_zero",
+        ExecutionStatus::Exited { code: Some(_), .. } => "exited_nonzero",
+        ExecutionStatus::Exited { code: None, .. } => "exited_unknown",
+        ExecutionStatus::TimedOut => "timed_out",
+        ExecutionStatus::Cancelled => "cancelled",
+        ExecutionStatus::Running => "running",
+        ExecutionStatus::Unknown => "unknown",
+    }
+}
+
+fn range_bytes(ranges: &[OutputRange]) -> u64 {
+    ranges
+        .iter()
+        .map(|range| range.end.saturating_sub(range.start))
+        .sum()
+}
+
+fn captured_bytes(document: &OutputDocument) -> (u64, bool) {
+    let command = matches!(document.source, OutputSource::Command { .. });
+    document
+        .parts
+        .iter()
+        .filter(|part| part.stream != OutputStream::Display)
+        .fold((0u64, false), |(bytes, unknown), part| {
+            let captured = if command {
+                part.total.unwrap_or(part.text.len() as u64)
+            } else {
+                part.text.len() as u64
+            };
+            (
+                bytes.saturating_add(captured),
+                unknown || part.total.is_none(),
+            )
+        })
+}
+
 pub fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -759,6 +900,7 @@ pub struct OutputState {
     pub owner: ReadReceiptOwner,
     entries: Mutex<VecDeque<Entry>>,
     store: Mutex<Option<Arc<crate::output_store::OutputStore>>>,
+    observations: Mutex<ObservationState>,
 }
 
 impl OutputState {
@@ -777,7 +919,304 @@ impl OutputState {
             owner,
             entries: Mutex::new(VecDeque::new()),
             store: Mutex::new(None),
+            observations: Mutex::new(ObservationState::default()),
         }
+    }
+
+    fn observe(&self, observation: OutputRecoveryObservation) {
+        metrics::counter!(
+            "octos_output_recovery_events_total",
+            "operation" => observation.operation,
+            "layer" => observation.layer,
+            "outcome" => observation.outcome,
+            "reason" => observation.reason,
+            "policy" => observation.policy_id,
+        )
+        .increment(1);
+        match observation.operation {
+            "capture" => {
+                metrics::counter!(
+                    "octos_output_recovery_bytes_total",
+                    "stage" => "captured",
+                    "policy" => observation.policy_id,
+                )
+                .increment(observation.captured_bytes);
+            }
+            "save" => {
+                metrics::counter!(
+                    "octos_output_recovery_bytes_total",
+                    "stage" => "stored",
+                    "policy" => observation.policy_id,
+                )
+                .increment(observation.stored_bytes);
+                metrics::counter!(
+                    "octos_output_recovery_bytes_total",
+                    "stage" => "omitted_at_save",
+                    "policy" => observation.policy_id,
+                )
+                .increment(observation.known_omitted_bytes);
+            }
+            "render" => {
+                metrics::counter!(
+                    "octos_output_recovery_bytes_total",
+                    "stage" => "visible",
+                    "policy" => observation.policy_id,
+                )
+                .increment(observation.visible_bytes);
+                metrics::counter!(
+                    "octos_output_recovery_bytes_total",
+                    "stage" => "omitted_at_render",
+                    "policy" => observation.policy_id,
+                )
+                .increment(observation.known_omitted_bytes);
+            }
+            _ => {}
+        }
+        if observation.unknown_total {
+            metrics::counter!(
+                "octos_output_recovery_unknown_totals_total",
+                "stage" => observation.operation,
+                "policy" => observation.policy_id,
+            )
+            .increment(1);
+        }
+        tracing::debug!(
+            target: "octos.output_recovery",
+            operation = observation.operation,
+            layer = observation.layer,
+            outcome = observation.outcome,
+            reason = observation.reason,
+            policy = observation.policy_id,
+            captured_bytes = observation.captured_bytes,
+            stored_bytes = observation.stored_bytes,
+            visible_bytes = observation.visible_bytes,
+            known_omitted_bytes = observation.known_omitted_bytes,
+            unknown_total = observation.unknown_total,
+            stream = ?observation.stream,
+            range_start = observation.range.map(|range| range.0),
+            range_end = observation.range.map(|range| range.1),
+            repeated = observation.repeated,
+            termination = observation.termination.unwrap_or("none"),
+            artifact = observation.artifact.unwrap_or("none"),
+            "output recovery event"
+        );
+        let mut state = self
+            .observations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.events.len() >= OBSERVATION_ENTRIES {
+            state.events.pop_front();
+        }
+        state.events.push_back(observation);
+    }
+
+    fn observe_render(
+        &self,
+        layer: &'static str,
+        captured: u64,
+        unknown: bool,
+        result: &Result<RenderedOutput, OutputError>,
+    ) {
+        let mut observation = match result {
+            Ok(rendered) => {
+                let visible = range_bytes(&rendered.view.visible_ranges);
+                let reason = if rendered.view.transformed {
+                    "source_transformed"
+                } else if visible < captured {
+                    "output_budget"
+                } else {
+                    continuation_reason(&rendered.view.continuation)
+                };
+                let mut event =
+                    OutputRecoveryObservation::event("render", layer, "success", reason);
+                event.stored_bytes = rendered.view.stored_bytes;
+                event.visible_bytes = visible;
+                event.known_omitted_bytes = if unknown {
+                    0
+                } else {
+                    captured.saturating_sub(visible)
+                };
+                event.stream = rendered
+                    .view
+                    .visible_ranges
+                    .first()
+                    .map(|range| range.stream);
+                event.range = rendered
+                    .view
+                    .visible_ranges
+                    .first()
+                    .map(|range| (range.start, range.end));
+                event
+            }
+            Err(error) => OutputRecoveryObservation::event(
+                "render",
+                layer,
+                "failure",
+                output_error_reason(*error),
+            ),
+        };
+        observation.captured_bytes = captured;
+        observation.unknown_total = unknown;
+        self.observe(observation);
+    }
+
+    pub(crate) fn observe_recall_request(
+        &self,
+        request: &crate::output_store::RecallRequest,
+    ) -> bool {
+        let request_digest = digest(&serde_json::to_vec(request).unwrap_or_default());
+        let repeated = {
+            let mut state = self
+                .observations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let repeated = state.recall_digests.contains(&request_digest);
+            if !repeated {
+                if state.recall_digests.len() >= OBSERVATION_ENTRIES {
+                    state.recall_digests.pop_front();
+                }
+                state.recall_digests.push_back(request_digest);
+            }
+            repeated
+        };
+        let reason = if request.cursor.is_some() {
+            "cursor"
+        } else if request.page.is_some() {
+            "page"
+        } else if request.offset.is_some() || request.limit.is_some() {
+            "range"
+        } else if request.tool_call_id.is_some() {
+            "legacy_call"
+        } else {
+            "output"
+        };
+        let mut observation =
+            OutputRecoveryObservation::event("recall", "request", "attempt", reason);
+        observation.stream = request.stream;
+        observation.range = request.offset.and_then(|start| {
+            request
+                .limit
+                .and_then(|limit| start.checked_add(limit).map(|end| (start, end)))
+        });
+        observation.repeated = repeated;
+        self.observe(observation);
+        repeated
+    }
+
+    pub(crate) fn observe_recall_result(
+        &self,
+        result: &Result<RenderedOutput, OutputError>,
+        repeated: bool,
+    ) {
+        let mut observation = match result {
+            Ok(rendered) => {
+                let visible = range_bytes(&rendered.view.visible_ranges);
+                let reason = if matches!(rendered.view.continuation, Continuation::Next { .. }) {
+                    if rendered
+                        .view
+                        .visible_ranges
+                        .first()
+                        .is_some_and(|range| range.end > range.start)
+                    {
+                        "strict_progress"
+                    } else {
+                        "no_progress"
+                    }
+                } else {
+                    continuation_reason(&rendered.view.continuation)
+                };
+                let mut event =
+                    OutputRecoveryObservation::event("recall", "result", "success", reason);
+                event.stored_bytes = rendered.view.stored_bytes;
+                event.visible_bytes = visible;
+                event.unknown_total = rendered.view.transformed
+                    || rendered
+                        .view
+                        .source_totals
+                        .iter()
+                        .any(|(_, total)| total.is_none());
+                event.stream = rendered
+                    .view
+                    .visible_ranges
+                    .first()
+                    .map(|range| range.stream);
+                event.range = rendered
+                    .view
+                    .visible_ranges
+                    .first()
+                    .map(|range| (range.start, range.end));
+                event.artifact = Some(availability_reason(&rendered.view.availability));
+                event
+            }
+            Err(error) => OutputRecoveryObservation::event(
+                "recall",
+                "result",
+                "failure",
+                output_error_reason(*error),
+            ),
+        };
+        observation.repeated = repeated;
+        metrics::counter!(
+            "octos_output_recovery_recall_total",
+            "outcome" => observation.outcome,
+            "reason" => observation.reason,
+            "repeated" => if repeated { "true" } else { "false" },
+            "policy" => observation.policy_id,
+        )
+        .increment(1);
+        self.observe(observation);
+    }
+
+    fn observe_command_terminal(&self, view: &OutputView) {
+        if !matches!(view.source, OutputSource::Command { .. })
+            || matches!(view.execution, ExecutionStatus::Running)
+        {
+            return;
+        }
+        let first = {
+            let mut state = self
+                .observations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.terminal_command_ids.contains(&view.output_id) {
+                false
+            } else {
+                if state.terminal_command_ids.len() >= OBSERVATION_ENTRIES {
+                    state.terminal_command_ids.pop_front();
+                }
+                state.terminal_command_ids.push_back(view.output_id.clone());
+                true
+            }
+        };
+        if !first {
+            return;
+        }
+        let termination = execution_reason(&view.execution);
+        let artifact = availability_reason(&view.availability);
+        metrics::counter!(
+            "octos_output_recovery_command_executions_total",
+            "termination" => termination,
+            "artifact" => artifact,
+            "policy" => OUTPUT_RECOVERY_POLICY_ID,
+        )
+        .increment(1);
+        let mut observation =
+            OutputRecoveryObservation::event("command", "execution", "terminal", termination);
+        observation.stored_bytes = view.stored_bytes;
+        observation.termination = Some(termination);
+        observation.artifact = Some(artifact);
+        self.observe(observation);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observations(&self) -> Vec<OutputRecoveryObservation> {
+        self.observations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .events
+            .iter()
+            .cloned()
+            .collect()
     }
 
     pub fn enable_store(&self, data_dir: &std::path::Path) -> Result<(), OutputError> {
@@ -823,9 +1262,10 @@ impl OutputState {
                     entry.document = Arc::new((*entry.document).clone().with_notice(
                         &crate::sanitize::sanitize_tool_output(&format!("[hook] {feedback}")),
                     ));
-                    if let Ok(rendered) =
-                        render(&entry.document, &entry.rendered.view, entry.budget)
-                    {
+                    let (captured, unknown_total) = captured_bytes(&entry.document);
+                    let rendered = render(&entry.document, &entry.rendered.view, entry.budget);
+                    self.observe_render("hook", captured, unknown_total, &rendered);
+                    if let Ok(rendered) = rendered {
                         entry.digests.push_back(rendered.view.view_digest.clone());
                         result.output = rendered.content.clone();
                         entry.rendered = rendered;
@@ -888,6 +1328,7 @@ impl OutputState {
         success: bool,
         budget: usize,
     ) -> Result<RenderedOutput, OutputError> {
+        let (captured, source_total_unknown) = captured_bytes(&document);
         if document.parts.iter().any(|part| {
             part.start
                 .checked_add(part.text.len() as u64)
@@ -903,9 +1344,28 @@ impl OutputState {
                             .is_none()
                 })
         }) {
+            let mut observation = OutputRecoveryObservation::event(
+                "capture",
+                "source",
+                "failure",
+                "source_incomplete",
+            );
+            observation.captured_bytes = captured;
+            observation.unknown_total = source_total_unknown;
+            self.observe(observation);
             return Err(OutputError::SourceIncomplete);
         }
+        let mut capture_observation = OutputRecoveryObservation::event(
+            "capture",
+            "source",
+            "success",
+            capture_reason(&document.capture),
+        );
+        capture_observation.captured_bytes = captured;
+        capture_observation.unknown_total = source_total_unknown;
+        self.observe(capture_observation);
         document.sanitize();
+        let projection_total_unknown = source_total_unknown || document.transformed;
         if document.transformed && document.file_read.is_some() && document.loss_reason.is_none() {
             document.loss_reason = Some("source_transformed".into());
         }
@@ -954,9 +1414,15 @@ impl OutputState {
             recovery_boundary: None,
             historical: false,
         };
+        let mut save_outcome = "skipped";
+        let mut save_reason = "store_unavailable";
         if let Some(store) = self.store() {
             match store.save(&view, &document) {
-                Ok(stored) => view = stored,
+                Ok(stored) => {
+                    view = stored;
+                    save_outcome = "success";
+                    save_reason = "available";
+                }
                 Err(error) => {
                     view.availability = if error == OutputError::Corrupt {
                         Availability::Corrupt
@@ -964,9 +1430,24 @@ impl OutputState {
                         Availability::StoreFailed
                     };
                     view.loss_reason = Some(error.to_string());
+                    save_outcome = "failure";
+                    save_reason = output_error_reason(error);
                 }
             }
         }
+        let mut save_observation =
+            OutputRecoveryObservation::event("save", "artifact", save_outcome, save_reason);
+        save_observation.captured_bytes = captured;
+        save_observation.stored_bytes = view.stored_bytes;
+        save_observation.known_omitted_bytes = if projection_total_unknown {
+            0
+        } else {
+            captured.saturating_sub(view.stored_bytes)
+        };
+        save_observation.unknown_total = projection_total_unknown;
+        save_observation.artifact = Some(availability_reason(&view.availability));
+        self.observe(save_observation);
+        self.observe_command_terminal(&view);
         let mut remaining = crate::output_store::OUTPUT_BYTES;
         for part in &mut document.parts {
             let stored = view
@@ -989,7 +1470,9 @@ impl OutputState {
             }
             remaining -= end;
         }
-        let rendered = render(&document, &view, budget)?;
+        let rendered = render(&document, &view, budget);
+        self.observe_render("initial", captured, projection_total_unknown, &rendered);
+        let rendered = rendered?;
         self.remember(document, rendered.clone(), budget);
         Ok(rendered)
     }
@@ -1000,13 +1483,22 @@ impl OutputState {
         args: &serde_json::Value,
         mut recalled: crate::output_store::RecalledOutput,
     ) -> Result<RenderedOutput, OutputError> {
+        let (captured, unknown_total) = captured_bytes(&recalled.document);
         if recalled.rendered.view.owner != self.owner {
+            self.observe_render(
+                "recall",
+                captured,
+                unknown_total,
+                &Err(OutputError::OwnerMismatch),
+            );
             return Err(OutputError::OwnerMismatch);
         }
         recalled.rendered.view.call_id = crate::agent::normalize_tool_call_id(call_id);
         recalled.rendered.view.arguments_digest =
             digest(&serde_json::to_vec(args).unwrap_or_default());
-        let rendered = render(&recalled.document, &recalled.rendered.view, PAGE_BYTES)?;
+        let rendered = render(&recalled.document, &recalled.rendered.view, PAGE_BYTES);
+        self.observe_render("recall", captured, unknown_total, &rendered);
+        let rendered = rendered?;
         self.remember(recalled.document, rendered.clone(), PAGE_BYTES);
         Ok(rendered)
     }
@@ -1057,7 +1549,10 @@ impl OutputState {
         };
         let budget = budget.min(entry.budget);
         entry.budget = budget;
-        let rendered = render(&entry.document, &entry.rendered.view, budget)?;
+        let (captured, unknown_total) = captured_bytes(&entry.document);
+        let rendered = render(&entry.document, &entry.rendered.view, budget);
+        self.observe_render("projection", captured, unknown_total, &rendered);
+        let rendered = rendered?;
         if !entry.digests.contains(&rendered.view.view_digest) {
             // Keep the initial execution view for history re-projection.
             if entry.digests.len() >= 8 {
@@ -1200,6 +1695,12 @@ impl OutputState {
                     .ok_or(OutputError::Missing)?;
                 message.content = rendered.content;
             } else {
+                self.observe(OutputRecoveryObservation::event(
+                    "render",
+                    "provider",
+                    "failure",
+                    "source_incomplete",
+                ));
                 let error =
                     "source_incomplete: output metadata missing or changed; recovery unavailable";
                 if budget < error.len() {
