@@ -7,7 +7,8 @@ use octos_core::{Message, MessageRole};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::model_read_receipts::ReadReceiptOwner;
+use crate::file_state_cache::FileVersion;
+use crate::model_read_receipts::{FileView, ModelReadReceiptStore, ReadReceiptOwner};
 
 pub const PAGE_BYTES: usize = 8192;
 pub const MIN_PAGE_BYTES: usize = 512;
@@ -126,6 +127,84 @@ pub struct OutputPart {
 }
 
 #[derive(Clone, Debug)]
+pub struct FileReadEvidence {
+    version: FileVersion,
+    requested_view: FileView,
+    line_end: Option<u64>,
+    selection_end: u64,
+    bounded: bool,
+}
+
+impl FileReadEvidence {
+    pub(crate) fn new(
+        version: FileVersion,
+        requested_view: FileView,
+        line_end: Option<u64>,
+        selection_end: u64,
+        bounded: bool,
+    ) -> Self {
+        Self {
+            version,
+            requested_view,
+            line_end,
+            selection_end,
+            bounded,
+        }
+    }
+
+    fn next_arguments(&self, range: &OutputRange) -> Option<serde_json::Value> {
+        if range.end >= self.selection_end {
+            return None;
+        }
+        let mut arguments = serde_json::json!({
+            "source_sha256": self.version.content_sha256(),
+        });
+        if let Some((_, line_end)) = range.lines {
+            arguments["offset"] = serde_json::json!(line_end + 1);
+            if let Some(end) = self.line_end {
+                arguments["end_line"] = serde_json::json!(end);
+            }
+        } else {
+            arguments["byte_offset"] = serde_json::json!(range.end);
+            if self.bounded {
+                arguments["byte_limit"] =
+                    serde_json::json!(self.selection_end.saturating_sub(range.end));
+            }
+        }
+        Some(arguments)
+    }
+
+    fn visible_view(&self, view: &OutputView) -> Option<FileView> {
+        if view.transformed {
+            return None;
+        }
+        if self.requested_view == FileView::Full
+            && self.version.size() == 0
+            && view.visible_ranges.is_empty()
+        {
+            return Some(FileView::Full);
+        }
+        let range = view
+            .visible_ranges
+            .iter()
+            .find(|range| range.stream == OutputStream::File)?;
+        if self.requested_view == FileView::Full
+            && range.start == 0
+            && range.end == self.version.size()
+        {
+            return Some(FileView::Full);
+        }
+        match range.lines {
+            Some((start, end)) => Some(FileView::Lines { start, end }),
+            None => Some(FileView::Bytes {
+                start: range.start,
+                end: range.end,
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct OutputDocument {
     pub source: OutputSource,
     pub parts: Vec<OutputPart>,
@@ -133,6 +212,7 @@ pub struct OutputDocument {
     pub execution: ExecutionStatus,
     pub transformed: bool,
     pub loss_reason: Option<String>,
+    pub file_read: Option<FileReadEvidence>,
 }
 
 impl OutputDocument {
@@ -193,6 +273,7 @@ impl OutputDocument {
             execution: ExecutionStatus::exited(output.status),
             transformed,
             loss_reason: None,
+            file_read: None,
         }
     }
 
@@ -210,6 +291,7 @@ impl OutputDocument {
             execution: ExecutionStatus::Unknown,
             transformed: true,
             loss_reason: Some("missing_source_metadata".into()),
+            file_read: None,
         }
     }
 
@@ -477,6 +559,20 @@ pub fn render(
             "recovery_error": if view.recoverable { None } else { Some("recovery_tool_unavailable") },
             "loss": view.loss_reason,
         });
+        if !view.transformed
+            && matches!(view.continuation, Continuation::Next { .. })
+            && let Some(arguments) = document.file_read.as_ref().and_then(|evidence| {
+                view.visible_ranges
+                    .iter()
+                    .find(|range| range.stream == OutputStream::File)
+                    .and_then(|range| evidence.next_arguments(range))
+            })
+        {
+            header["read_file_next"] = serde_json::json!({
+                "same_path": true,
+                "arguments": arguments,
+            });
+        }
         if view.recoverable {
             header["stored"] = serde_json::json!(view.stored_ranges);
             header["historical"] = serde_json::json!(view.historical);
@@ -539,6 +635,8 @@ struct Entry {
     rendered: RenderedOutput,
     /// Known exact projections, never parsed from model-supplied text.
     digests: VecDeque<String>,
+    /// Final provider projections already offered to the H02 receipt state.
+    receipt_digests: VecDeque<String>,
     bytes: usize,
     budget: usize,
 }
@@ -696,6 +794,9 @@ impl OutputState {
             return Err(OutputError::SourceIncomplete);
         }
         document.sanitize();
+        if document.transformed && document.file_read.is_some() && document.loss_reason.is_none() {
+            document.loss_reason = Some("source_transformed".into());
+        }
         if let OutputSource::Command { run_id } = &mut document.source {
             *run_id = id.clone();
         }
@@ -804,6 +905,7 @@ impl OutputState {
         entries.push_back(Entry {
             document: Arc::new(document),
             digests: VecDeque::from([rendered.view.view_digest.clone()]),
+            receipt_digests: VecDeque::new(),
             rendered: rendered.clone(),
             bytes,
             budget: budget.min(PAGE_BYTES),
@@ -842,12 +944,89 @@ impl OutputState {
         if !entry.digests.contains(&rendered.view.view_digest) {
             // Keep the initial execution view for history re-projection.
             if entry.digests.len() >= 8 {
-                entry.digests.remove(1);
+                if let Some(removed) = entry.digests.remove(1) {
+                    entry.receipt_digests.retain(|digest| digest != &removed);
+                }
             }
             entry.digests.push_back(rendered.view.view_digest.clone());
         }
         entry.rendered = rendered.clone();
         Ok(Some(rendered))
+    }
+
+    /// Stage only file ranges present in the exact request passed to the main model.
+    pub(crate) fn stage_file_reads(&self, messages: &[Message], receipts: &ModelReadReceiptStore) {
+        if !self.policy.enabled {
+            return;
+        }
+        let mut open_calls = VecDeque::new();
+        for message in messages {
+            match message.role {
+                MessageRole::Assistant => {
+                    open_calls.clear();
+                    open_calls.extend(message.tool_calls.iter().flatten().cloned());
+                }
+                MessageRole::Tool => {
+                    let Some(call_id) = message.tool_call_id.as_deref() else {
+                        continue;
+                    };
+                    let call_id = crate::agent::normalize_tool_call_id(call_id);
+                    let Some(index) = open_calls
+                        .iter()
+                        .position(|call| crate::agent::normalize_tool_call_id(&call.id) == call_id)
+                    else {
+                        continue;
+                    };
+                    let Some(call) = open_calls.remove(index) else {
+                        continue;
+                    };
+                    if call.name != "read_file" {
+                        continue;
+                    }
+                    let content_digest = digest(message.content.as_bytes());
+                    let arguments_digest =
+                        digest(&serde_json::to_vec(&call.arguments).unwrap_or_default());
+                    let candidate = {
+                        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+                        entries
+                            .iter_mut()
+                            .find(|entry| {
+                                entry.rendered.view.call_id == call_id
+                                    && entry.rendered.view.arguments_digest == arguments_digest
+                                    && entry.rendered.view.view_digest == content_digest
+                                    && entry.digests.contains(&content_digest)
+                                    && !entry.receipt_digests.contains(&content_digest)
+                                    && entry.document.file_read.is_some()
+                            })
+                            .and_then(|entry| {
+                                let evidence = entry.document.file_read.as_ref()?;
+                                let returned_view = evidence.visible_view(&entry.rendered.view)?;
+                                let requested_view =
+                                    match (&evidence.requested_view, &returned_view) {
+                                        (
+                                            FileView::Full | FileView::Lines { .. },
+                                            FileView::Bytes { .. },
+                                        ) => returned_view.clone(),
+                                        _ => evidence.requested_view.clone(),
+                                    };
+                                entry.receipt_digests.push_back(content_digest.clone());
+                                Some((evidence.version.clone(), requested_view, returned_view))
+                            })
+                    };
+                    if let Some((version, requested_view, returned_view)) = candidate {
+                        receipts.stage(
+                            &call.id,
+                            &call.arguments,
+                            version,
+                            requested_view,
+                            returned_view,
+                            &message.content,
+                        );
+                    }
+                }
+                MessageRole::System | MessageRole::User => open_calls.clear(),
+            }
+        }
     }
 
     /// Final dispatch guard, including bridge failure and direct Agent callers.

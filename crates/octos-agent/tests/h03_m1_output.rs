@@ -49,6 +49,7 @@ fn document(stream: OutputStream, text: &str) -> OutputDocument {
         },
         transformed: false,
         loss_reason: None,
+        file_read: None,
     }
 }
 

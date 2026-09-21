@@ -8429,6 +8429,7 @@ mod tests {
                     },
                     transformed: false,
                     loss_reason: None,
+                    file_read: None,
                 },
                 false,
                 PAGE_BYTES,

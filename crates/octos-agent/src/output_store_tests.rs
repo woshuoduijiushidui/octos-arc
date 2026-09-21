@@ -28,6 +28,7 @@ fn document(text: &str, start: u64) -> OutputDocument {
         execution: ExecutionStatus::NotApplicable,
         transformed: false,
         loss_reason: None,
+        file_read: None,
     }
 }
 
@@ -490,6 +491,7 @@ fn h03_m2_per_stream_capacity_keeps_prefix_and_real_failure_status() {
         },
         transformed: false,
         loss_reason: None,
+        file_read: None,
     };
     let id = uuid::Uuid::new_v4().to_string();
     let saved = state

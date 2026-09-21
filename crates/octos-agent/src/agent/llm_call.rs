@@ -114,6 +114,9 @@ impl Agent {
         // non-empty provider response succeeds. Silent checkpoint calls use a
         // different model purpose and must not consume or activate the main
         // branch's candidates.
+        if emit_progress && let Some(receipts) = self.model_read_receipts.as_ref() {
+            self.output_state.stage_file_reads(messages, receipts);
+        }
         let mut pending_read_receipts = if emit_progress {
             self.model_read_receipts.as_ref().map(|receipts| {
                 let context_policy = self

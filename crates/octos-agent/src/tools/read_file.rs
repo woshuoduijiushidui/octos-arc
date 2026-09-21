@@ -304,6 +304,10 @@ struct ReadFileInput {
     /// window). Requires `byte_offset`.
     #[serde(default)]
     byte_limit: Option<usize>,
+    /// Strong version returned by a prior H03 page. When present, a changed
+    /// file fails instead of mixing bytes from two generations.
+    #[serde(default)]
+    source_sha256: Option<String>,
 }
 
 /// Resolve the effective `(start_line, end_line)` pair from the three
@@ -344,7 +348,11 @@ impl Tool for ReadFileTool {
     // per-instance override or `OCTOS_READ_WINDOW`, both stable for a process,
     // so `specs()` sees a consistent answer.)
     fn description(&self) -> &str {
-        if self.window_armed() || crate::output_recovery::OutputPolicy::from_env().enabled {
+        if crate::output_recovery::OutputPolicy::from_env().enabled {
+            "Read the contents of a file. Returns one bounded page with exact source ranges. \
+             When read_file_next is present, call read_file again with the same path plus those \
+             arguments; source_sha256 prevents pages from different file versions being mixed."
+        } else if self.window_armed() {
             "Read the contents of a file. Returns the file content with line numbers. Large \
              results are truncated to a bounded window and the message names the exact call to \
              continue (offset/limit, or byte_offset for raw byte paging of very long lines) — \
@@ -394,6 +402,15 @@ impl Tool for ReadFileTool {
                     "description": "Raw byte mode: maximum bytes to return (default and cap: the read window). Requires byte_offset."
                 }),
             );
+            if crate::output_recovery::OutputPolicy::from_env().enabled {
+                props.insert(
+                    "source_sha256".to_string(),
+                    serde_json::json!({
+                        "type": "string",
+                        "description": "Optional source version from a prior read_file page. Reuse it while paging so a changed file returns stale_source instead of mixed content."
+                    }),
+                );
+            }
         }
         serde_json::json!({
             "type": "object",
@@ -520,6 +537,20 @@ impl ReadFileTool {
             .is_some_and(|state| state.policy.enabled);
         let window_armed = self.window_armed() || recovery_enabled;
         let dedup_enabled = self.dedup_enabled();
+        if let Some(version) = input.source_sha256.as_deref() {
+            let valid = version.len() == 71
+                && version.starts_with("sha256:")
+                && version[7..].bytes().all(|byte| byte.is_ascii_hexdigit());
+            if !recovery_enabled || !valid {
+                observation.reason = "invalid_range";
+                return Ok(ToolResult {
+                    output: "invalid_cursor: source_sha256 is unavailable or malformed".into(),
+                    success: false,
+                    structured_metadata: Some(serde_json::json!({"code": "invalid_cursor"})),
+                    ..Default::default()
+                });
+            }
+        }
 
         // #1638: raw byte mode is a distinct coordinate system — mixing it
         // with line parameters is ambiguous and rejected, like end_line+limit.
@@ -641,6 +672,26 @@ impl ReadFileTool {
             };
             observation.observe_version(&meta);
             record_file_version(ctx, &meta);
+            if let Some(expected) = input.source_sha256.as_deref() {
+                let Some(version) = meta.file_version.as_ref() else {
+                    observation.reason = "missing_state";
+                    return Ok(ToolResult {
+                        output: "source_incomplete: current file version is unavailable".into(),
+                        success: false,
+                        structured_metadata: Some(serde_json::json!({"code": "source_incomplete"})),
+                        ..Default::default()
+                    });
+                };
+                if version.content_sha256() != expected {
+                    observation.reason = "digest_changed";
+                    return Ok(ToolResult {
+                        output: "stale_source: file changed since the previous page; start a new read without source_sha256".into(),
+                        success: false,
+                        structured_metadata: Some(serde_json::json!({"code": "stale_source"})),
+                        ..Default::default()
+                    });
+                }
+            }
             let total = content.len();
             let range = if let Some(offset) = input.byte_offset {
                 if offset > total {
@@ -672,7 +723,17 @@ impl ReadFileTool {
                 if end == start && start < total {
                     end += content[start..].chars().next().unwrap().len_utf8();
                 }
-                (start, end, None)
+                (
+                    start,
+                    end,
+                    None,
+                    FileView::Bytes {
+                        start: start as u64,
+                        end: end as u64,
+                    },
+                    None,
+                    input.byte_limit.is_some(),
+                )
             } else {
                 let first = start_line.unwrap_or(1);
                 if first == 0
@@ -702,16 +763,36 @@ impl ReadFileTool {
                         ..Default::default()
                     });
                 }
+                let selected_start = line_start_byte_offset(&content, first);
+                let selected_end = if end >= count {
+                    total
+                } else {
+                    line_start_byte_offset(&content, end + 1)
+                };
+                let requested_view = if start_line.is_none() && end_line.is_none() {
+                    FileView::Full
+                } else {
+                    FileView::Lines {
+                        start: first as u64,
+                        end: end as u64,
+                    }
+                };
                 (
-                    line_start_byte_offset(&content, first),
-                    if end >= count {
-                        total
-                    } else {
-                        line_start_byte_offset(&content, end + 1)
-                    },
+                    selected_start,
+                    selected_end,
                     Some(first as u64),
+                    requested_view,
+                    end_line.map(|_| end as u64),
+                    end_line.is_some(),
                 )
             };
+            match unchanged_result(ctx, &meta, &range.3, dedup_enabled) {
+                Ok((result, receipt)) => {
+                    observation.hit(receipt);
+                    return Ok(result);
+                }
+                Err(reason) => observation.miss(reason),
+            }
             let selected = content[range.0..range.1].to_owned();
             let source = meta
                 .file_version
@@ -721,6 +802,15 @@ impl ReadFileTool {
                     sha256: version.content_sha256().to_owned(),
                 })
                 .unwrap_or(OutputSource::Unspecified);
+            let file_read = meta.file_version.clone().map(|version| {
+                crate::output_recovery::FileReadEvidence::new(
+                    version,
+                    range.3,
+                    range.4,
+                    range.1 as u64,
+                    range.5,
+                )
+            });
             return Ok(ToolResult {
                 output: selected.clone(),
                 output_document: Some(OutputDocument {
@@ -736,6 +826,7 @@ impl ReadFileTool {
                     execution: ExecutionStatus::NotApplicable,
                     transformed: meta.transformed,
                     loss_reason: None,
+                    file_read,
                 }),
                 success: true,
                 ..Default::default()
@@ -2971,5 +3062,104 @@ mod tests {
             "M1 must return the requested range body: {}",
             second.output
         );
+    }
+
+    #[tokio::test]
+    async fn h03_page_is_identical_across_read_window_and_dedup_switches() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("h03.txt"),
+            (1..=3_000)
+                .map(|line| format!("line-{line:04}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let mut expected = None;
+        for window in [false, true] {
+            for dedup in [false, true] {
+                let task = crate::TaskFileState::for_local_workspace(dir.path()).unwrap();
+                let branch = task
+                    .for_branch("task", "session", format!("{window}-{dedup}"))
+                    .unwrap();
+                let receipts = branch.receipts().clone();
+                let owner = receipts.owner().unwrap().clone();
+                let output_state = Arc::new(crate::output_recovery::OutputState::new(
+                    crate::output_recovery::OutputPolicy { enabled: true },
+                    owner,
+                ));
+                let mut ctx = ToolContext::zero();
+                ctx.tool_id = "call".into();
+                ctx.output_id = uuid::Uuid::new_v4().simple().to_string();
+                ctx.file_state_cache = Some(branch.ledger().clone());
+                ctx.model_read_receipts = Some(receipts.clone());
+                ctx.task_file_state = Some(branch.task_state().clone());
+                ctx.output_state = Some(output_state.clone());
+                let args = serde_json::json!({"path": "h03.txt"});
+                let tool = ReadFileTool::new(dir.path())
+                    .with_window_enforcement(window)
+                    .with_deduplication(dedup);
+                let mut result = tool.execute_with_context(&ctx, &args).await.unwrap();
+                assert!(result.output_document.is_some());
+                output_state.finish_result(
+                    &ctx.output_id,
+                    &ctx.tool_id,
+                    "read_file",
+                    &args,
+                    &mut result,
+                    None,
+                );
+                let header: serde_json::Value =
+                    serde_json::from_str(result.output.split_once('\n').unwrap().0).unwrap();
+                assert!(header["read_file_next"]["arguments"]["offset"].is_number());
+                assert_eq!(receipts.staged_len(), 0);
+                assert_eq!(receipts.active_len(), 0);
+                let comparable = (
+                    header["ranges"].clone(),
+                    result.output.split_once('\n').unwrap().1.to_owned(),
+                );
+                if let Some(expected) = &expected {
+                    assert_eq!(&comparable, expected);
+                } else {
+                    expected = Some(comparable);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn source_version_requires_h03_and_a_well_formed_digest() {
+        let owner = crate::model_read_receipts::ReadReceiptOwner::new(
+            "workspace",
+            "task",
+            "session",
+            "root",
+        )
+        .unwrap();
+        for (enabled, source_sha256) in [
+            (false, format!("sha256:{}", "a".repeat(64))),
+            (true, "not-a-version".to_string()),
+        ] {
+            let mut ctx = ToolContext::zero();
+            ctx.output_state = Some(Arc::new(crate::output_recovery::OutputState::new(
+                crate::output_recovery::OutputPolicy { enabled },
+                owner.clone(),
+            )));
+            let result = ReadFileTool::new("/tmp")
+                .execute_with_context(
+                    &ctx,
+                    &serde_json::json!({
+                        "path": "unused.txt",
+                        "source_sha256": source_sha256,
+                    }),
+                )
+                .await
+                .unwrap();
+            assert!(!result.success);
+            assert!(result.output.starts_with("invalid_cursor:"));
+            assert_eq!(
+                result.structured_metadata.as_ref().unwrap()["code"],
+                "invalid_cursor"
+            );
+        }
     }
 }

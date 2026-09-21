@@ -983,6 +983,7 @@ impl OutputStore {
             execution: manifest.view.execution.clone(),
             transformed: manifest.view.transformed,
             loss_reason: manifest.view.loss_reason.clone(),
+            file_read: None,
         };
         let mut view = manifest.view.clone();
         // render() must know the rest of the saved selection even when only one page was read.
