@@ -3297,6 +3297,10 @@ impl ActorFactory {
         .and_then(|task_state| {
             task_state.for_branch(session_key.to_string(), session_key.to_string(), "root")
         });
+        let output_owner = task_file_state
+            .as_ref()
+            .and_then(|state| state.receipts().owner())
+            .cloned();
         let (initial_context_manager, context_ledger_status) = load_or_rebuild_context_manager(
             &self.data_dir,
             session_key.to_string(),
@@ -4008,6 +4012,16 @@ impl ActorFactory {
             .with_subagent_summary_generator(subagent_summary_generator);
         if let Some(file_state) = task_file_state {
             agent = agent.with_file_state(file_state);
+        }
+        if let Some(owner) = output_owner {
+            let output_state = Arc::new(octos_agent::output_recovery::OutputState::new(
+                octos_agent::output_recovery::OutputPolicy::from_env(),
+                owner,
+            ));
+            if let Err(error) = output_state.enable_store(&self.data_dir) {
+                warn!(session = %session_key, error = %error, "tool output recovery unavailable");
+            }
+            agent = agent.with_output_state(output_state);
         }
         if let Some(scope) = session_scope_arc.clone() {
             agent = agent.with_session_scope(scope);

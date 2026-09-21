@@ -4541,6 +4541,7 @@ dependencies = [
  "dunce",
  "eyre",
  "flate2",
+ "fs2",
  "futures",
  "gix",
  "glob",

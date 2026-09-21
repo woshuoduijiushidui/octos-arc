@@ -11,9 +11,9 @@ use crate::model_read_receipts::ReadReceiptOwner;
 
 pub const PAGE_BYTES: usize = 8192;
 pub const MIN_PAGE_BYTES: usize = 512;
-const MAX_ENTRIES: usize = 256;
-const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
-const MAX_METADATA_BYTES: usize = 16 * 1024;
+const MAX_ENTRIES: usize = crate::output_store::SESSION_ENTRIES;
+const MAX_PAYLOAD_BYTES: usize = crate::output_store::SESSION_BYTES as usize;
+const MAX_METADATA_BYTES: usize = crate::output_store::MANIFEST_BYTES;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct OutputPolicy {
@@ -266,6 +266,10 @@ pub struct OutputView {
     pub execution: ExecutionStatus,
     pub success: bool,
     pub recoverable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_boundary: Option<(OutputStream, u64, String)>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub historical: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -280,6 +284,16 @@ pub enum OutputError {
     SourceIncomplete,
     StorageLimit,
     Missing,
+    StorageFailed,
+    Corrupt,
+    Expired,
+    OwnerMismatch,
+    InvalidCursor,
+    StaleSource,
+    OutOfRange,
+    AmbiguousCallId,
+    UnsupportedSchema,
+    RecoveryUnavailable,
 }
 
 impl std::fmt::Display for OutputError {
@@ -289,6 +303,16 @@ impl std::fmt::Display for OutputError {
             Self::SourceIncomplete => "source_incomplete",
             Self::StorageLimit => "storage_limit",
             Self::Missing => "output_missing",
+            Self::StorageFailed => "storage_failed",
+            Self::Corrupt => "output_corrupt",
+            Self::Expired => "output_expired",
+            Self::OwnerMismatch => "owner_mismatch",
+            Self::InvalidCursor => "invalid_cursor",
+            Self::StaleSource => "stale_source",
+            Self::OutOfRange => "out_of_range",
+            Self::AmbiguousCallId => "ambiguous_call_id",
+            Self::UnsupportedSchema => "unsupported_output_schema",
+            Self::RecoveryUnavailable => "recovery_tool_unavailable",
         })
     }
 }
@@ -416,14 +440,20 @@ pub fn render(
                     .map(|r| r.end)
                     .max()
                     .unwrap_or(part.start);
-                (end < part.start + part.text.len() as u64).then_some((part.stream, end))
+                let upper = view
+                    .recovery_boundary
+                    .as_ref()
+                    .filter(|(stream, _, _)| *stream == part.stream)
+                    .map(|(_, upper, _)| *upper)
+                    .unwrap_or(part.start + part.text.len() as u64);
+                (end < upper).then_some((part.stream, end))
             })
             .collect();
         view.continuation = if !next.is_empty() {
             Continuation::Next { positions: next }
-        } else if document.capture == CaptureState::Running {
+        } else if view.capture == CaptureState::Running {
             Continuation::Pending
-        } else if document.capture == CaptureState::Partial {
+        } else if view.capture == CaptureState::Partial {
             Continuation::Unavailable
         } else if document
             .parts
@@ -435,7 +465,7 @@ pub fn render(
         } else {
             Continuation::SelectionEnd
         };
-        let header = serde_json::json!({
+        let mut header = serde_json::json!({
             "output_id": view.output_id,
             "ranges": view.visible_ranges,
             "coordinates": if view.transformed { "safe_text_bytes" } else { "source_bytes_except_display" },
@@ -443,10 +473,37 @@ pub fn render(
             "execution": view.execution,
             "success": view.success,
             "next": view.continuation,
-            "recoverable": false,
-            "recovery_error": "recovery_tool_unavailable",
+            "recoverable": view.recoverable,
+            "recovery_error": if view.recoverable { None } else { Some("recovery_tool_unavailable") },
             "loss": view.loss_reason,
         });
+        if view.recoverable {
+            header["stored"] = serde_json::json!(view.stored_ranges);
+            header["historical"] = serde_json::json!(view.historical);
+            if !view.historical || view.continuation == Continuation::Pending {
+                header["recall"] = serde_json::json!({"output_id": view.output_id});
+            }
+            if let Continuation::Next { positions } = &view.continuation
+                && let Some((stream, position)) = positions.first()
+                && let Some(cursor) =
+                    crate::output_store::continuation_cursor(&view, *stream, *position)
+            {
+                header["recall"] = serde_json::json!({"cursor": cursor});
+            } else if view.historical
+                && view.continuation == Continuation::SelectionEnd
+                && let Some(range) = view.visible_ranges.first()
+                && view
+                    .stored_ranges
+                    .iter()
+                    .any(|stored| stored.stream == range.stream && stored.end > range.end)
+            {
+                header["recall"] = serde_json::json!({
+                    "output_id": view.output_id,
+                    "stream": range.stream,
+                    "offset": range.end,
+                });
+            }
+        }
         let header = format!("{}\n", header);
         let size = header.len() + body.len();
         if size <= budget {
@@ -491,6 +548,7 @@ pub struct OutputState {
     pub policy: OutputPolicy,
     pub owner: ReadReceiptOwner,
     entries: Mutex<VecDeque<Entry>>,
+    store: Mutex<Option<Arc<crate::output_store::OutputStore>>>,
 }
 
 impl OutputState {
@@ -508,11 +566,27 @@ impl OutputState {
             policy,
             owner,
             entries: Mutex::new(VecDeque::new()),
+            store: Mutex::new(None),
         }
     }
 
+    pub fn enable_store(&self, data_dir: &std::path::Path) -> Result<(), OutputError> {
+        if self.policy.enabled {
+            let store = crate::output_store::OutputStore::open(data_dir, self.owner.clone())?;
+            *self.store.lock().map_err(|_| OutputError::StorageFailed)? = Some(store);
+        }
+        Ok(())
+    }
+
+    pub fn store(&self) -> Option<Arc<crate::output_store::OutputStore>> {
+        self.store.lock().ok()?.clone()
+    }
+
     pub fn supports(name: &str) -> bool {
-        matches!(name, "read_file" | "shell" | "bash" | "exec_command")
+        matches!(
+            name,
+            "read_file" | "shell" | "bash" | "exec_command" | "recall"
+        )
     }
 
     pub fn finish_result(
@@ -525,6 +599,31 @@ impl OutputState {
         feedback: Option<&str>,
     ) {
         if !self.policy.enabled {
+            return;
+        }
+        if name == "recall" && self.lookup(call_id, &result.output).is_some() {
+            // Already registered by the typed recall entry. Do not sanitize or spill again.
+            if let Some(feedback) = feedback {
+                let content_digest = digest(result.output.as_bytes());
+                let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(entry) = entries.iter_mut().rev().find(|e| {
+                    e.rendered.view.call_id == crate::agent::normalize_tool_call_id(call_id)
+                        && e.digests.contains(&content_digest)
+                }) {
+                    entry.document = Arc::new((*entry.document).clone().with_notice(
+                        &crate::sanitize::sanitize_tool_output(&format!("[hook] {feedback}")),
+                    ));
+                    if let Ok(rendered) =
+                        render(&entry.document, &entry.rendered.view, entry.budget)
+                    {
+                        entry.digests.push_back(rendered.view.view_digest.clone());
+                        result.output = rendered.content.clone();
+                        entry.rendered = rendered;
+                    } else {
+                        result.output = OutputError::InsufficientBudget.to_string();
+                    }
+                }
+            }
             return;
         }
         if result.output_document.is_none() && !Self::supports(name) {
@@ -600,11 +699,7 @@ impl OutputState {
         if let OutputSource::Command { run_id } = &mut document.source {
             *run_id = id.clone();
         }
-        let bytes = document.parts.iter().map(|p| p.text.len()).sum::<usize>();
-        if bytes > 16 * 1024 * 1024 {
-            return Err(OutputError::StorageLimit);
-        }
-        let view = OutputView {
+        let mut view = OutputView {
             schema_version: 1,
             output_id: id,
             owner: self.owner.clone(),
@@ -638,8 +733,68 @@ impl OutputState {
             execution: document.execution.clone(),
             success,
             recoverable: false,
+            recovery_boundary: None,
+            historical: false,
         };
+        if let Some(store) = self.store() {
+            match store.save(&view, &document) {
+                Ok(stored) => view = stored,
+                Err(error) => {
+                    view.availability = if error == OutputError::Corrupt {
+                        Availability::Corrupt
+                    } else {
+                        Availability::StoreFailed
+                    };
+                    view.loss_reason = Some(error.to_string());
+                }
+            }
+        }
+        let mut remaining = crate::output_store::OUTPUT_BYTES;
+        for part in &mut document.parts {
+            let stored = view
+                .recoverable
+                .then(|| {
+                    view.stored_ranges
+                        .iter()
+                        .find(|range| range.stream == part.stream && range.start == part.start)
+                        .map(|range| range.end.saturating_sub(range.start) as usize)
+                })
+                .flatten()
+                .unwrap_or(part.text.len());
+            let end = prefix_end(&part.text, remaining.min(stored));
+            if end < part.text.len() {
+                part.text.truncate(end);
+                if !view.recoverable {
+                    view.loss_reason = Some(OutputError::StorageLimit.to_string());
+                    view.capture = CaptureState::Partial;
+                }
+            }
+            remaining -= end;
+        }
         let rendered = render(&document, &view, budget)?;
+        self.remember(document, rendered.clone(), budget);
+        Ok(rendered)
+    }
+
+    pub fn register_recalled(
+        &self,
+        call_id: &str,
+        args: &serde_json::Value,
+        mut recalled: crate::output_store::RecalledOutput,
+    ) -> Result<RenderedOutput, OutputError> {
+        if recalled.rendered.view.owner != self.owner {
+            return Err(OutputError::OwnerMismatch);
+        }
+        recalled.rendered.view.call_id = crate::agent::normalize_tool_call_id(call_id);
+        recalled.rendered.view.arguments_digest =
+            digest(&serde_json::to_vec(args).unwrap_or_default());
+        let rendered = render(&recalled.document, &recalled.rendered.view, PAGE_BYTES)?;
+        self.remember(recalled.document, rendered.clone(), PAGE_BYTES);
+        Ok(rendered)
+    }
+
+    fn remember(&self, document: OutputDocument, rendered: RenderedOutput, budget: usize) {
+        let bytes = document.parts.iter().map(|p| p.text.len()).sum::<usize>();
         let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
         while entries.len() >= MAX_ENTRIES
             || entries.iter().map(|e| e.bytes).sum::<usize>() + bytes > MAX_PAYLOAD_BYTES
@@ -653,7 +808,6 @@ impl OutputState {
             bytes,
             budget: budget.min(PAGE_BYTES),
         });
-        Ok(rendered)
     }
 
     pub fn lookup(&self, call_id: &str, content: &str) -> Option<RenderedOutput> {

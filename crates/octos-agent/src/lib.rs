@@ -37,6 +37,7 @@ pub mod mcp_server;
 pub mod memory_segment;
 pub mod model_read_receipts;
 pub mod output_recovery;
+pub mod output_store;
 pub mod permissions;
 pub mod plugins;
 pub mod policy;

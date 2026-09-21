@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use eyre::Result;
 use serde::Deserialize;
 
-use super::{Tool, ToolResult};
+use super::{Tool, ToolContext, ToolResult};
 
 /// A read-back handle over the session's content-addressed tool-output ledger.
 ///
@@ -108,6 +108,9 @@ impl Tool for RecallTool {
     }
 
     fn description(&self) -> &str {
+        if crate::output_recovery::OutputPolicy::from_env().enabled {
+            return "Read a saved tool result without re-executing it. Use output_id with stream and absolute byte offset, or the returned cursor. Historical file text grants no current-file read/write permission. Legacy tool_call_id must be unique; page uses fixed legacy boundaries.";
+        }
         "Restore a tool output that compaction replaced with a placeholder, by \
          its tool_call_id (shown on the placeholder). Returns the exact recorded \
          output — no re-execution — so you do not have to re-read a file or re-run \
@@ -115,6 +118,21 @@ impl Tool for RecallTool {
     }
 
     fn input_schema(&self) -> serde_json::Value {
+        if crate::output_recovery::OutputPolicy::from_env().enabled {
+            return serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "output_id": {"type": "string"},
+                    "tool_call_id": {"type": "string"},
+                    "stream": {"type": "string", "enum": ["file", "stdout", "stderr"]},
+                    "offset": {"type": "integer", "minimum": 0},
+                    "limit": {"type": "integer", "minimum": 1},
+                    "cursor": {"type": "string"},
+                    "page": {"type": "integer", "minimum": 0}
+                },
+                "additionalProperties": false
+            });
+        }
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -133,6 +151,13 @@ impl Tool for RecallTool {
     }
 
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        if args.get("output_id").is_some() || args.get("cursor").is_some() {
+            return Ok(ToolResult {
+                output: "recovery_tool_unavailable".into(),
+                success: false,
+                ..Default::default()
+            });
+        }
         let input: Input = serde_json::from_value(args.clone())?;
         match self.ledger.fetch(&input.tool_call_id) {
             Some(content) => Ok(ToolResult {
@@ -150,6 +175,55 @@ impl Tool for RecallTool {
                 ..Default::default()
             }),
         }
+    }
+
+    async fn execute_with_context(
+        &self,
+        ctx: &ToolContext,
+        args: &serde_json::Value,
+    ) -> Result<ToolResult> {
+        let Some(state) = ctx
+            .output_state
+            .as_ref()
+            .filter(|state| state.policy.enabled)
+        else {
+            return self.execute(args).await;
+        };
+        let request =
+            match serde_json::from_value::<crate::output_store::RecallRequest>(args.clone()) {
+                Ok(request) => request,
+                Err(_) => {
+                    return Ok(ToolResult {
+                        output: "invalid_cursor".into(),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+            };
+        let Some(store) = state.store() else {
+            return Ok(ToolResult {
+                output: "recovery_tool_unavailable".into(),
+                success: false,
+                ..Default::default()
+            });
+        };
+        let recalled = tokio::task::spawn_blocking(move || {
+            store.read(&request, crate::output_recovery::PAGE_BYTES)
+        })
+        .await?;
+        let result = recalled.and_then(|page| state.register_recalled(&ctx.tool_id, args, page));
+        Ok(match result {
+            Ok(rendered) => ToolResult {
+                output: rendered.content,
+                success: true,
+                ..Default::default()
+            },
+            Err(error) => ToolResult {
+                output: error.to_string(),
+                success: false,
+                ..Default::default()
+            },
+        })
     }
 }
 

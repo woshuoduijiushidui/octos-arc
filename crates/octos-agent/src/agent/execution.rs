@@ -580,10 +580,17 @@ impl Agent {
                 // to its limit FIRST, then append feedback — mirrors the
                 // spawned dispatch site so a downstream cap cannot cut the
                 // checker feedback appended last.
-                let limit = octos_core::tool_output_limit(&pending.request.tool_name);
-                result.output = octos_core::truncate_head_tail(&result.output, limit, 0.7);
-                result.output.push_str("\n\n[hook] ");
-                result.output.push_str(&feedback);
+                if !self.output_state.policy.enabled
+                    || (result.output_document.is_none()
+                        && !crate::output_recovery::OutputState::supports(
+                            &pending.request.tool_name,
+                        ))
+                {
+                    let limit = octos_core::tool_output_limit(&pending.request.tool_name);
+                    result.output = octos_core::truncate_head_tail(&result.output, limit, 0.7);
+                    result.output.push_str("\n\n[hook] ");
+                    result.output.push_str(&feedback);
+                }
             }
         }
 
