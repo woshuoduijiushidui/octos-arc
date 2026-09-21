@@ -377,6 +377,7 @@ what's missing.";
 pub(super) fn compose_system_prompt(agent: &Agent) -> String {
     let mut content = agent.system_prompt_snapshot();
     content.push_str(TOOL_USE_DISCIPLINE);
+    crate::local_edit::append_guidance(&mut content, agent.tools.local_edit_guidance_enabled());
     if let Some(summary) = agent.realtime_sensor_summary() {
         if !content.ends_with('\n') {
             content.push('\n');

@@ -1704,6 +1704,8 @@ mod profile_integration_tests {
     use octos_llm::{ChatResponse, LlmProvider, ToolSpec};
     use octos_memory::EpisodeStore;
 
+    use crate::profile::ProfileDefinition;
+
     #[test]
     fn clamp_env_secs_floor_one_keeps_guard_live() {
         // env_secs_or semantics: 0 floors to 1 so the guard is always live.
@@ -1755,8 +1757,6 @@ mod profile_integration_tests {
     }
 
     async fn agent_with_builtin_profile(cwd: &std::path::Path, name: &str) -> Agent {
-        use crate::profile::ProfileDefinition;
-
         let memory = Arc::new(
             EpisodeStore::open(cwd.join(format!("memory-profile-{name}")))
                 .await
@@ -1780,6 +1780,94 @@ mod profile_integration_tests {
             .collect();
         names.sort();
         names
+    }
+
+    async fn agent_with_local_edit_policy(cwd: &std::path::Path, enabled: bool) -> Agent {
+        let memory = Arc::new(
+            EpisodeStore::open(cwd.join(format!("memory-local-edit-{enabled}")))
+                .await
+                .expect("episode store"),
+        );
+        let provider: Arc<dyn LlmProvider> = Arc::new(NoopProvider);
+        let profile = ProfileDefinition::builtin("coding").expect("coding");
+        let mut tools = ToolRegistry::with_builtins(cwd);
+        profile.apply_to_registry(&mut tools);
+        tools.set_local_edit_policy(crate::local_edit::LocalEditPolicy { enabled });
+        Agent::new(AgentId::new("local-edit"), provider, tools, memory)
+            .with_profile(Arc::new(profile))
+    }
+
+    #[tokio::test]
+    async fn local_edit_guidance_is_opt_in_and_injected_once() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let off = agent_with_local_edit_policy(tmp.path(), false).await;
+        let on = agent_with_local_edit_policy(tmp.path(), true).await;
+
+        let off_prompt = execution::compose_system_prompt(&off);
+        let on_prompt = execution::compose_system_prompt(&on);
+        assert!(!off_prompt.contains(crate::local_edit::LOCAL_EDIT_GUIDANCE_HEADING));
+        assert_eq!(
+            on_prompt
+                .matches(crate::local_edit::LOCAL_EDIT_GUIDANCE_HEADING)
+                .count(),
+            1
+        );
+        assert_eq!(tool_names(&off), tool_names(&on));
+
+        let off_specs = off.tool_registry().specs();
+        let on_specs = on.tool_registry().specs();
+        let changed = off_specs
+            .iter()
+            .zip(&on_specs)
+            .filter_map(|(before, after)| {
+                assert_eq!(before.name, after.name);
+                assert_eq!(before.input_schema, after.input_schema);
+                (before.description != after.description).then_some(before.name.as_str())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(changed, ["diff_edit", "edit_file", "write_file"]);
+
+        let catalog = on.tool_registry().catalog_snapshot();
+        for spec in on_specs
+            .iter()
+            .filter(|spec| changed.contains(&spec.name.as_str()))
+        {
+            let entry = catalog
+                .iter()
+                .find(|entry| entry.name == spec.name)
+                .expect("edited tool must remain discoverable");
+            assert_eq!(entry.description, spec.description);
+        }
+    }
+
+    #[tokio::test]
+    async fn local_edit_guidance_is_hidden_when_an_editor_is_unavailable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let memory = Arc::new(
+            EpisodeStore::open(tmp.path().join("memory-local-edit-restricted"))
+                .await
+                .expect("episode store"),
+        );
+        let provider: Arc<dyn LlmProvider> = Arc::new(NoopProvider);
+        let mut tools = ToolRegistry::with_builtins(tmp.path());
+        tools.retain(|name| name == "write_file");
+        tools.set_local_edit_policy(crate::local_edit::LocalEditPolicy { enabled: true });
+        let agent = Agent::new(
+            AgentId::new("local-edit-restricted"),
+            provider,
+            tools,
+            memory,
+        );
+
+        let prompt = execution::compose_system_prompt(&agent);
+        assert!(!prompt.contains(crate::local_edit::LOCAL_EDIT_GUIDANCE_HEADING));
+        let specs = agent.tool_registry().specs();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(
+            specs[0].description,
+            "Write content to a file. Creates the file if it doesn't exist, or overwrites if it \
+             does."
+        );
     }
 
     #[tokio::test]

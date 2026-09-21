@@ -194,6 +194,8 @@ pub struct ToolRegistry {
     /// wins when present. `spawn_only` tools never reach this path (they are
     /// backgrounded earlier in the execution loop).
     tool_timeout_secs: u64,
+    /// H05 policy captured once when this registry is constructed.
+    local_edit_policy: crate::local_edit::LocalEditPolicy,
     /// RFC-1 fixup (codex P1): tool names that are registered for
     /// **internal** dispatch only — callable through `get()` /
     /// `get_tool()` so internal forwarders (e.g. the `mofa_make`
@@ -252,6 +254,7 @@ impl ToolRegistry {
             session_key: None,
             output_dir_hint: None,
             tool_timeout_secs: DEFAULT_REGISTRY_TOOL_TIMEOUT_SECS,
+            local_edit_policy: crate::local_edit::LocalEditPolicy::from_env(),
             internal_hidden: HashSet::new(),
             // #1607: default to a no-op sandbox. Constructors that receive a
             // real sandbox (`with_builtins_and_permissions`,
@@ -661,6 +664,19 @@ impl ToolRegistry {
         self.is_tool_visible_post_activation(name)
     }
 
+    pub(crate) fn local_edit_guidance_enabled(&self) -> bool {
+        self.local_edit_policy.enabled
+            && ["write_file", "edit_file", "diff_edit"]
+                .iter()
+                .all(|name| self.is_tool_visible(name))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_local_edit_policy(&mut self, policy: crate::local_edit::LocalEditPolicy) {
+        self.local_edit_policy = policy;
+        self.invalidate_cache();
+    }
+
     /// Visibility predicate shared with [`is_tool_visible`] that applies the
     /// `provider_policy` + `context_filter` checks.
     pub fn is_tool_visible_post_activation(&self, name: &str) -> bool {
@@ -702,6 +718,7 @@ impl ToolRegistry {
         if let Some(ref specs) = *cache {
             return specs.clone();
         }
+        let local_edit_guidance = self.local_edit_guidance_enabled();
 
         // RFC-0 (#1289): every enabled tool is emitted every turn. The only
         // exclusions remaining are internal-hidden tools (mofa_make
@@ -731,7 +748,12 @@ impl ToolRegistry {
             .filter(|t| self.active_context_allows(t.as_ref()))
             .map(|t| ToolSpec {
                 name: t.name().to_string(),
-                description: t.description().to_string(),
+                description: crate::local_edit::tool_description(
+                    t.name(),
+                    t.description(),
+                    local_edit_guidance,
+                )
+                .to_string(),
                 input_schema: t.input_schema(),
             })
             .collect();
@@ -1041,6 +1063,7 @@ impl ToolRegistry {
             session_key: None,
             output_dir_hint: self.output_dir_hint.clone(),
             tool_timeout_secs: self.tool_timeout_secs,
+            local_edit_policy: self.local_edit_policy,
             // RFC-1 fixup (codex P1): propagate internal-hidden markers
             // onto per-turn snapshots so the per-turn registry observes
             // the same invariants as the parent (mofa_make targets stay
@@ -1384,6 +1407,7 @@ impl ToolRegistry {
     /// list. Used by `with_builtins` to wire `tool_search` / `tool_suggest`
     /// against the effective coding tool contract.
     pub fn catalog_snapshot(&self) -> Vec<ToolCatalogEntry> {
+        let local_edit_guidance = self.local_edit_guidance_enabled();
         self.tools
             .values()
             // RFC-1 fixup (codex P1): exclude internal-hidden tools from
@@ -1406,7 +1430,11 @@ impl ToolRegistry {
             .map(|tool| {
                 ToolCatalogEntry::new(
                     tool.name(),
-                    tool.description(),
+                    crate::local_edit::tool_description(
+                        tool.name(),
+                        tool.description(),
+                        local_edit_guidance,
+                    ),
                     tool.tags().iter().map(|t| (*t).to_string()).collect(),
                 )
             })

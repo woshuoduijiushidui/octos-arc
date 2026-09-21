@@ -30,6 +30,7 @@ pub mod format;
 pub mod harness_errors;
 pub mod harness_events;
 pub mod hooks;
+mod local_edit;
 pub mod loop_detect;
 pub mod mcp;
 pub mod mcp_auth;
