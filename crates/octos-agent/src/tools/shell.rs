@@ -1265,6 +1265,7 @@ impl Tool for ShellTool {
                     "\n... (output truncated)",
                 );
 
+                let notice_start = result_text.len();
                 result_text.push_str(&exit_suffix);
                 if let Some(hint) = denial_hint {
                     result_text.push_str(hint);
@@ -1290,6 +1291,14 @@ impl Tool for ShellTool {
                 }
 
                 Ok(ToolResult {
+                    output_document: ctx
+                        .output_state
+                        .as_ref()
+                        .filter(|state| state.policy.enabled)
+                        .map(|_| {
+                            crate::output_recovery::OutputDocument::command(&output)
+                                .with_notice(&result_text[notice_start..])
+                        }),
                     output: result_text,
                     success: output.status.success(),
                     ..Default::default()
@@ -1352,6 +1361,11 @@ impl Tool for ShellTool {
                         .status();
                 }
                 Ok(ToolResult {
+                    output_document: ctx
+                        .output_state
+                        .as_ref()
+                        .filter(|state| state.policy.enabled)
+                        .map(|_| crate::output_recovery::OutputDocument::timed_out()),
                     output: format!(
                         "Command timed out after {} seconds",
                         timeout_duration.as_secs()

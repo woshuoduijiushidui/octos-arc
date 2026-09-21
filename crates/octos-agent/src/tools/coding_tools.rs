@@ -550,6 +550,7 @@ impl ExecCommandTool {
                 if text.is_empty() {
                     text.push_str("(no output)");
                 }
+                let notice_start = text.len();
                 text.push_str(&format!(
                     "\n\nExit code: {}",
                     output.status.code().unwrap_or(-1)
@@ -579,12 +580,21 @@ impl ExecCommandTool {
                 let hint =
                     sandbox_denial_hint(!self.sandbox.is_noop(), output.status.success(), &text);
                 let max = input.max_output_tokens.unwrap_or(MAX_CAPTURE_BYTES);
+                let output_document = TOOL_CTX
+                    .try_with(|ctx| ctx.output_state.as_ref().is_some_and(|s| s.policy.enabled))
+                    .unwrap_or(false)
+                    .then(|| {
+                        crate::output_recovery::OutputDocument::command(&output)
+                            .with_notice(&text[notice_start..])
+                            .with_notice(hint.unwrap_or_default())
+                    });
                 let mut out = truncate_output(text, max);
                 if let Some(hint) = hint {
                     out.push_str(hint);
                 }
                 Ok(ToolResult {
                     output: out,
+                    output_document,
                     success: output.status.success(),
                     ..Default::default()
                 })
@@ -602,6 +612,10 @@ impl ExecCommandTool {
                 // helper the `bash` tool uses.
                 kill_timed_out_child(child_pid).await;
                 Ok(ToolResult {
+                    output_document: TOOL_CTX
+                        .try_with(|ctx| ctx.output_state.as_ref().is_some_and(|s| s.policy.enabled))
+                        .unwrap_or(false)
+                        .then(crate::output_recovery::OutputDocument::timed_out),
                     output: format!("Command timed out after {timeout_secs} seconds"),
                     success: false,
                     ..Default::default()
@@ -2125,6 +2139,7 @@ impl Tool for BashTool {
                     text.push_str("(no output)");
                 }
                 let exit_code = output.status.code().unwrap_or(-1);
+                let notice_start = text.len();
                 text.push_str(&format!("\n\nExit code: {exit_code}"));
                 // #28c — file-change receipt appended ONCE to THIS result's
                 // tail (28a semantics: prompt-cache stable, never a system
@@ -2150,12 +2165,21 @@ impl Tool for BashTool {
                 // Scan BEFORE truncation, append AFTER — see run_to_completion.
                 let hint =
                     sandbox_denial_hint(!self.sandbox.is_noop(), output.status.success(), &text);
+                let output_document = TOOL_CTX
+                    .try_with(|ctx| ctx.output_state.as_ref().is_some_and(|s| s.policy.enabled))
+                    .unwrap_or(false)
+                    .then(|| {
+                        crate::output_recovery::OutputDocument::command(&output)
+                            .with_notice(&text[notice_start..])
+                            .with_notice(hint.unwrap_or_default())
+                    });
                 let mut out = truncate_output(text, MAX_CAPTURE_BYTES);
                 if let Some(hint) = hint {
                     out.push_str(hint);
                 }
                 Ok(ToolResult {
                     output: out,
+                    output_document,
                     success: output.status.success(),
                     structured_metadata: Some(json!({
                         "codex_tool": "bash",
@@ -2173,6 +2197,10 @@ impl Tool for BashTool {
             Err(_) => {
                 kill_timed_out_child(child_pid).await;
                 Ok(ToolResult {
+                    output_document: TOOL_CTX
+                        .try_with(|ctx| ctx.output_state.as_ref().is_some_and(|s| s.policy.enabled))
+                        .unwrap_or(false)
+                        .then(crate::output_recovery::OutputDocument::timed_out),
                     output: format!("Command timed out after {timeout_secs} seconds"),
                     success: false,
                     ..Default::default()

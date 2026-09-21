@@ -1271,6 +1271,7 @@ impl Tool for RunPipelineTool {
 
         Ok(ToolResult {
             output: format!("{bounded_output}{footer}"),
+            output_document: None,
             success: result.success,
             tokens_used: Some(result.token_usage),
             file_modified: delivery.report_file,
@@ -1573,6 +1574,7 @@ fn cascade_fail_orphan_node_tasks(
 pub(crate) fn build_pipeline_timeout_result(timeout_secs: u64) -> ToolResult {
     ToolResult {
         output: format!("pipeline timed out after {timeout_secs}s"),
+        output_document: None,
         success: false,
         tokens_used: None,
         file_modified: None,

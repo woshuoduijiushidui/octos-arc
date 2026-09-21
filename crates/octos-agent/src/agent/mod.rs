@@ -440,6 +440,7 @@ pub struct Agent {
     pub(super) file_state_cache: Option<Arc<FileStateCache>>,
     /// Branch-local proof that this model received exact `read_file` output.
     pub(super) model_read_receipts: Option<Arc<ModelReadReceiptStore>>,
+    pub(super) output_state: Arc<crate::output_recovery::OutputState>,
     /// Complete task/branch file state. Kept explicitly so child builders can
     /// share only the ledger and mint their own receipt store.
     pub(super) task_file_state: Option<ModelBranchFileState>,
@@ -637,6 +638,9 @@ impl Agent {
         crate::plugins::PluginLoader::wire_mofa_make_registry_back_ref(&tools);
 
         Self {
+            output_state: crate::output_recovery::OutputState::for_agent(
+                tools.workspace_root().unwrap_or(std::path::Path::new(".")),
+            ),
             id,
             llm,
             tools,
@@ -726,6 +730,9 @@ impl Agent {
         crate::plugins::PluginLoader::wire_mofa_make_registry_back_ref(&tools);
 
         Self {
+            output_state: crate::output_recovery::OutputState::for_agent(
+                tools.workspace_root().unwrap_or(std::path::Path::new(".")),
+            ),
             id,
             llm,
             tools,
@@ -899,8 +906,21 @@ impl Agent {
     /// Attach a caller-owned prompt context manager. Optional; absent keeps
     /// the legacy agent-local compaction path.
     pub fn with_prompt_context_manager(mut self, manager: Arc<dyn PromptContextManager>) -> Self {
+        manager.set_output_state(self.output_state.clone());
         self.prompt_context_manager = Some(manager);
         self
+    }
+
+    pub fn with_output_state(mut self, state: Arc<crate::output_recovery::OutputState>) -> Self {
+        if let Some(manager) = &self.prompt_context_manager {
+            manager.set_output_state(state.clone());
+        }
+        self.output_state = state;
+        self
+    }
+
+    pub fn output_state(&self) -> &Arc<crate::output_recovery::OutputState> {
+        &self.output_state
     }
 
     /// Access the attached prompt context manager, if any.
@@ -1001,6 +1021,13 @@ impl Agent {
 
     /// Attach a complete task-local ledger and branch-local receipt store.
     pub fn with_file_state(mut self, state: ModelBranchFileState) -> Self {
+        if let Some(owner) = state.receipts().owner() {
+            let policy = self.output_state.policy;
+            self = self.with_output_state(Arc::new(crate::output_recovery::OutputState::new(
+                policy,
+                owner.clone(),
+            )));
+        }
         self.file_state_cache = Some(state.ledger().clone());
         self.model_read_receipts = Some(state.receipts().clone());
         self.task_file_state = Some(state);

@@ -321,6 +321,8 @@ pub(crate) enum ToolOutputTruncationReason {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ToolOutputEnvelope {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) output_view: Option<Box<octos_agent::output_recovery::OutputView>>,
     pub(crate) tool_call_id: String,
     pub(crate) tool_name: String,
     pub(crate) raw_sha256: String,
@@ -586,6 +588,7 @@ pub(crate) struct ContextManager {
     recovery_state: ContextRecoveryState,
     tool_output_policy: ToolOutputPolicy,
     tool_output_artifacts: HashMap<String, Vec<u8>>,
+    output_state: Option<std::sync::Arc<octos_agent::output_recovery::OutputState>>,
     /// #2131: `tool_call_id` -> recall handle, populated at record time and
     /// NEVER pruned by `compact_context` (which drops old `items`). Without
     /// this, a `recall(...)` placeholder emitted for an evicted output could
@@ -1295,6 +1298,7 @@ impl ContextManager {
             recovery_state: ContextRecoveryState::Exact,
             tool_output_policy: ToolOutputPolicy::default(),
             tool_output_artifacts: HashMap::new(),
+            output_state: None,
             recall_index: HashMap::new(),
             compactions: Vec::new(),
             cache_epoch: None,
@@ -1305,6 +1309,36 @@ impl ContextManager {
     pub(crate) fn with_tool_output_policy(mut self, policy: ToolOutputPolicy) -> Self {
         self.tool_output_policy = policy;
         self
+    }
+
+    pub(crate) fn set_output_state(
+        &mut self,
+        state: std::sync::Arc<octos_agent::output_recovery::OutputState>,
+    ) {
+        self.output_state = state.policy.enabled.then_some(state);
+    }
+
+    pub(crate) fn refresh_output_views(&mut self) {
+        let Some(state) = &self.output_state else {
+            return;
+        };
+        let mut changed = false;
+        for item in self.items.iter_mut().chain(self.ledger_items.iter_mut()) {
+            if let TranscriptItemKind::ToolOutput { envelope } = &mut item.kind {
+                if let Some(rendered) =
+                    state.lookup(&envelope.tool_call_id, &envelope.model_visible_content)
+                {
+                    changed |= envelope.output_view.as_deref() != Some(&rendered.view)
+                        || envelope.model_visible_content != rendered.content;
+                    envelope.model_visible_bytes = rendered.content.len();
+                    envelope.model_visible_content = rendered.content;
+                    envelope.output_view = Some(Box::new(rendered.view));
+                }
+            }
+        }
+        if changed {
+            self.generation += 1;
+        }
     }
 
     pub(crate) fn tool_output_policy_id(&self) -> &str {
@@ -1368,6 +1402,7 @@ impl ContextManager {
             recovery_state: ContextRecoveryState::Rebuilt,
             tool_output_policy: ToolOutputPolicy::default(),
             tool_output_artifacts: HashMap::new(),
+            output_state: None,
             recall_index: HashMap::new(),
             compactions: Vec::new(),
             cache_epoch: None,
@@ -1755,6 +1790,7 @@ impl ContextManager {
             },
             tool_output_policy: ToolOutputPolicy::default(),
             tool_output_artifacts: HashMap::new(),
+            output_state: None,
             recall_index: HashMap::new(),
             compactions: snapshot.compactions,
             cache_epoch: snapshot.cache_epoch,
@@ -2432,11 +2468,27 @@ impl ContextManager {
         let tool_call_id = normalize_tool_call_id(&tool_call_id.into());
         let raw_sha256 = sha256_prefixed(raw_output.as_bytes());
         let original_bytes = raw_output.len();
-        let (model_visible_content, truncation_reason) = truncate_utf8(
-            raw_output,
-            self.tool_output_policy.model_visible_max_bytes,
-            ToolOutputTruncationReason::MaxBytes,
-        );
+        let projected = self.output_state.as_ref().and_then(|state| {
+            state
+                .project(
+                    &tool_call_id,
+                    raw_output,
+                    self.tool_output_policy.model_visible_max_bytes,
+                )
+                .ok()
+                .flatten()
+                .or_else(|| state.lookup(&tool_call_id, raw_output))
+        });
+        let output_view = projected.as_ref().map(|r| Box::new(r.view.clone()));
+        let (model_visible_content, truncation_reason) = if let Some(projected) = projected {
+            (projected.content, None)
+        } else {
+            truncate_utf8(
+                raw_output,
+                self.tool_output_policy.model_visible_max_bytes,
+                ToolOutputTruncationReason::MaxBytes,
+            )
+        };
         let raw_artifact_ref = (truncation_reason.is_some()
             || original_bytes > self.tool_output_policy.inline_raw_threshold_bytes)
             .then(|| format!("tool-output/{raw_sha256}.txt"));
@@ -2462,6 +2514,7 @@ impl ContextManager {
         self.record_item_with_source_ref_and_group(
             TranscriptItemKind::ToolOutput {
                 envelope: ToolOutputEnvelope {
+                    output_view,
                     tool_call_id,
                     tool_name: tool_name.into(),
                     raw_sha256,
@@ -3219,6 +3272,7 @@ impl ContextManager {
                 &mut entries,
                 max_tokens,
                 &mut truncated_item_ids,
+                self.output_state.as_deref(),
             );
             trim_prompt_entries_preserving_invariants(
                 &mut entries,
@@ -3251,10 +3305,25 @@ impl ContextManager {
                     })
             })
             .collect();
-        let messages = entries
+        let mut messages = entries
             .into_iter()
             .map(|entry| entry.message)
             .collect::<Vec<_>>();
+        if let Some(state) = &self.output_state {
+            let fixed: usize = messages
+                .iter()
+                .filter(|m| m.role != MessageRole::Tool)
+                .map(|m| octos_llm::context::estimate_message_tokens(m) as usize * 3)
+                .sum::<usize>()
+                .saturating_add(messages.len() * 32);
+            let available = policy
+                .max_prompt_token_estimate
+                .map(|n| n.saturating_mul(3).saturating_sub(fixed))
+                .unwrap_or(usize::MAX);
+            // The final dispatch guard returns an explicit budget error if
+            // protected context still cannot fit after normal compaction.
+            let _ = state.prepare_messages(&mut messages, available);
+        }
         let token_estimate = estimate_messages_tokens(&messages);
         let output_prompt_hash = hash_prompt_messages(&messages);
         let report = NormalizationReport {
@@ -3663,12 +3732,22 @@ fn truncate_tool_outputs_for_context_pressure(
     entries: &mut [PromptMessageEntry],
     max_tokens: usize,
     truncated_item_ids: &mut Vec<TranscriptItemId>,
+    output_state: Option<&octos_agent::output_recovery::OutputState>,
 ) {
     if estimate_entries_tokens(entries) <= max_tokens {
         return;
     }
     let max_tool_bytes = (max_tokens.saturating_mul(4) / 2).max(1);
     for entry in entries.iter_mut() {
+        if output_state.is_some_and(|state| {
+            entry
+                .message
+                .tool_call_id
+                .as_ref()
+                .is_some_and(|id| state.lookup(id, &entry.message.content).is_some())
+        }) {
+            continue;
+        }
         if entry.message.role != MessageRole::Tool || entry.message.content.len() <= max_tool_bytes
         {
             continue;
@@ -5791,6 +5870,7 @@ mod tests {
             == std::mem::discriminant(&TranscriptItemKind::ToolOutput {
                 envelope: ToolOutputEnvelope {
                     tool_call_id: String::new(),
+                    output_view: None,
                     tool_name: String::new(),
                     raw_sha256: String::new(),
                     raw_artifact_ref: None,
@@ -8315,6 +8395,99 @@ mod tests {
                 .adopt_source_items_after(&canonical, watermark)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn h03_m1_typed_envelope_survives_projection_and_persistence() {
+        use octos_agent::model_read_receipts::ReadReceiptOwner;
+        use octos_agent::output_recovery::*;
+        let state = std::sync::Arc::new(OutputState::new(
+            OutputPolicy { enabled: true },
+            ReadReceiptOwner::new("workspace", "task", "session", "branch").unwrap(),
+        ));
+        let text = "中文🙂\r\n".repeat(3000);
+        let output = state
+            .register(
+                "immutable-occurrence".into(),
+                "call_1",
+                &serde_json::json!({"cmd": "echo hi"}),
+                OutputDocument {
+                    source: OutputSource::Command {
+                        run_id: String::new(),
+                    },
+                    parts: vec![OutputPart {
+                        stream: OutputStream::Stdout,
+                        total: Some(text.len() as u64),
+                        text,
+                        start: 0,
+                        first_line: None,
+                    }],
+                    capture: CaptureState::Complete,
+                    execution: ExecutionStatus::Exited {
+                        code: Some(7),
+                        signal: None,
+                    },
+                    transformed: false,
+                    loss_reason: None,
+                },
+                false,
+                PAGE_BYTES,
+            )
+            .unwrap();
+        let mut manager =
+            ContextManager::new("session", None).with_tool_output_policy(ToolOutputPolicy {
+                model_visible_max_bytes: 900,
+                ..ToolOutputPolicy::default()
+            });
+        manager.set_output_state(state);
+        manager.record_message(&assistant_tool_call("call_1"));
+        manager.record_tool_output("call_1", "shell", &output.content);
+        let frame = manager.for_prompt(&PromptBuildPolicy::default());
+        let message = frame
+            .messages
+            .iter()
+            .find(|m| m.role == MessageRole::Tool)
+            .unwrap();
+        assert!(message.content.len() <= 900);
+        assert!(!message.content.contains("[truncated]"));
+        let header: Value =
+            serde_json::from_str(message.content.split_once('\n').unwrap().0).unwrap();
+        assert_eq!(header["execution"]["code"], 7);
+        manager.refresh_output_views();
+        let snapshot = manager.snapshot();
+        let serialized = serde_json::to_vec(&snapshot).unwrap();
+        let restored = ContextManager::from_snapshot(serde_json::from_slice(&serialized).unwrap());
+        let envelope = restored
+            .items
+            .iter()
+            .find_map(|item| match &item.kind {
+                TranscriptItemKind::ToolOutput { envelope } => Some(envelope),
+                _ => None,
+            })
+            .unwrap();
+        let view = envelope.output_view.as_ref().unwrap();
+        assert_eq!(view.view_digest, digest(message.content.as_bytes()));
+        assert_eq!(
+            view.visible_ranges,
+            serde_json::from_value::<Vec<OutputRange>>(header["ranges"].clone()).unwrap()
+        );
+        assert_ne!(view.source_proof, output.view.source_proof);
+        assert_eq!(view.availability, Availability::Missing);
+        assert!(!view.recoverable);
+        assert_eq!(view.schema_version, 1);
+    }
+
+    #[test]
+    fn h03_m1_legacy_envelope_does_not_acquire_source_claims() {
+        let mut manager = ContextManager::new("session", None);
+        manager.record_tool_output("call", "legacy", "old body");
+        let snapshot = serde_json::to_value(manager.snapshot()).unwrap();
+        assert!(!snapshot.to_string().contains("output_view"));
+        let restored = ContextManager::from_snapshot(serde_json::from_value(snapshot).unwrap());
+        assert!(restored.items.iter().all(|item| match &item.kind {
+            TranscriptItemKind::ToolOutput { envelope } => envelope.output_view.is_none(),
+            _ => true,
+        }));
     }
 
     #[test]

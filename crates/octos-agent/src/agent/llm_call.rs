@@ -86,6 +86,29 @@ impl Agent {
         // so callers must record it instead of re-pricing the merged total at
         // the winner's rate (codex #1632 P2). `None` = no attempt was priced.
     ) -> Result<(ChatResponse, bool, Option<f64>)> {
+        let mut projected;
+        let messages = if self.output_state.policy.enabled {
+            projected = messages.to_vec();
+            // Use the same conservative input share as agent-local compaction.
+            let max_bytes = (self.llm.context_window() as f64 * 0.8
+                / crate::compaction::SAFETY_MARGIN
+                * 3.0) as usize;
+            let fixed = messages
+                .iter()
+                .filter(|m| m.role != octos_core::MessageRole::Tool)
+                .map(|m| octos_llm::context::estimate_message_tokens(m) as usize * 3)
+                .sum::<usize>()
+                .saturating_add(serde_json::to_vec(tools_spec).map(|v| v.len()).unwrap_or(0))
+                .saturating_add(messages.len() * 32);
+            self.output_state
+                .prepare_messages(&mut projected, max_bytes.saturating_sub(fixed))?;
+            if let Some(manager) = &self.prompt_context_manager {
+                manager.observe_output_views(&projected);
+            }
+            projected.as_slice()
+        } else {
+            messages
+        };
         // Consume read candidates against the exact messages about to be sent.
         // The batch stays local to this call and is activated only after a
         // non-empty provider response succeeds. Silent checkpoint calls use a

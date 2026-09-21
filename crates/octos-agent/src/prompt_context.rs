@@ -56,6 +56,11 @@ pub struct PromptContextReport {
 /// context ledger. Returning an error does not abort the agent loop; the agent
 /// logs it and falls back to its existing prompt vector.
 pub trait PromptContextManager: Send + Sync {
+    fn set_output_state(&self, _state: std::sync::Arc<crate::output_recovery::OutputState>) {}
+
+    /// Persist the final projections after the dispatch guard has run.
+    fn observe_output_views(&self, _messages: &[Message]) {}
+
     fn prepare_prompt(
         &self,
         request: PromptContextRequest,

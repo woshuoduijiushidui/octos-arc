@@ -484,6 +484,8 @@ impl Agent {
         // batch state, and an approved call resumes outside a turn batch.
         let ctx = ToolContext {
             tool_id: pending.tool_id.clone(),
+            output_id: uuid::Uuid::new_v4().simple().to_string(),
+            output_state: Some(self.output_state.clone()),
             reporter: self.reporter(),
             harness_event_sink: self.harness_event_sink.clone(),
             agent_definitions: self.agent_definitions.clone(),
@@ -552,6 +554,7 @@ impl Agent {
             )
             .await?;
 
+        let mut output_feedback = None;
         if let Some(ref hooks) = self.hooks {
             let payload = HookPayload::after_tool(
                 &pending.request.tool_name,
@@ -572,6 +575,7 @@ impl Agent {
                 hooks.run(HookEvent::AfterToolCall, &payload).await
             {
                 let feedback = crate::sanitize::sanitize_tool_output(&entries.join("\n\n"));
+                output_feedback = Some(feedback.clone());
                 // #2129 review round 2, finding 4: truncate the tool output
                 // to its limit FIRST, then append feedback — mirrors the
                 // spawned dispatch site so a downstream cap cannot cut the
@@ -583,6 +587,14 @@ impl Agent {
             }
         }
 
+        self.output_state.finish_result(
+            &ctx.output_id,
+            &pending.tool_id,
+            &pending.request.tool_name,
+            &pending.tool_args,
+            &mut result,
+            output_feedback.as_deref(),
+        );
         Ok(result)
     }
 
@@ -646,6 +658,7 @@ impl Agent {
             .task_file_state
             .as_ref()
             .map(|state| state.task_state().clone());
+        let output_state = self.output_state.clone();
         // M8 fix-first item 8 (gap 4b): if the agent carries a resolved
         // profile envelope, derive a ToolPermissions record once per turn
         // and clone it into every ToolContext. Today's pre-M8 default
@@ -2107,6 +2120,8 @@ impl Agent {
 
             let ctx = ToolContext {
                 tool_id: tc_id.clone(),
+                output_id: uuid::Uuid::new_v4().simple().to_string(),
+                output_state: Some(output_state.clone()),
                 reporter: reporter.clone(),
                 harness_event_sink: harness_event_sink.clone(),
                 attachment_paths: attachment_ctx.attachment_paths.clone(),
@@ -2228,6 +2243,7 @@ impl Agent {
 
             let duration = tool_start.elapsed();
 
+            let mut output_document = None;
             let (
                 content,
                 tool_files_modified,
@@ -2237,7 +2253,8 @@ impl Agent {
                 tool_structured_metadata,
                 tool_cascades,
             ) = match result {
-                Ok(tool_result) => {
+                Ok(mut tool_result) => {
+                    output_document = tool_result.output_document.take();
                     debug!(
                         tool = %tc_name,
                         success = tool_result.success,
@@ -2425,23 +2442,44 @@ impl Agent {
             // undercounted by the marker's own length and told the model two
             // disagreeing numbers about one cut.
             let limit = octos_core::tool_output_limit(&tc_name);
-            let report = octos_core::truncate_head_tail_report(&content, limit, 0.7);
-            let mut content = report.content;
-            if report.truncated {
-                if let Some(recovery) = tools.get(&tc_name).and_then(|tool| {
-                    tool.truncation_recovery(&effective_args, report.omitted_bytes)
-                }) {
-                    content.push('\n');
-                    content.push_str(&recovery);
+            let typed_output = output_state.policy.enabled
+                && (output_document.is_some()
+                    || crate::output_recovery::OutputState::supports(&tc_name));
+            let content = if typed_output {
+                let mut result = crate::tools::ToolResult {
+                    output: content,
+                    output_document,
+                    success: tool_success,
+                    ..Default::default()
+                };
+                output_state.finish_result(
+                    &ctx.output_id,
+                    &tc_id,
+                    &tc_name,
+                    &effective_args,
+                    &mut result,
+                    hook_feedback.as_deref(),
+                );
+                result.output
+            } else {
+                let report = octos_core::truncate_head_tail_report(&content, limit, 0.7);
+                let mut content = report.content;
+                if report.truncated {
+                    if let Some(recovery) = tools.get(&tc_name).and_then(|tool| {
+                        tool.truncation_recovery(&effective_args, report.omitted_bytes)
+                    }) {
+                        content.push('\n');
+                        content.push_str(&recovery);
+                    }
                 }
-            }
-            let content = content;
-            let mut content = crate::sanitize::sanitize_tool_output(&content);
-            if let Some(feedback) = hook_feedback {
-                content.push_str("\n\n[hook] ");
-                content.push_str(&feedback);
-            }
-            let content = content;
+                let content = content;
+                let mut content = crate::sanitize::sanitize_tool_output(&content);
+                if let Some(feedback) = hook_feedback {
+                    content.push_str("\n\n[hook] ");
+                    content.push_str(&feedback);
+                }
+                content
+            };
 
             // Pair the structured side-channel with the originating tool's
             // call id so the session actor (which keys cost rows by

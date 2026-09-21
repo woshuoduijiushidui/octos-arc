@@ -684,6 +684,30 @@ impl SessionActorPromptContextBridge {
 }
 
 impl PromptContextManager for SessionActorPromptContextBridge {
+    fn set_output_state(&self, state: Arc<octos_agent::output_recovery::OutputState>) {
+        self.context_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_output_state(state);
+    }
+
+    fn observe_output_views(&self, _messages: &[Message]) {
+        if let Some(scratch) = self
+            .scratch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            scratch.manager.refresh_output_views();
+        }
+        let mut canonical = self
+            .context_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        canonical.refresh_output_views();
+        persist_context_manager_snapshot_for_session(&self.data_dir, &self.session_key, &canonical);
+    }
+
     fn prepare_prompt(
         &self,
         request: PromptContextRequest,

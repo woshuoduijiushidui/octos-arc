@@ -266,6 +266,8 @@ impl AppStateHandle {
 #[derive(Clone)]
 pub struct ToolContext {
     pub tool_id: String,
+    pub output_id: String,
+    pub output_state: Option<Arc<crate::output_recovery::OutputState>>,
     pub reporter: Arc<dyn ProgressReporter>,
     /// Local newline-delimited JSON sink for structured harness progress.
     pub harness_event_sink: Option<String>,
@@ -402,6 +404,8 @@ impl ToolContext {
 
         Self {
             tool_id: String::new(),
+            output_id: String::new(),
+            output_state: None,
             reporter: Arc::new(crate::progress::SilentReporter),
             harness_event_sink: None,
             attachment_paths: Vec::new(),
@@ -583,6 +587,8 @@ pub enum ConcurrencyClass {
 pub struct ToolResult {
     /// Output to return to the LLM.
     pub output: String,
+    /// Source facts from the tool; execution owns identity, sanitization and projection.
+    pub output_document: Option<crate::output_recovery::OutputDocument>,
     /// Whether the tool execution succeeded.
     pub success: bool,
     /// File modified by this tool (if any).

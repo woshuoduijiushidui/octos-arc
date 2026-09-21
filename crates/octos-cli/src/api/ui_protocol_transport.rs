@@ -4349,6 +4349,34 @@ impl AppUiPromptContextBridge {
 }
 
 impl PromptContextManager for AppUiPromptContextBridge {
+    fn set_output_state(&self, state: Arc<octos_agent::output_recovery::OutputState>) {
+        self.context_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_output_state(state);
+    }
+
+    fn observe_output_views(&self, _messages: &[Message]) {
+        if let Some(scratch) = self
+            .scratch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            scratch.manager.refresh_output_views();
+        }
+        let mut canonical = self
+            .context_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        canonical.refresh_output_views();
+        if let Err(error) =
+            persist_appui_context_snapshot(&self.data_dir, &self.session_id, &canonical)
+        {
+            tracing::warn!(%error, "failed to persist final output views");
+        }
+    }
+
     fn prepare_prompt(
         &self,
         request: PromptContextRequest,
@@ -34642,6 +34670,7 @@ async fn run_standalone_turn(
     if let Some(file_state) = session_runtime.agent.file_state() {
         request_agent = request_agent.with_file_state(file_state.clone());
     }
+    request_agent = request_agent.with_output_state(session_runtime.agent.output_state().clone());
     if let Some(profile) = session_runtime.agent.profile() {
         request_agent = request_agent
             .with_profile(profile)

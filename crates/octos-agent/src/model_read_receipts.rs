@@ -16,7 +16,7 @@ const MAX_ACTIVE_RECEIPTS: usize = 256;
 const MAX_MISS_HINTS: usize = 256;
 
 /// Stable identity of one model-visible history branch.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ReadReceiptOwner {
     workspace_id: String,
     task_id: String,

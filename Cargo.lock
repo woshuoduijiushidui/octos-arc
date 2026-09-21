@@ -4585,6 +4585,7 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-typescript",
  "url",
+ "uuid",
  "webbrowser",
  "which 7.0.3",
  "wiremock",

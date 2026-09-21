@@ -344,7 +344,7 @@ impl Tool for ReadFileTool {
     // per-instance override or `OCTOS_READ_WINDOW`, both stable for a process,
     // so `specs()` sees a consistent answer.)
     fn description(&self) -> &str {
-        if self.window_armed() {
+        if self.window_armed() || crate::output_recovery::OutputPolicy::from_env().enabled {
             "Read the contents of a file. Returns the file content with line numbers. Large \
              results are truncated to a bounded window and the message names the exact call to \
              continue (offset/limit, or byte_offset for raw byte paging of very long lines) — \
@@ -378,7 +378,7 @@ impl Tool for ReadFileTool {
                 "description": "Optional maximum number of lines to read, starting at start_line (alternative to end_line — do not provide both)"
             }
         });
-        if self.window_armed() {
+        if self.window_armed() || crate::output_recovery::OutputPolicy::from_env().enabled {
             let props = properties.as_object_mut().expect("object literal");
             props.insert(
                 "byte_offset".to_string(),
@@ -514,7 +514,11 @@ impl ReadFileTool {
         // #1638 R6: byte mode is part of the ARMED feature. It is resolved
         // once here so the schema/description gating and the execution gating
         // agree.
-        let window_armed = self.window_armed();
+        let recovery_enabled = ctx
+            .output_state
+            .as_ref()
+            .is_some_and(|state| state.policy.enabled);
+        let window_armed = self.window_armed() || recovery_enabled;
         let dedup_enabled = self.dedup_enabled();
 
         // #1638: raw byte mode is a distinct coordinate system — mixing it
@@ -619,6 +623,124 @@ impl ReadFileTool {
             .as_ref()
             .map(|scope| scope.workspace())
             .unwrap_or(self.base_dir.as_path());
+
+        if recovery_enabled {
+            use crate::output_recovery::{
+                CaptureState, ExecutionStatus, OutputDocument, OutputPart, OutputSource,
+                OutputStream,
+            };
+            let (content, meta) = match super::read_no_follow_with_meta(
+                &path,
+                workspace_root,
+                MAX_FILE_BYTES,
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(error) => return Ok(stable_read_error(error, &input.path)),
+            };
+            observation.observe_version(&meta);
+            record_file_version(ctx, &meta);
+            let total = content.len();
+            let range = if let Some(offset) = input.byte_offset {
+                if offset > total {
+                    return Ok(ToolResult {
+                        output: "out_of_range: byte offset exceeds file".into(),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+                let mut start = offset;
+                while !content.is_char_boundary(start) {
+                    start -= 1;
+                }
+                let requested_end = match input.byte_limit {
+                    Some(limit) => offset.checked_add(limit),
+                    None => Some(total),
+                };
+                let Some(mut end) = requested_end else {
+                    return Ok(ToolResult {
+                        output: "out_of_range: byte range overflow".into(),
+                        success: false,
+                        ..Default::default()
+                    });
+                };
+                end = end.min(total);
+                while end > start && !content.is_char_boundary(end) {
+                    end -= 1;
+                }
+                if end == start && start < total {
+                    end += content[start..].chars().next().unwrap().len_utf8();
+                }
+                (start, end, None)
+            } else {
+                let first = start_line.unwrap_or(1);
+                if first == 0
+                    || input
+                        .limit
+                        .is_some_and(|n| first.checked_add(n - 1).is_none())
+                {
+                    return Ok(ToolResult {
+                        output: "out_of_range: invalid line range".into(),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+                let count = content.split_inclusive('\n').count();
+                if first > count + 1 || (first == count + 1 && end_line.is_some()) {
+                    return Ok(ToolResult {
+                        output: "out_of_range: line exceeds file".into(),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+                let end = end_line.unwrap_or(count).min(count);
+                if end < first && first <= count {
+                    return Ok(ToolResult {
+                        output: "out_of_range: inverted line range".into(),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+                (
+                    line_start_byte_offset(&content, first),
+                    if end >= count {
+                        total
+                    } else {
+                        line_start_byte_offset(&content, end + 1)
+                    },
+                    Some(first as u64),
+                )
+            };
+            let selected = content[range.0..range.1].to_owned();
+            let source = meta
+                .file_version
+                .as_ref()
+                .map(|version| OutputSource::File {
+                    target: version.target().target_key().to_string_lossy().into_owned(),
+                    sha256: version.content_sha256().to_owned(),
+                })
+                .unwrap_or(OutputSource::Unspecified);
+            return Ok(ToolResult {
+                output: selected.clone(),
+                output_document: Some(OutputDocument {
+                    source,
+                    parts: vec![OutputPart {
+                        stream: OutputStream::File,
+                        text: selected,
+                        start: range.0 as u64,
+                        first_line: range.2,
+                        total: Some(total as u64),
+                    }],
+                    capture: CaptureState::Complete,
+                    execution: ExecutionStatus::NotApplicable,
+                    transformed: meta.transformed,
+                    loss_reason: None,
+                }),
+                success: true,
+                ..Default::default()
+            });
+        }
 
         // #1638 R6 (armed-only): raw byte mode. Reached only when armed —
         // unarmed byte params were rejected above. It bypasses the #2131
