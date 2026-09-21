@@ -3,6 +3,7 @@
 use std::sync::OnceLock;
 
 pub(crate) const LOCAL_EDIT_ENV: &str = "OCTOS_LOCAL_EDIT";
+pub(crate) const LOCAL_EDIT_STRICT_MATCH_ENV: &str = "OCTOS_LOCAL_EDIT_STRICT_MATCH";
 pub(crate) const LOCAL_EDIT_GUIDANCE_HEADING: &str = "## File editing";
 pub(crate) const LOCAL_EDIT_GUIDANCE: &str = "\n\n\
 ## File editing\n\n\
@@ -20,43 +21,65 @@ const EDIT_FILE_DESCRIPTION: &str = "Replace one unique contiguous span in an ex
 diff_edit for multiple separated changes in the same file and write_file for new files or \
 intentional whole-file rewrites. An exact old_string match is preferred; the current fuzzy \
 fallbacks remain enabled.";
+const STRICT_EDIT_FILE_DESCRIPTION: &str = "Replace one unique contiguous span in an existing \
+file. Automatic writes require an exact or CRLF/LF-equivalent old_string match; approximate \
+whitespace, indentation, escape, or block matches are returned only as suggestions. Use \
+diff_edit for multiple separated changes.";
 const DIFF_EDIT_DESCRIPTION: &str = "Apply one unified diff to an existing file. Prefer one \
 multi-hunk call for multiple separated changes in that file; use edit_file for one contiguous \
 change and write_file for new files or intentional whole-file rewrites. Context matching allows \
 a +-3-line offset.";
+const STRICT_DIFF_EDIT_DESCRIPTION: &str = "Apply one unified diff to an existing file. Automatic \
+writes require exact context lines, with CRLF/LF treated as equivalent; trailing-whitespace \
+matches are returned only as suggestions. Prefer one multi-hunk call for separated changes.";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct LocalEditPolicy {
     pub enabled: bool,
+    pub strict_match: bool,
 }
 
 impl LocalEditPolicy {
-    pub(crate) fn parse(value: Option<&str>) -> Self {
-        let enabled = match value.map(str::trim) {
-            Some("1") => true,
-            Some(value)
-                if value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("on") =>
-            {
-                true
-            }
-            None | Some("0") => false,
-            Some(value)
-                if value.eq_ignore_ascii_case("false") || value.eq_ignore_ascii_case("off") =>
-            {
-                false
-            }
-            Some(_) => {
-                tracing::warn!("unknown OCTOS_LOCAL_EDIT value; local-edit guidance disabled");
-                eprintln!("warning: unknown OCTOS_LOCAL_EDIT value; local-edit guidance disabled");
-                false
-            }
-        };
-        Self { enabled }
+    pub(crate) fn parse_with_strict(value: Option<&str>, strict_match: Option<&str>) -> Self {
+        let enabled = parse_flag(value, LOCAL_EDIT_ENV, "local-edit guidance");
+        let strict_match = enabled
+            && parse_flag(
+                strict_match,
+                LOCAL_EDIT_STRICT_MATCH_ENV,
+                "strict local-edit matching",
+            );
+        Self {
+            enabled,
+            strict_match,
+        }
     }
 
     pub(crate) fn from_env() -> Self {
         static POLICY: OnceLock<LocalEditPolicy> = OnceLock::new();
-        *POLICY.get_or_init(|| Self::parse(std::env::var(LOCAL_EDIT_ENV).ok().as_deref()))
+        *POLICY.get_or_init(|| {
+            Self::parse_with_strict(
+                std::env::var(LOCAL_EDIT_ENV).ok().as_deref(),
+                std::env::var(LOCAL_EDIT_STRICT_MATCH_ENV).ok().as_deref(),
+            )
+        })
+    }
+}
+
+fn parse_flag(value: Option<&str>, env: &str, feature: &str) -> bool {
+    match value.map(str::trim) {
+        Some("1") => true,
+        Some(value) if value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("on") => {
+            true
+        }
+        None | Some("0") => false,
+        Some(value) if value.eq_ignore_ascii_case("false") || value.eq_ignore_ascii_case("off") => {
+            false
+        }
+        Some(_) => {
+            tracing::warn!(env, "unknown feature flag value; {feature} disabled");
+            eprintln!("warning: unknown {env} value; {feature} disabled");
+            false
+        }
     }
 }
 
@@ -66,15 +89,19 @@ pub(crate) fn append_guidance(prompt: &mut String, enabled: bool) {
     }
 }
 
-pub(crate) fn tool_description<'a>(name: &str, fallback: &'a str, enabled: bool) -> &'a str {
-    if !enabled {
-        return fallback;
-    }
-    match name {
-        "write_file" => WRITE_FILE_DESCRIPTION,
-        "edit_file" => EDIT_FILE_DESCRIPTION,
-        "diff_edit" => DIFF_EDIT_DESCRIPTION,
-        _ => fallback,
+pub(crate) fn tool_description<'a>(
+    name: &str,
+    fallback: &'a str,
+    guidance_enabled: bool,
+    strict_match: bool,
+) -> &'a str {
+    match (name, guidance_enabled, strict_match) {
+        ("edit_file", _, true) => STRICT_EDIT_FILE_DESCRIPTION,
+        ("diff_edit", _, true) => STRICT_DIFF_EDIT_DESCRIPTION,
+        ("write_file", true, _) => WRITE_FILE_DESCRIPTION,
+        ("edit_file", true, false) => EDIT_FILE_DESCRIPTION,
+        ("diff_edit", true, false) => DIFF_EDIT_DESCRIPTION,
+        (_, _, _) => fallback,
     }
 }
 
@@ -107,19 +134,49 @@ mod tests {
 
     #[test]
     fn policy_defaults_and_unknown_values_are_off() {
-        assert!(!LocalEditPolicy::parse(None).enabled);
-        assert!(!LocalEditPolicy::parse(Some("0")).enabled);
-        assert!(!LocalEditPolicy::parse(Some("false")).enabled);
-        assert!(!LocalEditPolicy::parse(Some("off")).enabled);
-        assert!(!LocalEditPolicy::parse(Some("unexpected")).enabled);
+        for value in [
+            None,
+            Some("0"),
+            Some("false"),
+            Some("off"),
+            Some("unexpected"),
+        ] {
+            assert_eq!(
+                LocalEditPolicy::parse_with_strict(value, None),
+                LocalEditPolicy::default()
+            );
+        }
+        assert_eq!(
+            LocalEditPolicy::parse_with_strict(Some("0"), Some("1")),
+            LocalEditPolicy::default()
+        );
     }
 
     #[test]
     fn policy_accepts_documented_enabled_values() {
-        assert!(LocalEditPolicy::parse(Some("1")).enabled);
-        assert!(LocalEditPolicy::parse(Some("true")).enabled);
-        assert!(LocalEditPolicy::parse(Some("TRUE")).enabled);
-        assert!(LocalEditPolicy::parse(Some(" on ")).enabled);
+        for value in [Some("1"), Some("true"), Some("TRUE"), Some(" on ")] {
+            assert_eq!(
+                LocalEditPolicy::parse_with_strict(value, None),
+                LocalEditPolicy {
+                    enabled: true,
+                    strict_match: false,
+                }
+            );
+        }
+        assert_eq!(
+            LocalEditPolicy::parse_with_strict(Some("1"), Some("true")),
+            LocalEditPolicy {
+                enabled: true,
+                strict_match: true,
+            }
+        );
+        assert_eq!(
+            LocalEditPolicy::parse_with_strict(Some("1"), Some("unexpected")),
+            LocalEditPolicy {
+                enabled: true,
+                strict_match: false,
+            }
+        );
     }
 
     #[test]
@@ -141,11 +198,48 @@ mod tests {
     #[test]
     fn tool_descriptions_change_only_for_the_three_editors() {
         let fallback = "unchanged";
-        assert_eq!(tool_description("write_file", fallback, false), fallback);
-        assert!(tool_description("write_file", fallback, true).contains("new file"));
-        assert!(tool_description("edit_file", fallback, true).contains("contiguous"));
-        assert!(tool_description("diff_edit", fallback, true).contains("multi-hunk"));
-        assert_eq!(tool_description("read_file", fallback, true), fallback);
+        let off = LocalEditPolicy::default();
+        let enabled = LocalEditPolicy {
+            enabled: true,
+            strict_match: false,
+        };
+        let strict = LocalEditPolicy {
+            enabled: true,
+            strict_match: true,
+        };
+        assert_eq!(
+            tool_description("write_file", fallback, off.enabled, off.strict_match),
+            fallback
+        );
+        assert!(
+            tool_description(
+                "write_file",
+                fallback,
+                enabled.enabled,
+                enabled.strict_match
+            )
+            .contains("new file")
+        );
+        assert!(
+            tool_description("edit_file", fallback, enabled.enabled, enabled.strict_match)
+                .contains("contiguous")
+        );
+        assert!(
+            tool_description("diff_edit", fallback, enabled.enabled, enabled.strict_match)
+                .contains("multi-hunk")
+        );
+        assert!(
+            tool_description("edit_file", fallback, strict.enabled, strict.strict_match)
+                .contains("suggestions")
+        );
+        assert!(
+            tool_description("diff_edit", fallback, strict.enabled, strict.strict_match)
+                .contains("suggestions")
+        );
+        assert_eq!(
+            tool_description("read_file", fallback, enabled.enabled, enabled.strict_match),
+            fallback
+        );
     }
 
     #[test]

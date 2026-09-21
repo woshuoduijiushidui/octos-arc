@@ -156,6 +156,58 @@ fn replace_all_candidates(
         .collect()
 }
 
+fn find_strict_replacement_evidence(
+    content: &str,
+    old_string: &str,
+) -> super::replacer::ReplacementEvidence {
+    let mut exact_occurrences = Vec::new();
+    let mut exact_count = 0usize;
+    for (start, matched) in content.match_indices(old_string) {
+        exact_count += 1;
+        if exact_occurrences.len() < MAX_RENDERED_CANDIDATES {
+            exact_occurrences.push(ReplacementOccurrence {
+                range: start..start + matched.len(),
+                matcher: "exact",
+            });
+        }
+    }
+    if exact_count > 0 {
+        let candidates = replace_all_candidates(content, &exact_occurrences);
+        let outcome = match exact_count {
+            1 => super::replacer::ChainOutcome::Match {
+                range: exact_occurrences[0].range.clone(),
+                replacer: "exact",
+            },
+            count => super::replacer::ChainOutcome::Ambiguous {
+                count,
+                replacer: "exact",
+            },
+        };
+        return super::replacer::ReplacementEvidence {
+            outcome,
+            candidates,
+        };
+    }
+
+    let scan = find_replace_all_matches(content, old_string);
+    let candidates = replace_all_candidates(content, &scan.occurrences);
+    let outcome = match scan.count {
+        0 => super::replacer::ChainOutcome::NoMatch,
+        1 => super::replacer::ChainOutcome::Match {
+            range: scan.occurrences[0].range.clone(),
+            replacer: "line_ending_equivalent",
+        },
+        count => super::replacer::ChainOutcome::Ambiguous {
+            count,
+            replacer: "line_ending_equivalent",
+        },
+    };
+    super::replacer::ReplacementEvidence {
+        outcome,
+        candidates,
+    }
+}
+
 fn line_ending_near(content: &str, range: &Range<usize>) -> LineEnding {
     let bytes = content.as_bytes();
     if let Some(offset) = bytes[range.start..].iter().position(|byte| *byte == b'\n') {
@@ -281,6 +333,7 @@ pub struct EditFileTool {
     /// follow the allowlist. `None` = pre-#1976 behaviour.
     write_grant: Option<WritePathGrant>,
     local_edit_enabled: bool,
+    strict_match_enabled: bool,
 }
 
 impl EditFileTool {
@@ -292,6 +345,7 @@ impl EditFileTool {
             file_access: FileAccessMode::ReadWrite,
             write_grant: None,
             local_edit_enabled: false,
+            strict_match_enabled: false,
         }
     }
 
@@ -317,6 +371,12 @@ impl EditFileTool {
     /// Enable typed, bounded recovery evidence for rejected edits.
     pub fn with_local_edit_enabled(mut self, enabled: bool) -> Self {
         self.local_edit_enabled = enabled;
+        self
+    }
+
+    /// Require exact or CRLF/LF-equivalent matches for automatic writes.
+    pub fn with_strict_match_enabled(mut self, enabled: bool) -> Self {
+        self.strict_match_enabled = enabled;
         self
     }
 }
@@ -577,6 +637,8 @@ impl Tool for EditFileTool {
     ) -> Result<ToolResult> {
         let local_edit_enabled =
             self.local_edit_enabled || super::registry::local_edit_execution_enabled();
+        let strict_match_enabled = local_edit_enabled
+            && (self.strict_match_enabled || super::registry::local_edit_strict_match_enabled());
         if !local_edit_enabled
             && args.as_object().is_some_and(|args| {
                 args.contains_key("replace_all") || args.contains_key("replaceAll")
@@ -809,7 +871,11 @@ impl Tool for EditFileTool {
                         },
                     ));
                 }
-                let evidence = super::replacer::find_replacement_evidence(content, &old_string);
+                let evidence = if strict_match_enabled {
+                    find_strict_replacement_evidence(content, &old_string)
+                } else {
+                    super::replacer::find_replacement_evidence(content, &old_string)
+                };
                 let (range, replacer_name) = match evidence.outcome.clone() {
                     super::replacer::ChainOutcome::Match { range, replacer } => (range, replacer),
                     super::replacer::ChainOutcome::Ambiguous { count, replacer }
@@ -833,6 +899,30 @@ impl Tool for EditFileTool {
                                  replacer). Please provide more context to make the match unique.",
                         )
                         .into());
+                    }
+                    super::replacer::ChainOutcome::NoMatch
+                        if local_edit_enabled && strict_match_enabled =>
+                    {
+                        let suggestions =
+                            super::replacer::find_replacement_evidence(content, &old_string);
+                        let (matcher, occurrence_count) = match suggestions.outcome {
+                            super::replacer::ChainOutcome::Match { replacer, .. } => (replacer, 1),
+                            super::replacer::ChainOutcome::Ambiguous { count, replacer } => {
+                                (replacer, count)
+                            }
+                            super::replacer::ChainOutcome::NoMatch => ("none", 0),
+                        };
+                        return Err(typed_edit_rejection(EditRejection {
+                            code: "edit_no_match",
+                            path: &display_path,
+                            current_bytes: bytes,
+                            content: Some(content),
+                            old_string: &old_string,
+                            matcher,
+                            occurrence_count,
+                            candidates: &suggestions.candidates,
+                            reason: "strict_match_requires_exact",
+                        }));
                     }
                     super::replacer::ChainOutcome::NoMatch if local_edit_enabled => {
                         return Err(typed_edit_rejection(EditRejection {
@@ -862,10 +952,13 @@ impl Tool for EditFileTool {
                 } else {
                     old_string.clone()
                 };
-                let splice_new = if replacer_name == "escape_normalized" {
-                    super::replacer::unescape_find(&new_string)
-                } else {
-                    new_string
+                let splice_new = match replacer_name {
+                    "escape_normalized" => super::replacer::unescape_find(&new_string),
+                    "line_ending_equivalent" => replacement_for_line_ending(
+                        &new_string.replace("\r\n", "\n"),
+                        line_ending_near(content, &range),
+                    ),
+                    _ => new_string,
                 };
                 let matched_text = &content[range.clone()];
                 if super::replacer::is_disproportionate_match(matched_text, &guard_needle) {
@@ -960,7 +1053,7 @@ impl Tool for EditFileTool {
             });
         }
 
-        if replacer_name != "exact" {
+        if !matches!(replacer_name, "exact" | "line_ending_equivalent") {
             tracing::info!(
                 replacer = replacer_name,
                 path = %input.path,
@@ -1735,6 +1828,259 @@ mod tests {
     // -----------------------------------------------------------------------
     // #1771: cascading fuzzy replacer chain.
     // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn strict_match_keeps_exact_and_line_ending_equivalent_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("exact.txt"), "alpha\n").unwrap();
+        std::fs::write(dir.path().join("crlf.txt"), "one\r\ntwo\r\n").unwrap();
+        std::fs::write(dir.path().join("mixed.txt"), b"same\nsame\r\n").unwrap();
+        std::fs::write(dir.path().join("duplicate.txt"), "same\nsame\n").unwrap();
+        std::fs::write(dir.path().join("noop.txt"), "same\n").unwrap();
+        let tool = EditFileTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .with_strict_match_enabled(true);
+
+        let exact = tool
+            .execute(&serde_json::json!({
+                "path": "exact.txt",
+                "old_string": "alpha",
+                "new_string": "beta",
+            }))
+            .await
+            .unwrap();
+        assert!(exact.success, "{}", exact.output);
+        assert_eq!(
+            exact.structured_metadata.as_ref().unwrap()["matcher"],
+            "exact"
+        );
+
+        let equivalent = tool
+            .execute(&serde_json::json!({
+                "path": "crlf.txt",
+                "old_string": "one\ntwo\n",
+                "new_string": "uno\ndos\n",
+            }))
+            .await
+            .unwrap();
+        assert!(equivalent.success, "{}", equivalent.output);
+        assert_eq!(
+            equivalent.structured_metadata.as_ref().unwrap()["matcher"],
+            "line_ending_equivalent"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("crlf.txt")).unwrap(),
+            b"uno\r\ndos\r\n"
+        );
+
+        let exact_before_equivalent = tool
+            .execute(&serde_json::json!({
+                "path": "mixed.txt",
+                "old_string": "same\n",
+                "new_string": "changed\n",
+            }))
+            .await
+            .unwrap();
+        assert!(
+            exact_before_equivalent.success,
+            "{}",
+            exact_before_equivalent.output
+        );
+        assert_eq!(
+            exact_before_equivalent
+                .structured_metadata
+                .as_ref()
+                .unwrap()["matcher"],
+            "exact"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("mixed.txt")).unwrap(),
+            b"changed\nsame\r\n"
+        );
+
+        let ambiguous = tool
+            .execute(&serde_json::json!({
+                "path": "duplicate.txt",
+                "old_string": "same",
+                "new_string": "changed",
+            }))
+            .await
+            .unwrap();
+        assert!(!ambiguous.success);
+        assert_eq!(
+            ambiguous.structured_metadata.as_ref().unwrap()["error_code"],
+            "edit_ambiguous"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("duplicate.txt")).unwrap(),
+            "same\nsame\n"
+        );
+
+        let no_change = tool
+            .execute(&serde_json::json!({
+                "path": "noop.txt",
+                "old_string": "absent",
+                "new_string": "absent",
+            }))
+            .await
+            .unwrap();
+        assert!(no_change.success);
+        assert!(no_change.file_modified.is_none());
+        assert_eq!(
+            no_change.structured_metadata.as_ref().unwrap()["outcome"],
+            "no_change"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_match_turns_every_fuzzy_stage_into_a_stable_suggestion() {
+        let cases = [
+            (
+                "python_indent",
+                "def run():\n    value = 1\n",
+                "def run():\nvalue = 1",
+                "def run():\n    value = 2",
+                "line_trimmed",
+            ),
+            (
+                "markdown_spaces",
+                "first  \nsecond\n",
+                "first\nsecond",
+                "changed\nsecond",
+                "line_trimmed",
+            ),
+            (
+                "string_spaces",
+                "const label = \"a  b\";\n",
+                "const label = \"a b\";",
+                "const label = \"safe\";",
+                "whitespace_normalized",
+            ),
+            (
+                "template_spaces",
+                "<p>Hello   {{ name }}</p>\n",
+                "<p>Hello {{ name }}</p>",
+                "<p>Welcome {{ name }}</p>",
+                "whitespace_normalized",
+            ),
+            (
+                "indentation",
+                "fn wrapper() {\n    step_one();\n    step_two();\n}\n",
+                "\n        step_one();\n        step_two();\n\n",
+                "    merged_steps();",
+                "indentation_flexible",
+            ),
+            (
+                "escaped",
+                "alpha {\n    beta();\n}\n",
+                "alpha {\\n    beta();",
+                "alpha {\n    gamma();",
+                "escape_normalized",
+            ),
+            (
+                "block_anchor",
+                "fn compute() {\n    let total = base + extra;\n    total * 2\n}\n",
+                "fn compute() {\n    let total = base + offset;\n    total * 2\n}",
+                "fn compute() {\n    base * 3\n}",
+                "block_anchor",
+            ),
+        ];
+
+        for (index, (name, original, old_string, new_string, expected_matcher)) in
+            cases.into_iter().enumerate()
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let baseline_path = format!("b-{index}.txt");
+            let strict_path = format!("c-{index}.txt");
+            std::fs::write(dir.path().join(&baseline_path), original).unwrap();
+            std::fs::write(dir.path().join(&strict_path), original).unwrap();
+
+            let baseline = EditFileTool::new(dir.path())
+                .with_local_edit_enabled(true)
+                .execute(&serde_json::json!({
+                    "path": baseline_path,
+                    "old_string": old_string,
+                    "new_string": new_string,
+                }))
+                .await
+                .unwrap();
+            assert!(
+                baseline.success,
+                "B must keep {name} writes enabled: {}",
+                baseline.output
+            );
+            assert_eq!(
+                baseline.structured_metadata.as_ref().unwrap()["matcher"],
+                expected_matcher,
+                "{name}"
+            );
+
+            let strict = EditFileTool::new(dir.path())
+                .with_local_edit_enabled(true)
+                .with_strict_match_enabled(true)
+                .execute(&serde_json::json!({
+                    "path": strict_path,
+                    "old_string": old_string,
+                    "new_string": new_string,
+                }))
+                .await
+                .unwrap();
+            assert!(!strict.success, "{name}: {}", strict.output);
+            assert!(strict.file_modified.is_none(), "{name}");
+            let metadata = strict.structured_metadata.as_ref().unwrap();
+            assert_eq!(metadata["error_code"], "edit_no_match", "{name}");
+            assert_eq!(metadata["reason"], "strict_match_requires_exact", "{name}");
+            assert_eq!(metadata["matcher"], expected_matcher, "{name}");
+            assert_eq!(
+                metadata["candidates"][0]["matcher"], expected_matcher,
+                "{name}"
+            );
+            if expected_matcher == "block_anchor" {
+                assert!(metadata["candidates"][0]["score"].as_f64().is_some());
+            }
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join(strict_path)).unwrap(),
+                original,
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_match_keeps_ambiguous_fuzzy_candidates_stably_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repeated.txt");
+        let original = "  key\n  value\nseparator\n  key\n  value\n";
+        std::fs::write(&path, original).unwrap();
+        let tool = EditFileTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .with_strict_match_enabled(true);
+        let args = serde_json::json!({
+            "path": "repeated.txt",
+            "old_string": "key\nvalue",
+            "new_string": "changed",
+        });
+
+        let first = tool.execute(&args).await.unwrap();
+        let second = tool.execute(&args).await.unwrap();
+
+        for result in [&first, &second] {
+            assert!(!result.success, "{}", result.output);
+            assert!(result.file_modified.is_none());
+            let metadata = result.structured_metadata.as_ref().unwrap();
+            assert_eq!(metadata["error_code"], "edit_no_match");
+            assert_eq!(metadata["reason"], "strict_match_requires_exact");
+            assert_eq!(metadata["matcher"], "line_trimmed");
+            assert_eq!(metadata["occurrence_count"], 2);
+            assert_eq!(metadata["candidates"][0]["line_range"]["start"], 1);
+            assert_eq!(metadata["candidates"][1]["line_range"]["start"], 4);
+        }
+        assert_eq!(
+            first.structured_metadata.as_ref().unwrap()["candidates"],
+            second.structured_metadata.as_ref().unwrap()["candidates"]
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
 
     #[tokio::test]
     async fn should_match_via_line_trimmed_when_indentation_differs() {
