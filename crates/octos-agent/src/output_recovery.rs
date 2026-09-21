@@ -245,6 +245,35 @@ impl OutputDocument {
         document
     }
 
+    pub(crate) fn running_command() -> Self {
+        Self {
+            source: OutputSource::Command {
+                run_id: String::new(),
+            },
+            parts: vec![
+                OutputPart {
+                    stream: OutputStream::Stdout,
+                    text: String::new(),
+                    start: 0,
+                    first_line: None,
+                    total: None,
+                },
+                OutputPart {
+                    stream: OutputStream::Stderr,
+                    text: String::new(),
+                    start: 0,
+                    first_line: None,
+                    total: None,
+                },
+            ],
+            capture: CaptureState::Running,
+            execution: ExecutionStatus::Running,
+            transformed: false,
+            loss_reason: Some("safe_text_pending_finalization".into()),
+            file_read: None,
+        }
+    }
+
     pub fn command(output: &std::process::Output) -> Self {
         let mut transformed = false;
         let parts = [
@@ -427,7 +456,69 @@ fn prefix_end(text: &str, limit: usize) -> usize {
     end
 }
 
-fn render_parts(document: &OutputDocument, budget: usize) -> (String, Vec<OutputRange>) {
+fn suffix_start(text: &str, limit: usize) -> usize {
+    let mut start = text.len().saturating_sub(limit);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    start
+}
+
+fn render_command_head_tail(
+    part: &OutputPart,
+    allowance: usize,
+) -> Option<(String, Vec<OutputRange>)> {
+    const LABEL_AND_GAP_RESERVE: usize = 256;
+    let payload = allowance.checked_sub(LABEL_AND_GAP_RESERVE)?;
+    if payload < 128 {
+        return None;
+    }
+    let head_end = prefix_end(&part.text, payload * 2 / 3);
+    let tail_start = suffix_start(&part.text, payload - head_end);
+    if head_end == 0 || tail_start <= head_end || tail_start >= part.text.len() {
+        return None;
+    }
+    let head_start = part.start;
+    let head_upper = head_start + head_end as u64;
+    let tail_lower = head_start + tail_start as u64;
+    let tail_upper = head_start + part.text.len() as u64;
+    let body = format!(
+        "\n--- {:?} [{head_start}..{head_upper}] ---\n{}\n\
+         ... [{:?} bytes {head_upper}..{tail_lower} omitted from this preview; use recall] ...\n\
+         --- {:?} [{tail_lower}..{tail_upper}] ---\n{}",
+        part.stream,
+        &part.text[..head_end],
+        part.stream,
+        part.stream,
+        &part.text[tail_start..],
+    );
+    if body.len() > allowance {
+        return None;
+    }
+    Some((
+        body,
+        vec![
+            OutputRange {
+                stream: part.stream,
+                start: head_start,
+                end: head_upper,
+                lines: None,
+            },
+            OutputRange {
+                stream: part.stream,
+                start: tail_lower,
+                end: tail_upper,
+                lines: None,
+            },
+        ],
+    ))
+}
+
+fn render_parts(
+    document: &OutputDocument,
+    original: &OutputView,
+    budget: usize,
+) -> (String, Vec<OutputRange>) {
     let mut body = String::new();
     let mut ranges = Vec::new();
     let nonempty: Vec<_> = document
@@ -437,6 +528,14 @@ fn render_parts(document: &OutputDocument, budget: usize) -> (String, Vec<Output
         .collect();
     let allocations = allocate_batch(budget, &vec![budget; nonempty.len()]);
     for (part, allowance) in nonempty.into_iter().zip(allocations) {
+        let head_tail = matches!(&document.source, OutputSource::Command { .. })
+            && !original.historical
+            && matches!(part.stream, OutputStream::Stdout | OutputStream::Stderr);
+        if head_tail && let Some((rendered, visible)) = render_command_head_tail(part, allowance) {
+            body.push_str(&rendered);
+            ranges.extend(visible);
+            continue;
+        }
         let label = if part.stream == OutputStream::File {
             String::new()
         } else {
@@ -507,7 +606,7 @@ pub fn render(
     }
     let mut body_budget = budget;
     loop {
-        let (body, ranges) = render_parts(document, body_budget);
+        let (body, ranges) = render_parts(document, original, body_budget);
         let mut view = original.clone();
         view.visible_ranges = ranges;
         let next: Vec<_> = document
@@ -515,13 +614,17 @@ pub fn render(
             .iter()
             .filter(|p| p.stream != OutputStream::Display)
             .filter_map(|part| {
-                let end = view
+                let mut end = part.start;
+                for range in view
                     .visible_ranges
                     .iter()
-                    .filter(|r| r.stream == part.stream)
-                    .map(|r| r.end)
-                    .max()
-                    .unwrap_or(part.start);
+                    .filter(|range| range.stream == part.stream)
+                {
+                    if range.start > end {
+                        break;
+                    }
+                    end = end.max(range.end);
+                }
                 let upper = view
                     .recovery_boundary
                     .as_ref()
@@ -550,6 +653,7 @@ pub fn render(
         let mut header = serde_json::json!({
             "output_id": view.output_id,
             "ranges": view.visible_ranges,
+            "source_totals": view.source_totals,
             "coordinates": if view.transformed { "safe_text_bytes" } else { "source_bytes_except_display" },
             "capture": view.capture,
             "execution": view.execution,
@@ -581,10 +685,18 @@ pub fn render(
             }
             if let Continuation::Next { positions } = &view.continuation
                 && let Some((stream, position)) = positions.first()
-                && let Some(cursor) =
-                    crate::output_store::continuation_cursor(&view, *stream, *position)
             {
-                header["recall"] = serde_json::json!({"cursor": cursor});
+                header["recall"] = if let Some(cursor) =
+                    crate::output_store::continuation_cursor(&view, *stream, *position)
+                {
+                    serde_json::json!({"cursor": cursor})
+                } else {
+                    serde_json::json!({
+                        "output_id": view.output_id,
+                        "stream": stream,
+                        "offset": position,
+                    })
+                };
             } else if view.historical
                 && view.continuation == Continuation::SelectionEnd
                 && let Some(range) = view.visible_ranges.first()
@@ -811,7 +923,7 @@ impl OutputState {
             captured_ranges: document
                 .parts
                 .iter()
-                .filter(|p| !p.text.is_empty())
+                .filter(|p| p.stream != OutputStream::Display && !p.text.is_empty())
                 .map(|p| OutputRange {
                     stream: p.stream,
                     start: p.start,
@@ -819,7 +931,12 @@ impl OutputState {
                     lines: None,
                 })
                 .collect(),
-            source_totals: document.parts.iter().map(|p| (p.stream, p.total)).collect(),
+            source_totals: document
+                .parts
+                .iter()
+                .filter(|p| p.stream != OutputStream::Display)
+                .map(|p| (p.stream, p.total))
+                .collect(),
             loss_reason: document.loss_reason.clone(),
             availability: Availability::Missing,
             stored_ranges: vec![],

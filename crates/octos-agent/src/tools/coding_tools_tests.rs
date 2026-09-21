@@ -2696,17 +2696,33 @@ mod cancellation_kills_child_group {
     /// what the guard must kill.
     #[tokio::test]
     async fn aborting_the_bash_tool_kills_the_command_it_launched() {
+        use crate::model_read_receipts::ReadReceiptOwner;
+        use crate::output_recovery::{ExecutionStatus, OutputPolicy, OutputState, PAGE_BYTES};
+        use crate::output_store::RecallRequest;
+
         let dir = tempfile::tempdir().expect("tempdir");
         let pidfile = dir.path().join("probe.pid");
+        let owner = ReadReceiptOwner::new("workspace", "task", "session", "cancel").expect("owner");
+        let state = Arc::new(OutputState::new(OutputPolicy { enabled: true }, owner));
+        state.enable_store(dir.path()).expect("store");
+        let output_id = uuid::Uuid::new_v4().to_string();
+        let mut context = ToolContext::zero();
+        context.output_id = output_id.clone();
+        context.tool_id = "cancelled-bash".into();
+        context.output_state = Some(state.clone());
         // AllowAll: `ApprovalPolicy::Never` FAILS any command the policy would
         // ask about, which would stop the probe before it ever ran.
         let tool = BashTool::new(dir.path(), Arc::new(crate::sandbox::NoSandbox))
             .with_policy(Arc::new(crate::policy::AllowAllPolicy));
         let args = json!({
-            "cmd": format!("echo $$ > {}; sleep 300", pidfile.display()),
+            "cmd": format!(
+                "printf 'captured-before-cancel\\n'; echo $$ > {}; sleep 300",
+                pidfile.display()
+            ),
         });
 
-        let handle = tokio::spawn(async move { tool.execute(&args).await });
+        let handle =
+            tokio::spawn(async move { TOOL_CTX.scope(context, tool.execute(&args)).await });
 
         // Wait for the probe to actually be running before aborting.
         let mut probe_pid = None;
@@ -2739,6 +2755,40 @@ mod cancellation_kills_child_group {
             "aborting the turn left process group {probe_pid} alive — an \
              interrupted `npm run dev` would keep holding ports and writing \
              to the workspace"
+        );
+
+        let store = state.store().expect("store");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let view = loop {
+            if let Ok(view) = store.status(&output_id) {
+                if view.execution == ExecutionStatus::Cancelled {
+                    break view;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cancelled capture was not finalized"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(view.recoverable);
+        assert_eq!(view.execution, ExecutionStatus::Cancelled);
+        let recalled = store
+            .read(
+                &RecallRequest {
+                    output_id: Some(output_id),
+                    stream: Some(crate::output_recovery::OutputStream::Stdout),
+                    ..Default::default()
+                },
+                PAGE_BYTES,
+            )
+            .expect("recall cancelled output");
+        assert!(
+            recalled
+                .document
+                .parts
+                .iter()
+                .any(|part| part.text.contains("captured-before-cancel"))
         );
     }
 }
@@ -3326,4 +3376,295 @@ fn session_payload_carries_denial_hint_on_sandboxed_failures() {
     // Unsandboxed: EPERM is real, no hint.
     let payload = super::session_output_payload(denial, Some(1), false, 4096);
     assert!(!payload.contains("[sandbox]"), "{payload}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn h03_m4_all_foreground_shell_tools_capture_both_streams_and_nonzero_exit() {
+    use crate::model_read_receipts::ReadReceiptOwner;
+    use crate::output_recovery::{CaptureState, ExecutionStatus, OutputPolicy, OutputState};
+    use crate::policy::AllowAllPolicy;
+    use crate::tools::shell::ShellTool;
+
+    fn context(state: Arc<OutputState>) -> ToolContext {
+        let mut context = ToolContext::zero();
+        context.output_id = uuid::Uuid::new_v4().to_string();
+        context.tool_id = uuid::Uuid::new_v4().to_string();
+        context.output_state = Some(state);
+        context
+    }
+
+    fn assert_capture(result: ToolResult) {
+        assert!(!result.success);
+        let document = result.output_document.expect("captured output document");
+        assert_eq!(document.capture, CaptureState::Complete);
+        assert_eq!(
+            document.execution,
+            ExecutionStatus::Exited {
+                code: Some(7),
+                signal: None,
+            }
+        );
+        assert!(
+            document
+                .parts
+                .iter()
+                .any(|part| part.text.contains("stdout-marker"))
+        );
+        assert!(
+            document
+                .parts
+                .iter()
+                .any(|part| part.text.contains("unique-stderr-marker"))
+        );
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let owner = ReadReceiptOwner::new("workspace", "task", "session", "branch").expect("owner");
+    let state = Arc::new(OutputState::new(OutputPolicy { enabled: true }, owner));
+    let command = "printf 'stdout-marker\\n'; printf 'unique-stderr-marker\\n' >&2; exit 7";
+
+    let bash = BashTool::new(dir.path(), Arc::new(crate::sandbox::NoSandbox))
+        .with_policy(Arc::new(AllowAllPolicy));
+    let bash_args = json!({"cmd": command});
+    let bash_context = context(state.clone());
+    assert_capture(
+        TOOL_CTX
+            .scope(bash_context, bash.execute(&bash_args))
+            .await
+            .expect("bash"),
+    );
+
+    let exec = ExecCommandTool::new(dir.path(), Arc::new(crate::sandbox::NoSandbox))
+        .with_policy(Arc::new(AllowAllPolicy));
+    let exec_args = json!({"command": command});
+    let exec_context = context(state.clone());
+    assert_capture(
+        TOOL_CTX
+            .scope(exec_context, exec.execute(&exec_args))
+            .await
+            .expect("exec_command"),
+    );
+
+    let shell = ShellTool::new(dir.path()).with_policy(Arc::new(AllowAllPolicy));
+    let shell_args = json!({"command": command});
+    let shell_context = context(state);
+    assert_capture(
+        shell
+            .execute_with_context(&shell_context, &shell_args)
+            .await
+            .expect("shell"),
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn h03_m4_background_and_yield_paths_do_not_claim_recoverable_history() {
+    use crate::model_read_receipts::ReadReceiptOwner;
+    use crate::output_recovery::{OutputPolicy, OutputState};
+    use crate::policy::AllowAllPolicy;
+    use crate::tools::shell::ShellTool;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let owner = ReadReceiptOwner::new("workspace", "task", "session", "special").expect("owner");
+    let state = Arc::new(OutputState::new(OutputPolicy { enabled: true }, owner));
+    let mut context = ToolContext::zero();
+    context.output_id = uuid::Uuid::new_v4().to_string();
+    context.tool_id = "background-shell".into();
+    context.output_state = Some(state.clone());
+
+    let shell = ShellTool::new(dir.path()).with_policy(Arc::new(AllowAllPolicy));
+    let background_args = json!({"command": "true", "background": true});
+    let mut background = shell
+        .execute_with_context(&context, &background_args)
+        .await
+        .expect("background shell");
+    assert!(background.output_document.is_none());
+    state.finish_result(
+        &context.output_id,
+        &context.tool_id,
+        "shell",
+        &background_args,
+        &mut background,
+        None,
+    );
+    assert!(background.output.contains("\"recoverable\":false"));
+    assert!(background.output.contains("missing_source_metadata"));
+
+    context.output_id = uuid::Uuid::new_v4().to_string();
+    context.tool_id = "yielded-exec".into();
+    let exec = ExecCommandTool::new(dir.path(), Arc::new(crate::sandbox::NoSandbox))
+        .with_policy(Arc::new(AllowAllPolicy));
+    let args = json!({"command": "printf yielded", "yield_time_ms": 10});
+    let exec_context = context.clone();
+    let mut yielded = TOOL_CTX
+        .scope(exec_context, exec.execute(&args))
+        .await
+        .expect("yielded exec");
+    assert!(yielded.output_document.is_none());
+    state.finish_result(
+        &context.output_id,
+        &context.tool_id,
+        "exec_command",
+        &args,
+        &mut yielded,
+        None,
+    );
+    assert!(yielded.output.contains("\"recoverable\":false"));
+    assert!(yielded.output.contains("missing_source_metadata"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn h03_m4_timeout_preserves_output_emitted_before_termination() {
+    use crate::model_read_receipts::ReadReceiptOwner;
+    use crate::output_recovery::{CaptureState, ExecutionStatus, OutputPolicy, OutputState};
+    use crate::policy::AllowAllPolicy;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let owner = ReadReceiptOwner::new("workspace", "task", "session", "timeout").expect("owner");
+    let state = Arc::new(OutputState::new(OutputPolicy { enabled: true }, owner));
+    let mut context = ToolContext::zero();
+    context.output_id = uuid::Uuid::new_v4().to_string();
+    context.tool_id = "timed-out-bash".into();
+    context.output_state = Some(state);
+    let tool = BashTool::new(dir.path(), Arc::new(crate::sandbox::NoSandbox))
+        .with_policy(Arc::new(AllowAllPolicy));
+    let args = json!({
+        "cmd": "printf 'before-timeout\\n'; printf 'stderr-before-timeout\\n' >&2; sleep 30",
+        "timeout_ms": 1_000,
+    });
+
+    let result = TOOL_CTX
+        .scope(context, tool.execute(&args))
+        .await
+        .expect("bash");
+    assert!(!result.success);
+    assert!(result.output.contains("before-timeout"));
+    assert!(result.output.contains("timed out"));
+    let document = result.output_document.expect("captured output document");
+    assert_eq!(document.capture, CaptureState::Partial);
+    assert_eq!(document.execution, ExecutionStatus::TimedOut);
+    assert!(
+        document
+            .parts
+            .iter()
+            .any(|part| part.text.contains("before-timeout"))
+    );
+    assert!(
+        document
+            .parts
+            .iter()
+            .any(|part| part.text.contains("stderr-before-timeout"))
+    );
+
+    let disabled = tool
+        .execute(&args)
+        .await
+        .expect("bash with recovery disabled");
+    assert_eq!(disabled.output, "Command timed out after 1 seconds");
+    assert!(disabled.output_document.is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn h03_m4_shell_timeout_preserves_partial_output_and_kills_grandchildren() {
+    use crate::model_read_receipts::ReadReceiptOwner;
+    use crate::output_recovery::{CaptureState, ExecutionStatus, OutputPolicy, OutputState};
+    use crate::policy::AllowAllPolicy;
+    use crate::tools::shell::ShellTool;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sentinel = dir.path().join("late");
+    let owner =
+        ReadReceiptOwner::new("workspace", "task", "session", "shell-timeout").expect("owner");
+    let state = Arc::new(OutputState::new(OutputPolicy { enabled: true }, owner));
+    let mut context = ToolContext::zero();
+    context.output_id = uuid::Uuid::new_v4().to_string();
+    context.tool_id = "timed-out-shell".into();
+    context.output_state = Some(state);
+    let tool = ShellTool::new(dir.path())
+        .with_policy(Arc::new(AllowAllPolicy))
+        .with_timeout(Duration::from_secs(1));
+    let args = json!({
+        "command": format!(
+            "printf 'shell-before-timeout\\n'; (sleep 3; touch {}) & wait",
+            sentinel.display()
+        ),
+    });
+
+    let result = tool
+        .execute_with_context(&context, &args)
+        .await
+        .expect("shell");
+    assert!(!result.success);
+    assert!(result.output.contains("shell-before-timeout"));
+    let document = result.output_document.expect("captured output document");
+    assert_eq!(document.capture, CaptureState::Partial);
+    assert_eq!(document.execution, ExecutionStatus::TimedOut);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!sentinel.exists(), "timed-out grandchild survived");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn h03_m4_repeated_recall_does_not_execute_the_command_again() {
+    use crate::model_read_receipts::ReadReceiptOwner;
+    use crate::output_recovery::{OutputPolicy, OutputState, OutputStream, PAGE_BYTES};
+    use crate::output_store::RecallRequest;
+    use crate::policy::AllowAllPolicy;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let counter = dir.path().join("counter");
+    let owner = ReadReceiptOwner::new("workspace", "task", "session", "recall").expect("owner");
+    let state = Arc::new(OutputState::new(OutputPolicy { enabled: true }, owner));
+    state.enable_store(dir.path()).expect("store");
+    let output_id = uuid::Uuid::new_v4().to_string();
+    let call_id = "single-execution";
+    let mut context = ToolContext::zero();
+    context.output_id = output_id.clone();
+    context.tool_id = call_id.into();
+    context.output_state = Some(state.clone());
+    let tool = BashTool::new(dir.path(), Arc::new(crate::sandbox::NoSandbox))
+        .with_policy(Arc::new(AllowAllPolicy));
+    let args = json!({
+        "cmd": format!("printf x >> {}; printf 'saved-log\\n'", counter.display()),
+    });
+
+    let mut result = TOOL_CTX
+        .scope(context, tool.execute(&args))
+        .await
+        .expect("bash");
+    let document = result.output_document.take().expect("capture");
+    state
+        .register(
+            output_id.clone(),
+            call_id,
+            &args,
+            document,
+            result.success,
+            PAGE_BYTES,
+        )
+        .expect("finalize");
+    let store = state.store().expect("store");
+    for _ in 0..3 {
+        let recalled = store
+            .read(
+                &RecallRequest {
+                    output_id: Some(output_id.clone()),
+                    stream: Some(OutputStream::Stdout),
+                    ..Default::default()
+                },
+                PAGE_BYTES,
+            )
+            .expect("recall");
+        assert!(
+            recalled
+                .document
+                .parts
+                .iter()
+                .any(|part| part.text.contains("saved-log"))
+        );
+    }
+    assert_eq!(std::fs::read_to_string(counter).expect("counter"), "x");
 }

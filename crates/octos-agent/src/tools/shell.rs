@@ -10,6 +10,8 @@ use eyre::Result;
 use serde::Deserialize;
 use tokio::time::timeout;
 
+use super::coding_tools::{ChildGroupGuard, kill_timed_out_child};
+use super::command_capture::{CaptureTermination, RecoveryRegistration, capture_child};
 use super::{
     ConcurrencyClass, TOOL_APPROVAL_CTX, TOOL_CTX, Tool, ToolApprovalDecision, ToolApprovalRequest,
     ToolContext, ToolResult,
@@ -1173,10 +1175,8 @@ impl Tool for ShellTool {
             timeout_duration = timeout_duration.min(cap);
         }
 
-        // Execute command (through sandbox).
-        // Spawn the child, grab its PID, then timeout on wait_with_output().
-        // If timeout fires, kill by PID to prevent orphaned processes.
-        // (wait_with_output() takes ownership of child, so we save the PID first.)
+        // Execute through the sandbox. The shared capture path drains both
+        // pipes concurrently while retaining bounded recovery data.
         let usage_guard = match begin_build_cache_use(ctx) {
             Ok(guard) => guard,
             Err(message) => {
@@ -1194,6 +1194,8 @@ impl Tool for ShellTool {
             slot.as_deref(),
         );
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        #[cfg(unix)]
+        cmd.process_group(0);
         apply_frontend_tool_env(&mut cmd, effective_cwd);
         apply_quarto_tool_env(&mut cmd, &input.command, effective_cwd);
         apply_git_tool_env(&mut cmd, &input.command);
@@ -1212,52 +1214,47 @@ impl Tool for ShellTool {
             }
         };
         let child_pid = child.id();
-
-        // The waiter owns both the child and the claim usage. Dropping the
-        // caller's future detaches this waiter, so release still waits for exit.
-        let waiter = tokio::spawn(async move {
+        let recovery_enabled = ctx
+            .output_state
+            .as_ref()
+            .is_some_and(|state| state.policy.enabled);
+        let registration = RecoveryRegistration::from_context(ctx, args);
+        let termination = CaptureTermination::default();
+        let mut group_guard = ChildGroupGuard::with_termination(child_pid, termination.clone());
+        let capture_termination = termination.clone();
+        let capture_registration = registration.clone();
+        // The waiter owns the child, both pipe drains and the build-cache
+        // claim. If the caller is cancelled, the guard kills the process
+        // group while this detached waiter finishes the partial capture.
+        let mut waiter = tokio::spawn(async move {
             let _usage_guard = usage_guard;
-            child.wait_with_output().await
+            capture_child(child, capture_termination, capture_registration).await
         });
-        let result = timeout(timeout_duration, async {
-            waiter.await.map_err(std::io::Error::other)?
-        })
-        .await;
+        if let Some(registration) = &registration {
+            registration.register_running();
+        }
+        let result = timeout(timeout_duration, &mut waiter).await;
 
         match result {
-            Ok(Ok(output)) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let exit_code = output.status.code().unwrap_or(-1);
-
-                let mut result_text = String::new();
-
-                if !stdout.is_empty() {
-                    result_text.push_str(&stdout);
-                }
-
-                if !stderr.is_empty() {
-                    if !result_text.is_empty() {
-                        result_text.push_str("\n--- stderr ---\n");
-                    }
-                    result_text.push_str(&stderr);
-                }
-
-                if result_text.is_empty() {
-                    result_text = "(no output)".to_string();
-                }
+            Ok(Ok(capture)) => {
+                group_guard.disarm();
+                let exit_code = capture.exit_code().unwrap_or(-1);
+                let mut result_text = capture.text();
 
                 // Sandbox-denial scan runs on the FULL text (the denial line
                 // may be exactly what truncation cuts); the hint is appended
                 // after truncation so it survives the cut.
                 let denial_hint = crate::sandbox::sandbox_denial_hint(
                     !self.sandbox.is_noop(),
-                    output.status.success(),
+                    capture.success(),
                     &result_text,
                 );
 
                 // Truncate if too long (reserve space for exit code suffix)
-                let exit_suffix = format!("\n\nExit code: {exit_code}");
+                let exit_suffix = capture
+                    .wait_error()
+                    .map(|error| format!("\n\nFailed to wait for command: {error}"))
+                    .unwrap_or_else(|| format!("\n\nExit code: {exit_code}"));
                 const MAX_OUTPUT: usize = 50000;
                 octos_core::truncate_utf8(
                     &mut result_text,
@@ -1291,85 +1288,50 @@ impl Tool for ShellTool {
                 }
 
                 Ok(ToolResult {
-                    output_document: ctx
-                        .output_state
-                        .as_ref()
-                        .filter(|state| state.policy.enabled)
-                        .map(|_| {
-                            crate::output_recovery::OutputDocument::command(&output)
-                                .with_notice(&result_text[notice_start..])
-                        }),
+                    output_document: recovery_enabled
+                        .then(|| capture.document().with_notice(&result_text[notice_start..])),
                     output: result_text,
-                    success: output.status.success(),
+                    success: capture.success(),
                     ..Default::default()
                 })
             }
-            Ok(Err(e)) => Ok(ToolResult {
-                output: format!("Failed to execute command: {e}"),
-                success: false,
-                ..Default::default()
-            }),
-            Err(_) => {
-                // Graceful shutdown: SIGTERM first, then SIGKILL after grace period.
-                // wait_with_output() consumed the Child, so we kill via PID.
-                // Use negative PID to target the entire process group.
-                #[cfg(unix)]
-                if let Some(pid) = child_pid {
-                    use std::process::Command as StdCommand;
-
-                    // 1. Send SIGTERM to process group for graceful shutdown.
-                    // `--` is required before the negative PID: GNU/procps
-                    // `kill` otherwise parses `-<pid>` as an option and the
-                    // group signal is silently never delivered (macOS
-                    // accepted the bare form, Linux did not).
-                    let group = format!("-{pid}");
-                    let _ = StdCommand::new("kill").args(["-15", "--", &group]).status();
-                    let _ = StdCommand::new("kill")
-                        .args(["-15", &pid.to_string()])
-                        .status();
-
-                    // 2. Brief grace period, then SIGKILL gated on a probe of
-                    // the GROUP — a leader-only probe skipped the escalation
-                    // when the shell died to SIGTERM while backgrounded
-                    // grandchildren lived on (#1781 CI). `kill -0 -- -pgid`
-                    // succeeds while ANY member is alive and cannot hit a
-                    // recycled group while a member remains.
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-
-                    let group_alive = StdCommand::new("kill")
-                        .args(["-0", "--", &group])
-                        .status()
-                        .is_ok_and(|s| s.success());
-                    if group_alive {
-                        let _ = StdCommand::new("kill").args(["-9", "--", &group]).status();
-                    }
-                    let leader_alive = StdCommand::new("kill")
-                        .args(["-0", &pid.to_string()])
-                        .status()
-                        .is_ok_and(|s| s.success());
-                    if leader_alive {
-                        let _ = StdCommand::new("kill")
-                            .args(["-9", &pid.to_string()])
-                            .status();
-                    }
-                }
-                #[cfg(windows)]
-                if let Some(pid) = child_pid {
-                    use std::process::Command as StdCommand;
-                    let _ = StdCommand::new("taskkill")
-                        .args(["/F", "/T", "/PID", &pid.to_string()])
-                        .status();
-                }
+            Ok(Err(error)) => {
+                kill_timed_out_child(child_pid).await;
+                group_guard.disarm();
                 Ok(ToolResult {
-                    output_document: ctx
-                        .output_state
+                    output: format!("Failed to collect command output: {error}"),
+                    success: false,
+                    ..Default::default()
+                })
+            }
+            Err(_) => {
+                termination.mark_timed_out();
+                kill_timed_out_child(child_pid).await;
+                let capture = timeout(Duration::from_secs(5), &mut waiter)
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
+                group_guard.disarm();
+                let timeout_notice = format!(
+                    "Command timed out after {} seconds",
+                    timeout_duration.as_secs()
+                );
+                let output = if recovery_enabled {
+                    capture
                         .as_ref()
-                        .filter(|state| state.policy.enabled)
-                        .map(|_| crate::output_recovery::OutputDocument::timed_out()),
-                    output: format!(
-                        "Command timed out after {} seconds",
-                        timeout_duration.as_secs()
-                    ),
+                        .map(|capture| format!("{}\n\n{timeout_notice}", capture.text()))
+                        .unwrap_or_else(|| timeout_notice.clone())
+                } else {
+                    timeout_notice.clone()
+                };
+                Ok(ToolResult {
+                    output_document: recovery_enabled.then(|| {
+                        capture
+                            .as_ref()
+                            .map(|capture| capture.document().with_notice(&timeout_notice))
+                            .unwrap_or_else(crate::output_recovery::OutputDocument::timed_out)
+                    }),
+                    output,
                     success: false,
                     ..Default::default()
                 })

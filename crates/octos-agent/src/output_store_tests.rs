@@ -738,3 +738,171 @@ fn h03_m2_duplicate_output_id_cannot_change_immutable_content_or_cursor_version(
         OutputError::InvalidCursor
     );
 }
+
+fn restore_stream(store: &OutputStore, id: &str, stream: OutputStream) -> String {
+    let mut request = RecallRequest {
+        output_id: Some(id.into()),
+        stream: Some(stream),
+        ..Default::default()
+    };
+    let mut text = String::new();
+    loop {
+        let page = store.read(&request, PAGE_BYTES).unwrap();
+        let range = page.rendered.view.visible_ranges[0].clone();
+        let length = (range.end - range.start) as usize;
+        text.push_str(&page.document.parts[0].text[..length]);
+        let page_header = header(&page.rendered);
+        let Some(cursor) = page_header["recall"]["cursor"].as_str() else {
+            return text;
+        };
+        request = RecallRequest {
+            cursor: Some(cursor.into()),
+            ..Default::default()
+        };
+    }
+}
+
+#[test]
+fn h03_m4_command_preview_marks_head_tail_gap_and_recall_restores_each_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path(), "root");
+    let stdout = format!("HEAD\n{}TAIL\n", "middle\n".repeat(40_000));
+    let stderr = "unique failure on stderr\n";
+    let document = OutputDocument {
+        source: OutputSource::Command {
+            run_id: String::new(),
+        },
+        parts: vec![
+            OutputPart {
+                stream: OutputStream::Stdout,
+                text: stdout.clone(),
+                start: 0,
+                first_line: None,
+                total: Some(stdout.len() as u64),
+            },
+            OutputPart {
+                stream: OutputStream::Stderr,
+                text: stderr.into(),
+                start: 0,
+                first_line: None,
+                total: Some(stderr.len() as u64),
+            },
+        ],
+        capture: CaptureState::Complete,
+        execution: ExecutionStatus::Exited {
+            code: Some(7),
+            signal: None,
+        },
+        transformed: false,
+        loss_reason: None,
+        file_read: None,
+    };
+    let saved = state
+        .register(
+            uuid::Uuid::new_v4().to_string(),
+            "command-call",
+            &serde_json::json!({"command": "fixture"}),
+            document,
+            false,
+            PAGE_BYTES,
+        )
+        .unwrap();
+
+    assert!(saved.content.contains("HEAD"));
+    assert!(saved.content.contains("TAIL"));
+    assert!(
+        saved
+            .content
+            .contains("omitted from this preview; use recall")
+    );
+    assert!(saved.content.contains("unique failure on stderr"));
+    assert_eq!(
+        saved.view.execution,
+        ExecutionStatus::Exited {
+            code: Some(7),
+            signal: None,
+        }
+    );
+    let stdout_ranges: Vec<_> = saved
+        .view
+        .visible_ranges
+        .iter()
+        .filter(|range| range.stream == OutputStream::Stdout)
+        .collect();
+    assert_eq!(stdout_ranges.len(), 2);
+    assert!(stdout_ranges[0].end < stdout_ranges[1].start);
+    assert!(matches!(
+        &saved.view.continuation,
+        crate::output_recovery::Continuation::Next { positions }
+            if positions.contains(&(OutputStream::Stdout, stdout_ranges[0].end))
+    ));
+    let initial_header = header(&saved);
+    assert_eq!(
+        initial_header["recall"]["offset"].as_u64(),
+        Some(stdout_ranges[0].end)
+    );
+
+    let store = state.store().unwrap();
+    assert_eq!(
+        restore_stream(&store, &saved.view.output_id, OutputStream::Stdout),
+        stdout
+    );
+    assert_eq!(
+        restore_stream(&store, &saved.view.output_id, OutputStream::Stderr),
+        stderr
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn h03_m4_command_store_failure_preserves_output_and_exit_status_without_false_reference() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path(), "root");
+    let store = state.store().unwrap();
+    let outside = tempfile::NamedTempFile::new().unwrap();
+    symlink(outside.path(), store.directory.path.join("index.json")).unwrap();
+    let document = OutputDocument {
+        source: OutputSource::Command {
+            run_id: String::new(),
+        },
+        parts: vec![OutputPart {
+            stream: OutputStream::Stdout,
+            text: "captured before store failure\n".into(),
+            start: 0,
+            first_line: None,
+            total: Some(30),
+        }],
+        capture: CaptureState::Complete,
+        execution: ExecutionStatus::Exited {
+            code: Some(9),
+            signal: None,
+        },
+        transformed: false,
+        loss_reason: None,
+        file_read: None,
+    };
+    let saved = state
+        .register(
+            uuid::Uuid::new_v4().to_string(),
+            "failed-store-command",
+            &serde_json::json!({"command": "fixture"}),
+            document,
+            false,
+            PAGE_BYTES,
+        )
+        .unwrap();
+
+    assert!(!saved.view.recoverable);
+    assert_eq!(saved.view.availability, Availability::StoreFailed);
+    assert_eq!(saved.view.loss_reason.as_deref(), Some("storage_failed"));
+    assert_eq!(
+        saved.view.execution,
+        ExecutionStatus::Exited {
+            code: Some(9),
+            signal: None,
+        }
+    );
+    assert!(saved.content.contains("captured before store failure"));
+}

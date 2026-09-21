@@ -30,6 +30,7 @@ use crate::policy::{ApprovalPolicy, CommandPolicy, Decision, FileAccessMode, Fil
 use crate::sandbox::Sandbox;
 use crate::subprocess_env::{EnvAllowlist, sanitize_command_env};
 use crate::task_supervisor::{RelaunchOpts, TaskRelaunchError, TaskStatus};
+use crate::tools::command_capture::{CaptureTermination, RecoveryRegistration, capture_child};
 use crate::tools::policy::BashFileWrites;
 
 const MAX_EXEC_TIMEOUT_SECS: u64 = 600;
@@ -448,7 +449,8 @@ impl Tool for ExecCommandTool {
         if input.tty.unwrap_or(false) || input.yield_time_ms.is_some() {
             self.spawn_session(command, cwd, input).await
         } else {
-            self.run_to_completion(command, cwd, input).await
+            self.run_to_completion(command, cwd, input, args.clone())
+                .await
         }
     }
 }
@@ -459,6 +461,7 @@ impl ExecCommandTool {
         command: String,
         cwd: PathBuf,
         input: ExecCommandInput,
+        args: Value,
     ) -> Result<ToolResult> {
         let timeout_secs = input
             .timeout_secs
@@ -528,33 +531,35 @@ impl ExecCommandTool {
                 });
             }
         };
-        // Capture the pid BEFORE `wait_with_output` consumes the child — the
-        // timeout arm needs it to kill the process tree (dropping the wait
-        // future does NOT kill a tokio child).
         let child_pid = child.id();
-        // Armed for the whole wait: a dropped future (user interrupt ->
-        // `agent_task.abort()`) reaches neither arm below. See `ChildGroupGuard`.
-        let mut group_guard = ChildGroupGuard::new(child_pid);
-        let result = timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await;
-        group_guard.disarm();
+        let recovery_enabled = TOOL_CTX
+            .try_with(|ctx| ctx.output_state.as_ref().is_some_and(|s| s.policy.enabled))
+            .unwrap_or(false);
+        let registration = RecoveryRegistration::current(&args);
+        let termination = CaptureTermination::default();
+        let mut group_guard = ChildGroupGuard::with_termination(child_pid, termination.clone());
+        let mut waiter = tokio::spawn(capture_child(
+            child,
+            termination.clone(),
+            registration.clone(),
+        ));
+        if let Some(registration) = &registration {
+            registration.register_running();
+        }
+        let result = timeout(Duration::from_secs(timeout_secs), &mut waiter).await;
         match result {
-            Ok(Ok(output)) => {
-                let mut text = String::new();
-                text.push_str(&String::from_utf8_lossy(&output.stdout));
-                if !output.stderr.is_empty() {
-                    if !text.is_empty() {
-                        text.push_str("\n--- stderr ---\n");
-                    }
-                    text.push_str(&String::from_utf8_lossy(&output.stderr));
-                }
-                if text.is_empty() {
-                    text.push_str("(no output)");
-                }
+            Ok(Ok(capture)) => {
+                group_guard.disarm();
+                let mut text = capture.text();
                 let notice_start = text.len();
-                text.push_str(&format!(
-                    "\n\nExit code: {}",
-                    output.status.code().unwrap_or(-1)
-                ));
+                if let Some(error) = capture.wait_error() {
+                    text.push_str(&format!("\n\nFailed to wait for command: {error}"));
+                } else {
+                    text.push_str(&format!(
+                        "\n\nExit code: {}",
+                        capture.exit_code().unwrap_or(-1)
+                    ));
+                }
                 // #28c — file-change receipt on the coding-session exec
                 // path too (same shared 28a module; same five acceptance
                 // semantics as ShellTool / BashTool).
@@ -577,17 +582,14 @@ impl ExecCommandTool {
                 }
                 // Scan BEFORE truncation (the denial line may be what gets
                 // cut), append AFTER (so the hint itself survives the cut).
-                let hint =
-                    sandbox_denial_hint(!self.sandbox.is_noop(), output.status.success(), &text);
+                let hint = sandbox_denial_hint(!self.sandbox.is_noop(), capture.success(), &text);
                 let max = input.max_output_tokens.unwrap_or(MAX_CAPTURE_BYTES);
-                let output_document = TOOL_CTX
-                    .try_with(|ctx| ctx.output_state.as_ref().is_some_and(|s| s.policy.enabled))
-                    .unwrap_or(false)
-                    .then(|| {
-                        crate::output_recovery::OutputDocument::command(&output)
-                            .with_notice(&text[notice_start..])
-                            .with_notice(hint.unwrap_or_default())
-                    });
+                let output_document = recovery_enabled.then(|| {
+                    capture
+                        .document()
+                        .with_notice(&text[notice_start..])
+                        .with_notice(hint.unwrap_or_default())
+                });
                 let mut out = truncate_output(text, max);
                 if let Some(hint) = hint {
                     out.push_str(hint);
@@ -595,28 +597,44 @@ impl ExecCommandTool {
                 Ok(ToolResult {
                     output: out,
                     output_document,
-                    success: output.status.success(),
+                    success: capture.success(),
                     ..Default::default()
                 })
             }
-            Ok(Err(error)) => Ok(ToolResult {
-                output: format!("Failed to execute command: {error}"),
-                success: false,
-                ..Default::default()
-            }),
-            Err(_) => {
-                // Dropping the wait future does NOT kill a tokio child, so
-                // the wrapper shell and any grandchildren keep running. Kill
-                // the whole process group/tree (SIGTERM → 500ms grace →
-                // SIGKILL on Unix, `taskkill /F /T` on Windows) — the same
-                // helper the `bash` tool uses.
+            Ok(Err(error)) => {
                 kill_timed_out_child(child_pid).await;
+                group_guard.disarm();
                 Ok(ToolResult {
-                    output_document: TOOL_CTX
-                        .try_with(|ctx| ctx.output_state.as_ref().is_some_and(|s| s.policy.enabled))
-                        .unwrap_or(false)
-                        .then(crate::output_recovery::OutputDocument::timed_out),
-                    output: format!("Command timed out after {timeout_secs} seconds"),
+                    output: format!("Failed to collect command output: {error}"),
+                    success: false,
+                    ..Default::default()
+                })
+            }
+            Err(_) => {
+                termination.mark_timed_out();
+                kill_timed_out_child(child_pid).await;
+                let capture = timeout(Duration::from_secs(5), &mut waiter)
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
+                group_guard.disarm();
+                let timeout_notice = format!("Command timed out after {timeout_secs} seconds");
+                let output = if recovery_enabled {
+                    capture
+                        .as_ref()
+                        .map(|capture| format!("{}\n\n{timeout_notice}", capture.text()))
+                        .unwrap_or_else(|| timeout_notice.clone())
+                } else {
+                    timeout_notice.clone()
+                };
+                Ok(ToolResult {
+                    output_document: recovery_enabled.then(|| {
+                        capture
+                            .as_ref()
+                            .map(|capture| capture.document().with_notice(&timeout_notice))
+                            .unwrap_or_else(crate::output_recovery::OutputDocument::timed_out)
+                    }),
+                    output,
                     success: false,
                     ..Default::default()
                 })
@@ -2112,35 +2130,33 @@ impl Tool for BashTool {
                 });
             }
         };
-        // codex review (#1172) P2: `tokio::process::Child` does NOT
-        // kill the underlying process on drop, so a `timeout()` that
-        // expires would leave the shell running and able to mutate
-        // the workspace later. Save the PID before `wait_with_output`
-        // takes ownership of the child, then on timeout send
-        // SIGTERM -> brief grace -> SIGKILL (Unix) or `taskkill /F /T`
-        // (Windows). Mirrors `ShellTool`'s kill-on-timeout path.
         let child_pid = child.id();
-        // Armed for the whole wait: a dropped future (user interrupt ->
-        // `agent_task.abort()`) reaches neither arm below. See `ChildGroupGuard`.
-        let mut group_guard = ChildGroupGuard::new(child_pid);
-        let waited = timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await;
-        group_guard.disarm();
+        let recovery_enabled = TOOL_CTX
+            .try_with(|ctx| ctx.output_state.as_ref().is_some_and(|s| s.policy.enabled))
+            .unwrap_or(false);
+        let registration = RecoveryRegistration::current(args);
+        let termination = CaptureTermination::default();
+        let mut group_guard = ChildGroupGuard::with_termination(child_pid, termination.clone());
+        let mut waiter = tokio::spawn(capture_child(
+            child,
+            termination.clone(),
+            registration.clone(),
+        ));
+        if let Some(registration) = &registration {
+            registration.register_running();
+        }
+        let waited = timeout(Duration::from_secs(timeout_secs), &mut waiter).await;
         match waited {
-            Ok(Ok(output)) => {
-                let mut text = String::new();
-                text.push_str(&String::from_utf8_lossy(&output.stdout));
-                if !output.stderr.is_empty() {
-                    if !text.is_empty() {
-                        text.push_str("\n--- stderr ---\n");
-                    }
-                    text.push_str(&String::from_utf8_lossy(&output.stderr));
-                }
-                if text.is_empty() {
-                    text.push_str("(no output)");
-                }
-                let exit_code = output.status.code().unwrap_or(-1);
+            Ok(Ok(capture)) => {
+                group_guard.disarm();
+                let mut text = capture.text();
+                let exit_code = capture.exit_code().unwrap_or(-1);
                 let notice_start = text.len();
-                text.push_str(&format!("\n\nExit code: {exit_code}"));
+                if let Some(error) = capture.wait_error() {
+                    text.push_str(&format!("\n\nFailed to wait for command: {error}"));
+                } else {
+                    text.push_str(&format!("\n\nExit code: {exit_code}"));
+                }
                 // #28c — file-change receipt appended ONCE to THIS result's
                 // tail (28a semantics: prompt-cache stable, never a system
                 // prompt / history rewrite). Non-git fail-open ⇒ None ⇒
@@ -2163,16 +2179,13 @@ impl Tool for BashTool {
                     }
                 }
                 // Scan BEFORE truncation, append AFTER — see run_to_completion.
-                let hint =
-                    sandbox_denial_hint(!self.sandbox.is_noop(), output.status.success(), &text);
-                let output_document = TOOL_CTX
-                    .try_with(|ctx| ctx.output_state.as_ref().is_some_and(|s| s.policy.enabled))
-                    .unwrap_or(false)
-                    .then(|| {
-                        crate::output_recovery::OutputDocument::command(&output)
-                            .with_notice(&text[notice_start..])
-                            .with_notice(hint.unwrap_or_default())
-                    });
+                let hint = sandbox_denial_hint(!self.sandbox.is_noop(), capture.success(), &text);
+                let output_document = recovery_enabled.then(|| {
+                    capture
+                        .document()
+                        .with_notice(&text[notice_start..])
+                        .with_notice(hint.unwrap_or_default())
+                });
                 let mut out = truncate_output(text, MAX_CAPTURE_BYTES);
                 if let Some(hint) = hint {
                     out.push_str(hint);
@@ -2180,7 +2193,7 @@ impl Tool for BashTool {
                 Ok(ToolResult {
                     output: out,
                     output_document,
-                    success: output.status.success(),
+                    success: capture.success(),
                     structured_metadata: Some(json!({
                         "codex_tool": "bash",
                         "octos_tool": "exec_command",
@@ -2189,19 +2202,40 @@ impl Tool for BashTool {
                     ..Default::default()
                 })
             }
-            Ok(Err(error)) => Ok(ToolResult {
-                output: format!("Failed to execute command: {error}"),
-                success: false,
-                ..Default::default()
-            }),
-            Err(_) => {
+            Ok(Err(error)) => {
                 kill_timed_out_child(child_pid).await;
+                group_guard.disarm();
                 Ok(ToolResult {
-                    output_document: TOOL_CTX
-                        .try_with(|ctx| ctx.output_state.as_ref().is_some_and(|s| s.policy.enabled))
-                        .unwrap_or(false)
-                        .then(crate::output_recovery::OutputDocument::timed_out),
-                    output: format!("Command timed out after {timeout_secs} seconds"),
+                    output: format!("Failed to collect command output: {error}"),
+                    success: false,
+                    ..Default::default()
+                })
+            }
+            Err(_) => {
+                termination.mark_timed_out();
+                kill_timed_out_child(child_pid).await;
+                let capture = timeout(Duration::from_secs(5), &mut waiter)
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
+                group_guard.disarm();
+                let timeout_notice = format!("Command timed out after {timeout_secs} seconds");
+                let output = if recovery_enabled {
+                    capture
+                        .as_ref()
+                        .map(|capture| format!("{}\n\n{timeout_notice}", capture.text()))
+                        .unwrap_or_else(|| timeout_notice.clone())
+                } else {
+                    timeout_notice.clone()
+                };
+                Ok(ToolResult {
+                    output_document: recovery_enabled.then(|| {
+                        capture
+                            .as_ref()
+                            .map(|capture| capture.document().with_notice(&timeout_notice))
+                            .unwrap_or_else(crate::output_recovery::OutputDocument::timed_out)
+                    }),
+                    output,
                     success: false,
                     ..Default::default()
                 })
@@ -2225,25 +2259,46 @@ impl Tool for BashTool {
 /// one match arm.
 ///
 /// Disarm on every path that has already reaped or killed the child.
-struct ChildGroupGuard(Option<u32>);
+pub(super) struct ChildGroupGuard {
+    pid: Option<u32>,
+    termination: Option<CaptureTermination>,
+}
 
 impl ChildGroupGuard {
-    fn new(child_pid: Option<u32>) -> Self {
-        Self(child_pid)
+    #[cfg(test)]
+    pub(super) fn new(child_pid: Option<u32>) -> Self {
+        Self {
+            pid: child_pid,
+            termination: None,
+        }
+    }
+
+    pub(super) fn with_termination(
+        child_pid: Option<u32>,
+        termination: CaptureTermination,
+    ) -> Self {
+        Self {
+            pid: child_pid,
+            termination: Some(termination),
+        }
     }
 
     /// The normal paths (clean exit, spawn error, timeout ladder) have already
     /// dealt with the child; leave it alone.
-    fn disarm(&mut self) {
-        self.0 = None;
+    pub(super) fn disarm(&mut self) {
+        self.pid = None;
+        self.termination = None;
     }
 }
 
 impl Drop for ChildGroupGuard {
     fn drop(&mut self) {
-        let Some(pid) = self.0 else {
+        let Some(pid) = self.pid else {
             return;
         };
+        if let Some(termination) = &self.termination {
+            termination.mark_cancelled();
+        }
         // `Drop` cannot await, but the graceful ladder needs a grace period
         // between SIGTERM and SIGKILL. Hand it to a detached task when a
         // runtime is still available — cancellation drops this guard while the
@@ -2271,13 +2326,11 @@ impl Drop for ChildGroupGuard {
     }
 }
 
-/// Best-effort kill of a child whose `wait_with_output()` was dropped
-/// when a `tokio::time::timeout` expired. Mirrors `ShellTool`'s
-/// kill-on-timeout: SIGTERM the process group/tree, brief grace period,
-/// then SIGKILL if any process remains. On Windows uses `taskkill /F /T`.
-/// Errors are swallowed because the call is best-effort cleanup —
-/// the timeout result has already been returned to the caller.
-async fn kill_timed_out_child(child_pid: Option<u32>) {
+/// Best-effort process-group cleanup for timeout and cancellation paths.
+/// Uses SIGTERM, a brief grace period and SIGKILL on Unix, or `taskkill /F /T`
+/// on Windows. Errors are swallowed because cleanup follows a terminal tool
+/// outcome.
+pub(super) async fn kill_timed_out_child(child_pid: Option<u32>) {
     let Some(pid) = child_pid else {
         return;
     };
