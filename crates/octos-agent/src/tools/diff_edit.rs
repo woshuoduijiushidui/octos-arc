@@ -11,6 +11,14 @@ use tracing::warn;
 use super::{ConcurrencyClass, Tool, ToolContext, ToolResult};
 use crate::policy::{FileAccessMode, FilesystemScope};
 
+const FUZZY_RANGE: usize = 3;
+const MAX_GLOBAL_SCAN_BYTES: usize = 10_000_000;
+const MAX_GLOBAL_SCAN_LINES: usize = 100_000;
+const MAX_GLOBAL_SCAN_COMPARISONS: usize = 1_000_000;
+const MAX_DIFF_CANDIDATES: usize = 3;
+const DIFF_CANDIDATE_EXCERPT_BYTES: usize = 512;
+const DIFF_REJECTION_OUTPUT_BYTES: usize = 3072;
+
 /// Tool for editing files via unified diff format with fuzzy matching.
 pub struct DiffEditTool {
     base_dir: PathBuf,
@@ -50,6 +58,158 @@ impl DiffEditTool {
 struct DiffEditInput {
     path: String,
     diff: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HunkMatch {
+    hunk_index: usize,
+    expected_line: usize,
+    actual_line: usize,
+    matcher: &'static str,
+}
+
+#[derive(Debug)]
+struct AppliedDiff {
+    content: String,
+    hunk_matches: Vec<HunkMatch>,
+}
+
+#[derive(Debug, Clone)]
+struct DiffCandidate {
+    start: usize,
+    end: usize,
+    matcher: &'static str,
+}
+
+#[derive(Debug)]
+struct DiffApplyError {
+    code: &'static str,
+    reason: &'static str,
+    hunk_index: usize,
+    expected_line: usize,
+    matcher: &'static str,
+    occurrence_count: usize,
+    candidates: Vec<DiffCandidate>,
+    searched_context_digest: String,
+    full_file_scanned: bool,
+}
+
+fn typed_diff_rejection(
+    path: &str,
+    current_bytes: &[u8],
+    content: &str,
+    error: DiffApplyError,
+) -> super::mutation_guard::MutationTransformError {
+    let current_digest = crate::file_state_cache::FileVersion::sha256(current_bytes);
+    let short_version = super::mutation_report::short_bytes_version(current_bytes);
+    let shown_path =
+        octos_core::truncated_utf8(&super::mutation_report::safe_path(path), 96, "...");
+    let remedy = match error.code {
+        "diff_context_ambiguous" => "retry_with_more_context",
+        "invalid_edit_input" => "fix_diff_hunk",
+        _ => "retry_with_current_context",
+    };
+    let indexed = index_content_lines(content);
+    let mut output = format!(
+        "[{}] path={} hunk={} expected_line={} count={} current={} remedy={}",
+        error.code,
+        shown_path,
+        error.hunk_index,
+        error.expected_line,
+        error.occurrence_count,
+        short_version,
+        remedy,
+    );
+    let mut candidates = Vec::new();
+    for candidate in error.candidates.iter().take(MAX_DIFF_CANDIDATES) {
+        let excerpt = candidate_excerpt(content, &indexed, candidate);
+        let summary = format!(
+            "\nc{} suggestion=true lines={}-{} matcher={}",
+            candidates.len() + 1,
+            candidate.start + 1,
+            candidate.end,
+            candidate.matcher,
+        );
+        if output.len() + summary.len() > DIFF_REJECTION_OUTPUT_BYTES {
+            break;
+        }
+        output.push_str(&summary);
+        candidates.push((candidate, excerpt));
+    }
+    let mut candidate_metadata = Vec::with_capacity(candidates.len());
+    for (index, (candidate, excerpt)) in candidates.into_iter().enumerate() {
+        let body = format!("\ncandidate {} excerpt:\n{}", index + 1, excerpt);
+        if output.len() + body.len() <= DIFF_REJECTION_OUTPUT_BYTES {
+            output.push_str(&body);
+        }
+        candidate_metadata.push(json!({
+            "line_range": {
+                "start": candidate.start + 1,
+                "end": candidate.end,
+            },
+            "matcher": candidate.matcher,
+            "suggestion": true,
+            "excerpt": excerpt,
+        }));
+    }
+    octos_core::truncate_utf8(&mut output, DIFF_REJECTION_OUTPUT_BYTES, "");
+
+    let output_document = crate::output_recovery::OutputDocument::unavailable(output.clone());
+    super::mutation_guard::MutationTransformError::Rejected(
+        super::mutation_guard::MutationRejection::new(ToolResult {
+            output,
+            output_document: Some(output_document),
+            success: false,
+            structured_metadata: Some(json!({
+                "error_code": error.code,
+                "path": super::mutation_report::safe_path(path),
+                "current_version": {
+                    "content_sha256": current_digest,
+                    "size": current_bytes.len(),
+                },
+                "searched_context_digest": error.searched_context_digest,
+                "reason": error.reason,
+                "hunk_index": error.hunk_index,
+                "expected_line": error.expected_line,
+                "matcher": error.matcher,
+                "occurrence_count": error.occurrence_count,
+                "candidates": candidate_metadata,
+                "full_file_scanned": error.full_file_scanned,
+                "scan_limits": {
+                    "bytes": MAX_GLOBAL_SCAN_BYTES,
+                    "lines": MAX_GLOBAL_SCAN_LINES,
+                    "comparisons": MAX_GLOBAL_SCAN_COMPARISONS,
+                },
+                "remedy": remedy,
+                "file_modified": false,
+            })),
+            ..Default::default()
+        }),
+    )
+}
+
+fn hunk_matches_json(matches: &[HunkMatch]) -> serde_json::Value {
+    matches
+        .iter()
+        .map(|matched| {
+            json!({
+                "hunk_index": matched.hunk_index,
+                "expected_line": matched.expected_line,
+                "actual_line": matched.actual_line,
+                "matcher": matched.matcher,
+            })
+        })
+        .collect()
+}
+
+fn hunk_positions_summary(matches: &[HunkMatch]) -> String {
+    let mut summary = matches
+        .iter()
+        .map(|matched| format!("{}->{}", matched.expected_line, matched.actual_line))
+        .collect::<Vec<_>>()
+        .join(",");
+    octos_core::truncate_utf8(&mut summary, 256, "...");
+    summary
 }
 
 #[async_trait]
@@ -166,6 +326,7 @@ impl Tool for DiffEditTool {
         let hunk_count = hunks.len();
         let local_edit_enabled =
             self.local_edit_enabled || super::registry::local_edit_execution_enabled();
+        let display_path = input.path.clone();
 
         let guarded = super::mutation_guard::rewrite_existing(
             ctx,
@@ -178,12 +339,33 @@ impl Tool for DiffEditTool {
             },
             None,
             None,
-            move |bytes| -> Result<_, String> {
+            move |bytes| -> Result<_, super::mutation_guard::MutationTransformError> {
                 let content = std::str::from_utf8(bytes)
                     .map_err(|_| "File is not valid UTF-8 and cannot be edited".to_string())?;
-                let new_content = apply_hunks(content, &hunks)
-                    .map_err(|error| format!("Failed to apply diff: {error}"))?;
-                Ok((new_content.as_bytes().to_vec(), new_content))
+                let applied = if local_edit_enabled {
+                    match apply_hunks_local(content, &hunks) {
+                        Ok(applied) => applied,
+                        Err(error) => {
+                            return Err(typed_diff_rejection(
+                                &display_path,
+                                bytes,
+                                content,
+                                *error,
+                            ));
+                        }
+                    }
+                } else {
+                    match apply_hunks(content, &hunks) {
+                        Ok(content) => AppliedDiff {
+                            content,
+                            hunk_matches: Vec::new(),
+                        },
+                        Err(error) => {
+                            return Err(format!("Failed to apply diff: {error}").into());
+                        }
+                    }
+                };
+                Ok((applied.content.as_bytes().to_vec(), applied))
             },
         )
         .await;
@@ -191,7 +373,14 @@ impl Tool for DiffEditTool {
             Ok(rewrite) => rewrite,
             Err(error) => return Ok(error.into_tool_result(self.name(), &input.path)),
         };
-        let new_content = guarded.value;
+        let AppliedDiff {
+            content: new_content,
+            hunk_matches,
+        } = guarded.value;
+        let full_file_fallback_count = hunk_matches
+            .iter()
+            .filter(|matched| matched.matcher == "full_file_line_exact")
+            .count();
         if !guarded.changed {
             let mut metadata = super::mutation_report::no_change_metadata(
                 self.name(),
@@ -200,11 +389,22 @@ impl Tool for DiffEditTool {
             );
             super::mutation_report::insert(&mut metadata, "matcher", json!("diff_hunks"));
             super::mutation_report::insert(&mut metadata, "hunk_count", json!(hunk_count));
+            super::mutation_report::insert(
+                &mut metadata,
+                "hunk_matches",
+                hunk_matches_json(&hunk_matches),
+            );
+            super::mutation_report::insert(
+                &mut metadata,
+                "full_file_fallback_count",
+                json!(full_file_fallback_count),
+            );
             return Ok(ToolResult {
                 output: format!(
-                    "[no_change] path={} matcher=diff_hunks hunks={} current={}",
+                    "[no_change] path={} matcher=diff_hunks hunks={} positions={} current={}",
                     super::mutation_report::safe_path(&input.path),
                     hunk_count,
+                    hunk_positions_summary(&hunk_matches),
                     super::mutation_report::short_bytes_version(&guarded.before),
                 ),
                 success: true,
@@ -248,6 +448,16 @@ impl Tool for DiffEditTool {
         if let Some(report) = report.as_mut() {
             super::mutation_report::insert(&mut report.metadata, "matcher", json!("diff_hunks"));
             super::mutation_report::insert(&mut report.metadata, "hunk_count", json!(hunk_count));
+            super::mutation_report::insert(
+                &mut report.metadata,
+                "hunk_matches",
+                hunk_matches_json(&hunk_matches),
+            );
+            super::mutation_report::insert(
+                &mut report.metadata,
+                "full_file_fallback_count",
+                json!(full_file_fallback_count),
+            );
         }
 
         // Invalidate every recorded workspace-owned version for this path.
@@ -265,9 +475,10 @@ impl Tool for DiffEditTool {
 
         let output = if let Some(report) = report.as_ref() {
             format!(
-                "Applied {} hunk(s) to {}: final={}, formatter={}",
+                "Applied {} hunk(s) to {}: positions={}, final={}, formatter={}",
                 hunk_count,
                 super::mutation_report::safe_path(&input.path),
+                hunk_positions_summary(&hunk_matches),
                 report.final_label,
                 report.formatter_label,
             )
@@ -391,19 +602,14 @@ fn parse_hunk_header(line: &str) -> Result<usize> {
 
 // --- Hunk application with fuzzy matching ---
 
-const FUZZY_RANGE: i64 = 3;
-
 fn apply_hunks(content: &str, hunks: &[Hunk]) -> Result<String> {
     let mut lines: Vec<String> = content.lines().map(String::from).collect();
-
-    // Apply hunks in reverse order so line numbers stay valid
     let mut sorted_hunks: Vec<(usize, &Hunk)> = hunks.iter().enumerate().collect();
     sorted_hunks.sort_by_key(|entry| std::cmp::Reverse(entry.1.old_start));
 
-    // Check for overlapping hunks (sorted descending by old_start)
     for window in sorted_hunks.windows(2) {
-        let (_, later_hunk) = window[0]; // higher line number
-        let (_, earlier_hunk) = window[1]; // lower line number
+        let (_, later_hunk) = window[0];
+        let (_, earlier_hunk) = window[1];
         let earlier_end = earlier_hunk.old_start + pattern_lines(&earlier_hunk.lines).len();
         if earlier_end > later_hunk.old_start {
             eyre::bail!(
@@ -414,28 +620,18 @@ fn apply_hunks(content: &str, hunks: &[Hunk]) -> Result<String> {
         }
     }
 
-    for (idx, hunk) in sorted_hunks {
-        let context_lines = pattern_lines(&hunk.lines);
-
-        if context_lines.is_empty() {
-            eyre::bail!("hunk {} has no context or remove lines", idx + 1);
+    for (index, hunk) in sorted_hunks {
+        let pattern = pattern_lines(&hunk.lines);
+        if pattern.is_empty() {
+            eyre::bail!("hunk {} has no context or remove lines", index + 1);
         }
-
-        // Try exact position first, then fuzzy search
-        let target = hunk.old_start.saturating_sub(1); // 1-indexed to 0-indexed
-        let match_pos = find_match(&lines, &context_lines, target)?;
-
-        // Apply the hunk at match_pos: replace the matched pattern block with
-        // the replacement block.
-        let remove_count = context_lines.len();
-        let new_lines = replacement_lines(&hunk.lines);
-
-        // Replace the matched region
-        let end = (match_pos + remove_count).min(lines.len());
-        lines.splice(match_pos..end, new_lines);
+        let target = hunk.old_start.saturating_sub(1);
+        let position = find_match(&lines, &pattern, target)?;
+        let replacement = replacement_lines(&hunk.lines);
+        let end = (position + pattern.len()).min(lines.len());
+        lines.splice(position..end, replacement);
     }
 
-    // Preserve trailing newline if original had one
     let mut result = lines.join("\n");
     if content.ends_with('\n') {
         result.push('\n');
@@ -443,14 +639,229 @@ fn apply_hunks(content: &str, hunks: &[Hunk]) -> Result<String> {
     Ok(result)
 }
 
-fn find_match(lines: &[String], pattern: &[&str], target: usize) -> Result<usize> {
-    let start = target.saturating_sub(FUZZY_RANGE as usize);
-    let end = target
-        .saturating_add(FUZZY_RANGE as usize)
-        .min(lines.len().saturating_sub(pattern.len()));
-    let matches = (start..=end)
-        .filter(|position| matches_at(lines, pattern, *position))
+fn apply_hunks_local(
+    content: &str,
+    hunks: &[Hunk],
+) -> std::result::Result<AppliedDiff, Box<DiffApplyError>> {
+    let indexed = index_content_lines(content);
+    let lines = indexed
+        .iter()
+        .map(|line| line.text(content).to_string())
         .collect::<Vec<_>>();
+
+    // Validate declared ranges before doing any matching.
+    let mut sorted_hunks: Vec<(usize, &Hunk)> = hunks.iter().enumerate().collect();
+    sorted_hunks.sort_by_key(|entry| std::cmp::Reverse(entry.1.old_start));
+    for window in sorted_hunks.windows(2) {
+        let (_, later_hunk) = window[0];
+        let (earlier_index, earlier_hunk) = window[1];
+        let earlier_end = earlier_hunk
+            .old_start
+            .saturating_add(pattern_lines(&earlier_hunk.lines).len());
+        if earlier_end > later_hunk.old_start {
+            return Err(invalid_hunk_error(
+                "overlapping_declared_hunks",
+                earlier_index,
+                earlier_hunk,
+            ));
+        }
+    }
+
+    // Locate every hunk against the same immutable source. Applying a later
+    // hunk must not create or remove candidates for an earlier hunk.
+    let mut located = Vec::with_capacity(hunks.len());
+    for (index, hunk) in hunks.iter().enumerate() {
+        let pattern = pattern_lines(&hunk.lines);
+        if pattern.is_empty() {
+            return Err(invalid_hunk_error("empty_context", index, hunk));
+        }
+        let target = hunk.old_start.saturating_sub(1); // 1-indexed to 0-indexed
+        let matched = locate_hunk(content, &lines, &pattern, target, index, hunk)?;
+        located.push((index, hunk, matched));
+    }
+
+    let mut by_position = located.iter().collect::<Vec<_>>();
+    by_position.sort_by_key(|(_, _, matched)| matched.actual_line);
+    for window in by_position.windows(2) {
+        let (_, left_hunk, left_match) = window[0];
+        let (right_index, right_hunk, right_match) = window[1];
+        let left_end = left_match.actual_line - 1 + pattern_lines(&left_hunk.lines).len();
+        if left_end > right_match.actual_line - 1 {
+            return Err(Box::new(DiffApplyError {
+                code: "invalid_edit_input",
+                reason: "overlapping_actual_matches",
+                hunk_index: *right_index + 1,
+                expected_line: right_hunk.old_start,
+                matcher: right_match.matcher,
+                occurrence_count: 0,
+                candidates: vec![
+                    DiffCandidate {
+                        start: left_match.actual_line - 1,
+                        end: left_end,
+                        matcher: left_match.matcher,
+                    },
+                    DiffCandidate {
+                        start: right_match.actual_line - 1,
+                        end: right_match.actual_line - 1 + pattern_lines(&right_hunk.lines).len(),
+                        matcher: right_match.matcher,
+                    },
+                ],
+                searched_context_digest: pattern_digest(&pattern_lines(&right_hunk.lines)),
+                full_file_scanned: located
+                    .iter()
+                    .any(|(_, _, matched)| matched.matcher == "full_file_line_exact"),
+            }));
+        }
+    }
+
+    let mut result = content.to_string();
+    let mut reverse = located.iter().collect::<Vec<_>>();
+    reverse.sort_by_key(|(_, _, matched)| std::cmp::Reverse(matched.actual_line));
+    for (_, hunk, matched) in reverse {
+        let position = matched.actual_line - 1;
+        let pattern_len = pattern_lines(&hunk.lines).len();
+        let start = indexed[position].start;
+        let end = indexed[position + pattern_len - 1].end;
+        let replacement = render_hunk_replacement(content, &indexed, position, hunk);
+        result.replace_range(start..end, &replacement);
+    }
+
+    Ok(AppliedDiff {
+        content: result,
+        hunk_matches: located.into_iter().map(|(_, _, matched)| matched).collect(),
+    })
+}
+
+fn locate_hunk(
+    content: &str,
+    lines: &[String],
+    pattern: &[&str],
+    target: usize,
+    index: usize,
+    hunk: &Hunk,
+) -> std::result::Result<HunkMatch, Box<DiffApplyError>> {
+    let nearby = nearby_matches(lines, pattern, target);
+    match nearby.as_slice() {
+        [position] => {
+            return Ok(HunkMatch {
+                hunk_index: index + 1,
+                expected_line: hunk.old_start,
+                actual_line: *position + 1,
+                matcher: nearby_matcher(lines, pattern, target, *position),
+            });
+        }
+        [] => {}
+        _ => {
+            let candidates = nearby
+                .iter()
+                .take(MAX_DIFF_CANDIDATES)
+                .map(|position| DiffCandidate {
+                    start: *position,
+                    end: *position + pattern.len(),
+                    matcher: nearby_matcher(lines, pattern, target, *position),
+                })
+                .collect();
+            return Err(Box::new(DiffApplyError {
+                code: "diff_context_ambiguous",
+                reason: "ambiguous_nearby_matches",
+                hunk_index: index + 1,
+                expected_line: hunk.old_start,
+                matcher: "nearby_window",
+                occurrence_count: nearby.len(),
+                candidates,
+                searched_context_digest: pattern_digest(pattern),
+                full_file_scanned: false,
+            }));
+        }
+    }
+
+    if content.len() > MAX_GLOBAL_SCAN_BYTES
+        || lines.len() > MAX_GLOBAL_SCAN_LINES
+        || global_scan_work(lines.len(), pattern.len()) > MAX_GLOBAL_SCAN_COMPARISONS
+    {
+        return Err(Box::new(DiffApplyError {
+            code: "diff_context_no_match",
+            reason: "global_scan_limit",
+            hunk_index: index + 1,
+            expected_line: hunk.old_start,
+            matcher: "full_file_line_exact",
+            occurrence_count: 0,
+            candidates: expected_location_candidate(lines.len(), target, pattern.len()),
+            searched_context_digest: pattern_digest(pattern),
+            full_file_scanned: false,
+        }));
+    }
+
+    let matches = all_exact_matches(lines, pattern);
+    match matches.as_slice() {
+        [position] => Ok(HunkMatch {
+            hunk_index: index + 1,
+            expected_line: hunk.old_start,
+            actual_line: *position + 1,
+            matcher: "full_file_line_exact",
+        }),
+        [] => Err(Box::new(DiffApplyError {
+            code: "diff_context_no_match",
+            reason: "no_full_file_match",
+            hunk_index: index + 1,
+            expected_line: hunk.old_start,
+            matcher: "full_file_line_exact",
+            occurrence_count: 0,
+            candidates: expected_location_candidate(lines.len(), target, pattern.len()),
+            searched_context_digest: pattern_digest(pattern),
+            full_file_scanned: true,
+        })),
+        _ => Err(Box::new(DiffApplyError {
+            code: "diff_context_ambiguous",
+            reason: "ambiguous_full_file_matches",
+            hunk_index: index + 1,
+            expected_line: hunk.old_start,
+            matcher: "full_file_line_exact",
+            occurrence_count: matches.len(),
+            candidates: matches
+                .iter()
+                .take(MAX_DIFF_CANDIDATES)
+                .map(|position| DiffCandidate {
+                    start: *position,
+                    end: *position + pattern.len(),
+                    matcher: "full_file_line_exact",
+                })
+                .collect(),
+            searched_context_digest: pattern_digest(pattern),
+            full_file_scanned: true,
+        })),
+    }
+}
+
+fn invalid_hunk_error(reason: &'static str, index: usize, hunk: &Hunk) -> Box<DiffApplyError> {
+    Box::new(DiffApplyError {
+        code: "invalid_edit_input",
+        reason,
+        hunk_index: index + 1,
+        expected_line: hunk.old_start,
+        matcher: "none",
+        occurrence_count: 0,
+        candidates: Vec::new(),
+        searched_context_digest: pattern_digest(&pattern_lines(&hunk.lines)),
+        full_file_scanned: false,
+    })
+}
+
+fn nearby_matches(lines: &[String], pattern: &[&str], target: usize) -> Vec<usize> {
+    let start = target.saturating_sub(FUZZY_RANGE);
+    let end = target
+        .saturating_add(FUZZY_RANGE)
+        .min(lines.len().saturating_sub(pattern.len()));
+    if pattern.is_empty() || lines.len() < pattern.len() || start > end {
+        return Vec::new();
+    }
+    (start..=end)
+        .filter(|position| matches_at(lines, pattern, *position))
+        .collect()
+}
+
+fn find_match(lines: &[String], pattern: &[&str], target: usize) -> Result<usize> {
+    let matches = nearby_matches(lines, pattern, target);
     match matches.as_slice() {
         [position] => Ok(*position),
         [] => eyre::bail!(
@@ -465,6 +876,188 @@ fn find_match(lines: &[String], pattern: &[&str], target: usize) -> Result<usize
             target + 1
         ),
     }
+}
+
+fn nearby_matcher(
+    lines: &[String],
+    pattern: &[&str],
+    target: usize,
+    position: usize,
+) -> &'static str {
+    match (
+        position == target,
+        matches_at_exact(lines, pattern, position),
+    ) {
+        (true, true) => "target_line_exact",
+        (true, false) => "target_trailing_whitespace",
+        (false, true) => "nearby_line_exact",
+        (false, false) => "nearby_trailing_whitespace",
+    }
+}
+
+fn all_exact_matches(lines: &[String], pattern: &[&str]) -> Vec<usize> {
+    if pattern.is_empty() || lines.len() < pattern.len() {
+        return Vec::new();
+    }
+    (0..=lines.len() - pattern.len())
+        .filter(|position| matches_at_exact(lines, pattern, *position))
+        .collect()
+}
+
+fn global_scan_work(line_count: usize, pattern_len: usize) -> usize {
+    line_count
+        .saturating_sub(pattern_len)
+        .saturating_add(1)
+        .saturating_mul(pattern_len)
+}
+
+fn matches_at_exact(lines: &[String], pattern: &[&str], start: usize) -> bool {
+    if start + pattern.len() > lines.len() {
+        return false;
+    }
+    pattern
+        .iter()
+        .enumerate()
+        .all(|(index, expected)| lines[start + index] == *expected)
+}
+
+fn pattern_digest(pattern: &[&str]) -> String {
+    crate::file_state_cache::FileVersion::sha256(pattern.join("\n").as_bytes())
+}
+
+fn expected_location_candidate(
+    line_count: usize,
+    target: usize,
+    pattern_len: usize,
+) -> Vec<DiffCandidate> {
+    if line_count == 0 {
+        return Vec::new();
+    }
+    let focus = target.min(line_count - 1);
+    let start = focus.saturating_sub(2);
+    let end = focus
+        .saturating_add(pattern_len.max(1))
+        .saturating_add(2)
+        .min(line_count)
+        .max(start + 1);
+    vec![DiffCandidate {
+        start,
+        end,
+        matcher: "expected_location",
+    }]
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ContentLine {
+    start: usize,
+    text_end: usize,
+    end: usize,
+}
+
+impl ContentLine {
+    fn text<'a>(&self, content: &'a str) -> &'a str {
+        &content[self.start..self.text_end]
+    }
+
+    fn ending<'a>(&self, content: &'a str) -> &'a str {
+        &content[self.text_end..self.end]
+    }
+}
+
+fn index_content_lines(content: &str) -> Vec<ContentLine> {
+    let bytes = content.as_bytes();
+    let mut lines = Vec::new();
+    let mut start = 0usize;
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte != b'\n' {
+            continue;
+        }
+        let text_end = if index > start && bytes[index - 1] == b'\r' {
+            index - 1
+        } else {
+            index
+        };
+        lines.push(ContentLine {
+            start,
+            text_end,
+            end: index + 1,
+        });
+        start = index + 1;
+    }
+    if start < content.len() {
+        lines.push(ContentLine {
+            start,
+            text_end: content.len(),
+            end: content.len(),
+        });
+    }
+    lines
+}
+
+fn preferred_line_ending<'a>(
+    content: &'a str,
+    lines: &[ContentLine],
+    position: usize,
+    pattern_len: usize,
+) -> &'a str {
+    lines[position..position + pattern_len]
+        .iter()
+        .chain(lines[..position].iter().rev())
+        .chain(lines[position + pattern_len..].iter())
+        .map(|line| line.ending(content))
+        .find(|ending| !ending.is_empty())
+        .unwrap_or("\n")
+}
+
+fn render_hunk_replacement(
+    content: &str,
+    lines: &[ContentLine],
+    position: usize,
+    hunk: &Hunk,
+) -> String {
+    let pattern_len = pattern_lines(&hunk.lines).len();
+    let preferred_ending = preferred_line_ending(content, lines, position, pattern_len);
+    let matched_has_final_ending = !lines[position + pattern_len - 1].ending(content).is_empty();
+    let mut source = position;
+    let mut output_lines = Vec::new();
+    for line in &hunk.lines {
+        match line {
+            DiffLine::Context(_) => {
+                output_lines.push((
+                    lines[source].text(content).to_string(),
+                    lines[source].ending(content),
+                ));
+                source += 1;
+            }
+            DiffLine::Remove(_) => source += 1,
+            DiffLine::Add(text) => output_lines.push((text.clone(), "")),
+        }
+    }
+
+    let mut replacement = String::new();
+    let output_count = output_lines.len();
+    for (index, (text, original_ending)) in output_lines.into_iter().enumerate() {
+        replacement.push_str(&text);
+        if index + 1 < output_count || matched_has_final_ending {
+            replacement.push_str(if original_ending.is_empty() {
+                preferred_ending
+            } else {
+                original_ending
+            });
+        }
+    }
+    replacement
+}
+
+fn candidate_excerpt(content: &str, lines: &[ContentLine], candidate: &DiffCandidate) -> String {
+    if lines.is_empty() || candidate.start >= candidate.end || candidate.start >= lines.len() {
+        return String::new();
+    }
+    let start = candidate.start.saturating_sub(2);
+    let end = (candidate.end + 2).min(lines.len());
+    let excerpt = &content[lines[start].start..lines[end - 1].end];
+    let sanitized = crate::sanitize::sanitize_tool_output(excerpt);
+    octos_core::truncated_utf8(&sanitized, DIFF_CANDIDATE_EXCERPT_BYTES, "...")
 }
 
 /// Whether `pattern` matches `lines` starting at `start`, comparing with
@@ -631,6 +1224,338 @@ mod tests {
         let hunks = parse_unified_diff(diff).unwrap();
         let result = apply_hunks(content, &hunks).unwrap();
         assert_eq!(result, "extra\nline1\nline2_fuzzy\nline3\n");
+    }
+
+    #[tokio::test]
+    async fn local_edit_finds_a_unique_hunk_four_lines_away() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("drift.txt");
+        std::fs::write(&path, "p1\np2\np3\np4\ntarget\nend\n").unwrap();
+
+        let result = DiffEditTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .execute(&serde_json::json!({
+                "path": "drift.txt",
+                "diff": "@@ -1 +1 @@\n-target\n+changed\n",
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{}", result.output);
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "p1\np2\np3\np4\nchanged\nend\n"
+        );
+        let metadata = result.structured_metadata.as_ref().unwrap();
+        assert_eq!(metadata["hunk_matches"][0]["expected_line"], 1);
+        assert_eq!(metadata["hunk_matches"][0]["actual_line"], 5);
+        assert_eq!(
+            metadata["hunk_matches"][0]["matcher"],
+            "full_file_line_exact"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_edit_finds_a_unique_hunk_far_from_the_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("far.txt");
+        let mut original = (1..=80)
+            .map(|line| format!("padding-{line}\n"))
+            .collect::<String>();
+        original.push_str("unique target\nend\n");
+        std::fs::write(&path, &original).unwrap();
+
+        let result = DiffEditTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .execute(&serde_json::json!({
+                "path": "far.txt",
+                "diff": "@@ -1 +1 @@\n-unique target\n+changed\n",
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{}", result.output);
+        assert!(
+            std::fs::read_to_string(path)
+                .unwrap()
+                .contains("changed\nend\n")
+        );
+        assert_eq!(
+            result.structured_metadata.as_ref().unwrap()["hunk_matches"][0]["actual_line"],
+            81
+        );
+    }
+
+    #[tokio::test]
+    async fn local_edit_rejects_ambiguous_full_file_matches_with_bounded_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("duplicate.txt");
+        let original = concat!(
+            "p1\np2\np3\np4\ntarget\n",
+            "p6\np7\np8\np9\ntarget\n",
+            "p11\np12\np13\np14\ntarget\n",
+            "p16\np17\np18\np19\ntarget\n",
+        );
+        std::fs::write(&path, original).unwrap();
+
+        let result = DiffEditTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .execute(&serde_json::json!({
+                "path": "duplicate.txt",
+                "diff": "@@ -1 +1 @@\n-target\n+changed\n",
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.output.starts_with("[diff_context_ambiguous]"));
+        assert!(result.output.len() <= DIFF_REJECTION_OUTPUT_BYTES);
+        let metadata = result.structured_metadata.as_ref().unwrap();
+        assert_eq!(metadata["error_code"], "diff_context_ambiguous");
+        assert_eq!(metadata["occurrence_count"], 4);
+        assert_eq!(metadata["candidates"].as_array().unwrap().len(), 3);
+        assert_eq!(metadata["candidates"][0]["line_range"]["start"], 5);
+        assert_eq!(metadata["candidates"][1]["line_range"]["start"], 10);
+        assert_eq!(metadata["candidates"][2]["line_range"]["start"], 15);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn local_edit_no_match_returns_current_target_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.txt");
+        let original = "one\ntwo\nthree\nfour\nfive\n";
+        std::fs::write(&path, original).unwrap();
+
+        let result = DiffEditTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .execute(&serde_json::json!({
+                "path": "missing.txt",
+                "diff": "@@ -3 +3 @@\n-absent\n+changed\n",
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.output.starts_with("[diff_context_no_match]"));
+        let metadata = result.structured_metadata.as_ref().unwrap();
+        assert_eq!(metadata["error_code"], "diff_context_no_match");
+        assert_eq!(metadata["reason"], "no_full_file_match");
+        assert_eq!(metadata["candidates"][0]["matcher"], "expected_location");
+        assert!(
+            metadata["candidates"][0]["excerpt"]
+                .as_str()
+                .unwrap()
+                .contains("three")
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn local_edit_full_file_fallback_does_not_ignore_markdown_spaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("README.md");
+        let original = "p1\np2\np3\np4\nkeep break  \nend\n";
+        std::fs::write(&path, original).unwrap();
+
+        let result = DiffEditTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .execute(&serde_json::json!({
+                "path": "README.md",
+                "diff": "@@ -1 +1 @@\n-keep break\n+changed\n",
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert_eq!(
+            result.structured_metadata.as_ref().unwrap()["error_code"],
+            "diff_context_no_match"
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn local_edit_full_file_fallback_preserves_crlf_and_eof_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let crlf_path = dir.path().join("windows.txt");
+        std::fs::write(&crlf_path, b"p1\r\np2\r\np3\r\np4\r\ntarget\r\nend\r\n").unwrap();
+        let no_eof_path = dir.path().join("no-eof.txt");
+        std::fs::write(&no_eof_path, "p1\np2\np3\np4\ntarget").unwrap();
+        let tool = DiffEditTool::new(dir.path()).with_local_edit_enabled(true);
+
+        let crlf = tool
+            .execute(&serde_json::json!({
+                "path": "windows.txt",
+                "diff": "@@ -1 +1 @@\n-target\n+changed\n",
+            }))
+            .await
+            .unwrap();
+        let no_eof = tool
+            .execute(&serde_json::json!({
+                "path": "no-eof.txt",
+                "diff": "@@ -1 +1 @@\n-target\n+changed\n",
+            }))
+            .await
+            .unwrap();
+
+        assert!(crlf.success, "{}", crlf.output);
+        assert!(no_eof.success, "{}", no_eof.output);
+        assert_eq!(
+            std::fs::read(crlf_path).unwrap(),
+            b"p1\r\np2\r\np3\r\np4\r\nchanged\r\nend\r\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(no_eof_path).unwrap(),
+            "p1\np2\np3\np4\nchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_edit_pre_locates_all_hunks_before_reverse_application() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi.txt");
+        std::fs::write(&path, "p1\np2\np3\np4\nearly\np6\np7\np8\np9\nlate\n").unwrap();
+
+        let result = DiffEditTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .execute(&serde_json::json!({
+                "path": "multi.txt",
+                "diff": concat!(
+                    "@@ -1 +1 @@\n",
+                    "-early\n",
+                    "+EARLY\n",
+                    "@@ -10 +10 @@\n",
+                    "-late\n",
+                    "+early\n",
+                ),
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{}", result.output);
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "p1\np2\np3\np4\nEARLY\np6\np7\np8\np9\nearly\n"
+        );
+        let matches = result.structured_metadata.as_ref().unwrap()["hunk_matches"]
+            .as_array()
+            .unwrap();
+        assert_eq!(matches[0]["actual_line"], 5);
+        assert_eq!(matches[1]["actual_line"], 10);
+    }
+
+    #[tokio::test]
+    async fn local_edit_rejects_hunks_that_resolve_to_the_same_actual_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("actual-overlap.txt");
+        let original = "p1\np2\np3\np4\nsame\np6\np7\np8\np9\np10\n";
+        std::fs::write(&path, original).unwrap();
+
+        let result = DiffEditTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .execute(&serde_json::json!({
+                "path": "actual-overlap.txt",
+                "diff": concat!(
+                    "@@ -1 +1 @@\n",
+                    "-same\n",
+                    "+first\n",
+                    "@@ -20 +20 @@\n",
+                    "-same\n",
+                    "+second\n",
+                ),
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        let metadata = result.structured_metadata.as_ref().unwrap();
+        assert_eq!(metadata["error_code"], "invalid_edit_input");
+        assert_eq!(metadata["reason"], "overlapping_actual_matches");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn local_edit_one_failed_hunk_keeps_the_file_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("atomic.txt");
+        let original = "p1\np2\np3\np4\nfirst\nmiddle\nlast\n";
+        std::fs::write(&path, original).unwrap();
+
+        let result = DiffEditTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .execute(&serde_json::json!({
+                "path": "atomic.txt",
+                "diff": concat!(
+                    "@@ -1 +1 @@\n",
+                    "-first\n",
+                    "+FIRST\n",
+                    "@@ -20 +20 @@\n",
+                    "-missing\n",
+                    "+LAST\n",
+                ),
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert_eq!(
+            result.structured_metadata.as_ref().unwrap()["error_code"],
+            "diff_context_no_match"
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn local_edit_rejects_empty_hunk_context_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty-context.txt");
+        let original = "keep\n";
+        std::fs::write(&path, original).unwrap();
+
+        let result = DiffEditTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .execute(&serde_json::json!({
+                "path": "empty-context.txt",
+                "diff": "@@ -1,0 +1,1 @@\n+inserted\n",
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        let metadata = result.structured_metadata.as_ref().unwrap();
+        assert_eq!(metadata["error_code"], "invalid_edit_input");
+        assert_eq!(metadata["reason"], "empty_context");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
+    fn local_edit_global_scan_is_bounded() {
+        let content = (0..=MAX_GLOBAL_SCAN_LINES)
+            .map(|line| format!("line-{line}\n"))
+            .collect::<String>();
+        let hunks = parse_unified_diff("@@ -1 +1 @@\n-absent\n+changed\n").unwrap();
+
+        let error = apply_hunks_local(&content, &hunks).unwrap_err();
+
+        assert_eq!(error.code, "diff_context_no_match");
+        assert_eq!(error.reason, "global_scan_limit");
+    }
+
+    #[test]
+    fn local_edit_global_scan_caps_comparison_work() {
+        let content = "a\n".repeat(2_001);
+        let hunk = Hunk {
+            old_start: 1,
+            lines: (0..1_000)
+                .map(|_| DiffLine::Remove("b".to_string()))
+                .collect(),
+        };
+
+        let error = apply_hunks_local(&content, &[hunk]).unwrap_err();
+
+        assert_eq!(error.code, "diff_context_no_match");
+        assert_eq!(error.reason, "global_scan_limit");
     }
 
     #[tokio::test]
