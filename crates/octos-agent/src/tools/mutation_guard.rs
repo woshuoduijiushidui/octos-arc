@@ -998,6 +998,48 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn concurrent_creates_never_overwrite_the_winning_file() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join("target.txt");
+        let context = ToolContext::zero();
+
+        let (left, right) = tokio::join!(
+            create_new(&context, workspace.path(), &path, b"left\n".to_vec(), None,),
+            create_new(&context, workspace.path(), &path, b"right\n".to_vec(), None,),
+        );
+        let results = [left, right];
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let stale = results
+            .into_iter()
+            .find_map(Result::err)
+            .expect("one create must lose the race")
+            .into_tool_result("write_file", "target.txt");
+        assert!(!stale.success);
+        assert_eq!(
+            stale.structured_metadata.as_ref().unwrap()["error_code"],
+            STALE_MUTATION_CODE
+        );
+        let content = std::fs::read_to_string(path).unwrap();
+        assert!(content == "left\n" || content == "right\n");
+    }
+
+    #[test]
+    fn io_failure_after_a_possible_partial_write_reports_the_modified_path() {
+        let result = GuardedMutationError::Io {
+            error: std::io::Error::other("synthetic partial write"),
+            may_have_modified: true,
+        }
+        .into_tool_result("edit_file", "target.txt");
+
+        assert!(!result.success);
+        assert_eq!(
+            result.file_modified.as_deref(),
+            Some(Path::new("target.txt"))
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn no_change_policy_still_checks_the_authorized_epoch() {

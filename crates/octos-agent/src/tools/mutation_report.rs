@@ -342,4 +342,63 @@ mod tests {
         assert!(metadata["modified_paths"].as_array().unwrap().is_empty());
         assert!(metadata["diff_preview"].as_array().unwrap().is_empty());
     }
+
+    #[tokio::test]
+    async fn final_report_never_claims_stale_written_bytes_after_disk_changes() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join("file.rs");
+        let before = b"fn value() -> u8 { 1 }\n";
+        let written = b"fn value() -> u8 { 2 }\n";
+        let current = b"fn value() -> u8 { 3 }\n";
+        std::fs::write(&path, current).unwrap();
+
+        let unformatted = MutationReport::collect(
+            "edit_file",
+            &path,
+            workspace.path(),
+            "file.rs",
+            Some(before),
+            written,
+            &FormattingRun::Disabled,
+        )
+        .await;
+        assert_eq!(unformatted.metadata["final_state"], "unconfirmed");
+        assert!(unformatted.metadata["changed_range"].is_null());
+        assert!(
+            unformatted.metadata["diff_preview"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+
+        let formatted = MutationReport::collect(
+            "edit_file",
+            &path,
+            workspace.path(),
+            "file.rs",
+            Some(before),
+            written,
+            &FormattingRun::Attempted(FormatOutcome::Formatted {
+                formatter: "rustfmt",
+            }),
+        )
+        .await;
+        assert_eq!(formatted.metadata["final_state"], "confirmed");
+        assert_eq!(
+            formatted.metadata["final_version"]["content_sha256"],
+            FileVersion::sha256(current)
+        );
+        assert!(
+            formatted.metadata["diff_preview"][0]["diff"]
+                .as_str()
+                .unwrap()
+                .contains("+fn value() -> u8 { 3 }")
+        );
+        assert!(
+            !formatted.metadata["diff_preview"][0]["diff"]
+                .as_str()
+                .unwrap()
+                .contains("+fn value() -> u8 { 2 }")
+        );
+    }
 }
