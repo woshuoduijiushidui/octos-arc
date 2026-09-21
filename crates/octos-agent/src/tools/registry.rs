@@ -27,10 +27,17 @@ use crate::sandbox::{NoSandbox, Sandbox};
 
 tokio::task_local! {
     static LOCAL_EDIT_EXECUTION_ENABLED: bool;
+    static LOCAL_EDIT_STRICT_MATCH_ENABLED: bool;
 }
 
 pub(crate) fn local_edit_execution_enabled() -> bool {
     LOCAL_EDIT_EXECUTION_ENABLED
+        .try_with(|enabled| *enabled)
+        .unwrap_or(false)
+}
+
+pub(crate) fn local_edit_strict_match_enabled() -> bool {
+    LOCAL_EDIT_STRICT_MATCH_ENABLED
         .try_with(|enabled| *enabled)
         .unwrap_or(false)
 }
@@ -762,6 +769,7 @@ impl ToolRegistry {
                     t.name(),
                     t.description(),
                     local_edit_guidance,
+                    self.local_edit_policy.strict_match,
                 )
                 .to_string(),
                 input_schema: crate::local_edit::tool_input_schema(
@@ -1199,7 +1207,10 @@ impl ToolRegistry {
         // tool future entirely and returns a fresh failure.
         let invocation = LOCAL_EDIT_EXECUTION_ENABLED.scope(
             self.local_edit_policy.enabled,
-            tool.execute_with_context(ctx, args),
+            LOCAL_EDIT_STRICT_MATCH_ENABLED.scope(
+                self.local_edit_policy.strict_match,
+                tool.execute_with_context(ctx, args),
+            ),
         );
         let guarded = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(invocation));
 
@@ -1451,6 +1462,7 @@ impl ToolRegistry {
                         tool.name(),
                         tool.description(),
                         local_edit_guidance,
+                        self.local_edit_policy.strict_match,
                     ),
                     tool.tags().iter().map(|t| (*t).to_string()).collect(),
                 )
@@ -2322,7 +2334,10 @@ mod registry_dispatch_tests {
             "new_string": "changed",
         });
 
-        registry.set_local_edit_policy(crate::local_edit::LocalEditPolicy { enabled: false });
+        registry.set_local_edit_policy(crate::local_edit::LocalEditPolicy {
+            enabled: false,
+            strict_match: false,
+        });
         let off_schema = registry
             .specs()
             .into_iter()
@@ -2335,7 +2350,10 @@ mod registry_dispatch_tests {
         assert!(off.output.contains("Found 2 occurrences"));
         assert!(off.structured_metadata.is_none());
 
-        registry.set_local_edit_policy(crate::local_edit::LocalEditPolicy { enabled: true });
+        registry.set_local_edit_policy(crate::local_edit::LocalEditPolicy {
+            enabled: true,
+            strict_match: false,
+        });
         let on_schema = registry
             .specs()
             .into_iter()
@@ -2350,6 +2368,37 @@ mod registry_dispatch_tests {
             on.structured_metadata.as_ref().unwrap()["error_code"],
             "edit_ambiguous"
         );
+
+        let fuzzy_path = dir.path().join("fuzzy.rs");
+        let fuzzy = "fn one() {\n    launch();\n}\n";
+        std::fs::write(&fuzzy_path, fuzzy).unwrap();
+        registry.set_local_edit_policy(crate::local_edit::LocalEditPolicy {
+            enabled: true,
+            strict_match: true,
+        });
+        let strict_spec = registry
+            .specs()
+            .into_iter()
+            .find(|spec| spec.name == "edit_file")
+            .unwrap();
+        assert!(strict_spec.description.contains("only as suggestions"));
+        let strict = registry
+            .execute(
+                "edit_file",
+                &serde_json::json!({
+                    "path": "fuzzy.rs",
+                    "old_string": "fn one() {\nlaunch();\n}",
+                    "new_string": "fn one() {\n    stop();\n}",
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!strict.success);
+        assert_eq!(
+            strict.structured_metadata.as_ref().unwrap()["reason"],
+            "strict_match_requires_exact"
+        );
+        assert_eq!(std::fs::read_to_string(fuzzy_path).unwrap(), fuzzy);
     }
 }
 

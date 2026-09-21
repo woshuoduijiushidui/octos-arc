@@ -1782,9 +1782,13 @@ mod profile_integration_tests {
         names
     }
 
-    async fn agent_with_local_edit_policy(cwd: &std::path::Path, enabled: bool) -> Agent {
+    async fn agent_with_local_edit_policy(
+        cwd: &std::path::Path,
+        enabled: bool,
+        strict_match: bool,
+    ) -> Agent {
         let memory = Arc::new(
-            EpisodeStore::open(cwd.join(format!("memory-local-edit-{enabled}")))
+            EpisodeStore::open(cwd.join(format!("memory-local-edit-{enabled}-{strict_match}")))
                 .await
                 .expect("episode store"),
         );
@@ -1792,7 +1796,10 @@ mod profile_integration_tests {
         let profile = ProfileDefinition::builtin("coding").expect("coding");
         let mut tools = ToolRegistry::with_builtins(cwd);
         profile.apply_to_registry(&mut tools);
-        tools.set_local_edit_policy(crate::local_edit::LocalEditPolicy { enabled });
+        tools.set_local_edit_policy(crate::local_edit::LocalEditPolicy {
+            enabled,
+            strict_match: enabled && strict_match,
+        });
         Agent::new(AgentId::new("local-edit"), provider, tools, memory)
             .with_profile(Arc::new(profile))
     }
@@ -1800,8 +1807,8 @@ mod profile_integration_tests {
     #[tokio::test]
     async fn local_edit_guidance_is_opt_in_and_injected_once() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let off = agent_with_local_edit_policy(tmp.path(), false).await;
-        let on = agent_with_local_edit_policy(tmp.path(), true).await;
+        let off = agent_with_local_edit_policy(tmp.path(), false, false).await;
+        let on = agent_with_local_edit_policy(tmp.path(), true, false).await;
 
         let off_prompt = execution::compose_system_prompt(&off);
         let on_prompt = execution::compose_system_prompt(&on);
@@ -1850,6 +1857,58 @@ mod profile_integration_tests {
     }
 
     #[tokio::test]
+    async fn strict_match_changes_only_editing_descriptions() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let baseline = agent_with_local_edit_policy(tmp.path(), true, false).await;
+        let strict = agent_with_local_edit_policy(tmp.path(), true, true).await;
+
+        assert_eq!(
+            execution::compose_system_prompt(&baseline),
+            execution::compose_system_prompt(&strict)
+        );
+        let baseline_specs = baseline.tool_registry().specs();
+        let strict_specs = strict.tool_registry().specs();
+        let changed = baseline_specs
+            .iter()
+            .zip(&strict_specs)
+            .filter_map(|(before, after)| {
+                assert_eq!(before.name, after.name);
+                assert_eq!(before.input_schema, after.input_schema);
+                (before.description != after.description).then_some(before.name.as_str())
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(changed, ["diff_edit", "edit_file"]);
+        assert!(
+            strict_specs
+                .iter()
+                .find(|spec| spec.name == "edit_file")
+                .unwrap()
+                .description
+                .contains("only as suggestions")
+        );
+        assert!(
+            strict_specs
+                .iter()
+                .find(|spec| spec.name == "diff_edit")
+                .unwrap()
+                .description
+                .contains("only as suggestions")
+        );
+        let strict_catalog = strict.tool_registry().catalog_snapshot();
+        for spec in strict_specs
+            .iter()
+            .filter(|spec| changed.contains(&spec.name.as_str()))
+        {
+            let entry = strict_catalog
+                .iter()
+                .find(|entry| entry.name == spec.name)
+                .expect("strict editor must remain discoverable");
+            assert_eq!(entry.description, spec.description);
+        }
+    }
+
+    #[tokio::test]
     async fn local_edit_guidance_is_hidden_when_an_editor_is_unavailable() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let memory = Arc::new(
@@ -1860,7 +1919,10 @@ mod profile_integration_tests {
         let provider: Arc<dyn LlmProvider> = Arc::new(NoopProvider);
         let mut tools = ToolRegistry::with_builtins(tmp.path());
         tools.retain(|name| name == "write_file" || name == "edit_file");
-        tools.set_local_edit_policy(crate::local_edit::LocalEditPolicy { enabled: true });
+        tools.set_local_edit_policy(crate::local_edit::LocalEditPolicy {
+            enabled: true,
+            strict_match: false,
+        });
         let agent = Agent::new(
             AgentId::new("local-edit-restricted"),
             provider,

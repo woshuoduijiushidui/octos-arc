@@ -25,6 +25,7 @@ pub struct DiffEditTool {
     filesystem_scope: FilesystemScope,
     file_access: FileAccessMode,
     local_edit_enabled: bool,
+    strict_match_enabled: bool,
 }
 
 impl DiffEditTool {
@@ -34,6 +35,7 @@ impl DiffEditTool {
             filesystem_scope: FilesystemScope::Workspace,
             file_access: FileAccessMode::ReadWrite,
             local_edit_enabled: false,
+            strict_match_enabled: false,
         }
     }
 
@@ -50,6 +52,12 @@ impl DiffEditTool {
     /// Enable typed no-op and final-change reporting.
     pub fn with_local_edit_enabled(mut self, enabled: bool) -> Self {
         self.local_edit_enabled = enabled;
+        self
+    }
+
+    /// Require exact context lines for automatic writes.
+    pub fn with_strict_match_enabled(mut self, enabled: bool) -> Self {
+        self.strict_match_enabled = enabled;
         self
     }
 }
@@ -326,6 +334,8 @@ impl Tool for DiffEditTool {
         let hunk_count = hunks.len();
         let local_edit_enabled =
             self.local_edit_enabled || super::registry::local_edit_execution_enabled();
+        let strict_match_enabled = local_edit_enabled
+            && (self.strict_match_enabled || super::registry::local_edit_strict_match_enabled());
         let display_path = input.path.clone();
 
         let guarded = super::mutation_guard::rewrite_existing(
@@ -343,7 +353,7 @@ impl Tool for DiffEditTool {
                 let content = std::str::from_utf8(bytes)
                     .map_err(|_| "File is not valid UTF-8 and cannot be edited".to_string())?;
                 let applied = if local_edit_enabled {
-                    match apply_hunks_local(content, &hunks) {
+                    match apply_hunks_local(content, &hunks, strict_match_enabled) {
                         Ok(applied) => applied,
                         Err(error) => {
                             return Err(typed_diff_rejection(
@@ -642,6 +652,7 @@ fn apply_hunks(content: &str, hunks: &[Hunk]) -> Result<String> {
 fn apply_hunks_local(
     content: &str,
     hunks: &[Hunk],
+    strict_match: bool,
 ) -> std::result::Result<AppliedDiff, Box<DiffApplyError>> {
     let indexed = index_content_lines(content);
     let lines = indexed
@@ -676,7 +687,7 @@ fn apply_hunks_local(
             return Err(invalid_hunk_error("empty_context", index, hunk));
         }
         let target = hunk.old_start.saturating_sub(1); // 1-indexed to 0-indexed
-        let matched = locate_hunk(content, &lines, &pattern, target, index, hunk)?;
+        let matched = locate_hunk(content, &lines, &pattern, target, index, hunk, strict_match)?;
         located.push((index, hunk, matched));
     }
 
@@ -739,8 +750,13 @@ fn locate_hunk(
     target: usize,
     index: usize,
     hunk: &Hunk,
+    strict_match: bool,
 ) -> std::result::Result<HunkMatch, Box<DiffApplyError>> {
-    let nearby = nearby_matches(lines, pattern, target);
+    let nearby = if strict_match {
+        nearby_exact_matches(lines, pattern, target)
+    } else {
+        nearby_matches(lines, pattern, target)
+    };
     match nearby.as_slice() {
         [position] => {
             return Ok(HunkMatch {
@@ -800,17 +816,47 @@ fn locate_hunk(
             actual_line: *position + 1,
             matcher: "full_file_line_exact",
         }),
-        [] => Err(Box::new(DiffApplyError {
-            code: "diff_context_no_match",
-            reason: "no_full_file_match",
-            hunk_index: index + 1,
-            expected_line: hunk.old_start,
-            matcher: "full_file_line_exact",
-            occurrence_count: 0,
-            candidates: expected_location_candidate(lines.len(), target, pattern.len()),
-            searched_context_digest: pattern_digest(pattern),
-            full_file_scanned: true,
-        })),
+        [] => {
+            let fuzzy = if strict_match {
+                nearby_matches(lines, pattern, target)
+            } else {
+                Vec::new()
+            };
+            if !fuzzy.is_empty() {
+                let candidates = fuzzy
+                    .iter()
+                    .take(MAX_DIFF_CANDIDATES)
+                    .map(|position| DiffCandidate {
+                        start: *position,
+                        end: *position + pattern.len(),
+                        matcher: nearby_matcher(lines, pattern, target, *position),
+                    })
+                    .collect();
+                let matcher = nearby_matcher(lines, pattern, target, fuzzy[0]);
+                return Err(Box::new(DiffApplyError {
+                    code: "diff_context_no_match",
+                    reason: "strict_match_requires_exact",
+                    hunk_index: index + 1,
+                    expected_line: hunk.old_start,
+                    matcher,
+                    occurrence_count: fuzzy.len(),
+                    candidates,
+                    searched_context_digest: pattern_digest(pattern),
+                    full_file_scanned: true,
+                }));
+            }
+            Err(Box::new(DiffApplyError {
+                code: "diff_context_no_match",
+                reason: "no_full_file_match",
+                hunk_index: index + 1,
+                expected_line: hunk.old_start,
+                matcher: "full_file_line_exact",
+                occurrence_count: 0,
+                candidates: expected_location_candidate(lines.len(), target, pattern.len()),
+                searched_context_digest: pattern_digest(pattern),
+                full_file_scanned: true,
+            }))
+        }
         _ => Err(Box::new(DiffApplyError {
             code: "diff_context_ambiguous",
             reason: "ambiguous_full_file_matches",
@@ -857,6 +903,19 @@ fn nearby_matches(lines: &[String], pattern: &[&str], target: usize) -> Vec<usiz
     }
     (start..=end)
         .filter(|position| matches_at(lines, pattern, *position))
+        .collect()
+}
+
+fn nearby_exact_matches(lines: &[String], pattern: &[&str], target: usize) -> Vec<usize> {
+    let start = target.saturating_sub(FUZZY_RANGE);
+    let end = target
+        .saturating_add(FUZZY_RANGE)
+        .min(lines.len().saturating_sub(pattern.len()));
+    if pattern.is_empty() || lines.len() < pattern.len() || start > end {
+        return Vec::new();
+    }
+    (start..=end)
+        .filter(|position| matches_at_exact(lines, pattern, *position))
         .collect()
 }
 
@@ -1227,6 +1286,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn strict_match_rejects_trailing_whitespace_as_a_suggestion() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = "alpha  \nbeta\n";
+        std::fs::write(dir.path().join("baseline.md"), original).unwrap();
+        std::fs::write(dir.path().join("strict.md"), original).unwrap();
+        let args = |path: &str| {
+            serde_json::json!({
+                "path": path,
+                "diff": "@@ -1,2 +1,2 @@\n-alpha\n+changed\n beta\n",
+            })
+        };
+
+        let baseline = DiffEditTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .execute(&args("baseline.md"))
+            .await
+            .unwrap();
+        assert!(baseline.success, "{}", baseline.output);
+        assert_eq!(
+            baseline.structured_metadata.as_ref().unwrap()["hunk_matches"][0]["matcher"],
+            "target_trailing_whitespace"
+        );
+
+        let strict = DiffEditTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .with_strict_match_enabled(true)
+            .execute(&args("strict.md"))
+            .await
+            .unwrap();
+        assert!(!strict.success, "{}", strict.output);
+        assert!(strict.file_modified.is_none());
+        let metadata = strict.structured_metadata.as_ref().unwrap();
+        assert_eq!(metadata["error_code"], "diff_context_no_match");
+        assert_eq!(metadata["reason"], "strict_match_requires_exact");
+        assert_eq!(metadata["matcher"], "target_trailing_whitespace");
+        assert_eq!(
+            metadata["candidates"][0]["matcher"],
+            "target_trailing_whitespace"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("strict.md")).unwrap(),
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_match_accepts_exact_context_with_crlf_line_endings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("strict.txt");
+        std::fs::write(&path, b"alpha\r\nbeta\r\n").unwrap();
+
+        let result = DiffEditTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .with_strict_match_enabled(true)
+            .execute(&serde_json::json!({
+                "path": "strict.txt",
+                "diff": "@@ -10,2 +10,2 @@\n alpha\n-beta\n+changed\n",
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{}", result.output);
+        assert_eq!(std::fs::read(&path).unwrap(), b"alpha\r\nchanged\r\n");
+        assert_eq!(
+            result.structured_metadata.as_ref().unwrap()["hunk_matches"][0]["matcher"],
+            "full_file_line_exact"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_match_rejects_ambiguous_full_file_exact_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ambiguous.txt");
+        let original = "p1\np2\np3\np4\ntarget\np6\np7\np8\np9\ntarget\n";
+        std::fs::write(&path, original).unwrap();
+
+        let result = DiffEditTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .with_strict_match_enabled(true)
+            .execute(&serde_json::json!({
+                "path": "ambiguous.txt",
+                "diff": "@@ -20 +20 @@\n-target\n+changed\n",
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success, "{}", result.output);
+        assert!(result.file_modified.is_none());
+        let metadata = result.structured_metadata.as_ref().unwrap();
+        assert_eq!(metadata["error_code"], "diff_context_ambiguous");
+        assert_eq!(metadata["matcher"], "full_file_line_exact");
+        assert_eq!(metadata["occurrence_count"], 2);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn strict_match_rejects_all_hunks_when_one_is_only_a_fuzzy_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi.txt");
+        let original = "one\nmiddle\ntwo  \n";
+        std::fs::write(&path, original).unwrap();
+
+        let result = DiffEditTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .with_strict_match_enabled(true)
+            .execute(&serde_json::json!({
+                "path": "multi.txt",
+                "diff": concat!(
+                    "@@ -1 +1 @@\n",
+                    "-one\n",
+                    "+ONE\n",
+                    "@@ -3 +3 @@\n",
+                    "-two\n",
+                    "+TWO\n"
+                ),
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success, "{}", result.output);
+        assert!(result.file_modified.is_none());
+        let metadata = result.structured_metadata.as_ref().unwrap();
+        assert_eq!(metadata["error_code"], "diff_context_no_match");
+        assert_eq!(metadata["hunk_index"], 2);
+        assert_eq!(metadata["reason"], "strict_match_requires_exact");
+        assert_eq!(
+            metadata["candidates"][0]["matcher"],
+            "target_trailing_whitespace"
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[tokio::test]
     async fn local_edit_finds_a_unique_hunk_four_lines_away() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("drift.txt");
@@ -1536,7 +1728,7 @@ mod tests {
             .collect::<String>();
         let hunks = parse_unified_diff("@@ -1 +1 @@\n-absent\n+changed\n").unwrap();
 
-        let error = apply_hunks_local(&content, &hunks).unwrap_err();
+        let error = apply_hunks_local(&content, &hunks, false).unwrap_err();
 
         assert_eq!(error.code, "diff_context_no_match");
         assert_eq!(error.reason, "global_scan_limit");
@@ -1552,7 +1744,7 @@ mod tests {
                 .collect(),
         };
 
-        let error = apply_hunks_local(&content, &[hunk]).unwrap_err();
+        let error = apply_hunks_local(&content, &[hunk], false).unwrap_err();
 
         assert_eq!(error.code, "diff_context_no_match");
         assert_eq!(error.reason, "global_scan_limit");
