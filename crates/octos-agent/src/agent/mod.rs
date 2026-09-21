@@ -1821,7 +1821,16 @@ mod profile_integration_tests {
             .zip(&on_specs)
             .filter_map(|(before, after)| {
                 assert_eq!(before.name, after.name);
-                assert_eq!(before.input_schema, after.input_schema);
+                let mut normalized_after = after.input_schema.clone();
+                if before.name == "edit_file" {
+                    let replace_all = normalized_after["properties"]
+                        .as_object_mut()
+                        .and_then(|properties| properties.remove("replace_all"))
+                        .expect("local-edit schema must expose replace_all");
+                    assert_eq!(replace_all["type"], "boolean");
+                    assert_eq!(replace_all["default"], false);
+                }
+                assert_eq!(before.input_schema, normalized_after);
                 (before.description != after.description).then_some(before.name.as_str())
             })
             .collect::<Vec<_>>();
@@ -1850,7 +1859,7 @@ mod profile_integration_tests {
         );
         let provider: Arc<dyn LlmProvider> = Arc::new(NoopProvider);
         let mut tools = ToolRegistry::with_builtins(tmp.path());
-        tools.retain(|name| name == "write_file");
+        tools.retain(|name| name == "write_file" || name == "edit_file");
         tools.set_local_edit_policy(crate::local_edit::LocalEditPolicy { enabled: true });
         let agent = Agent::new(
             AgentId::new("local-edit-restricted"),
@@ -1862,9 +1871,21 @@ mod profile_integration_tests {
         let prompt = execution::compose_system_prompt(&agent);
         assert!(!prompt.contains(crate::local_edit::LOCAL_EDIT_GUIDANCE_HEADING));
         let specs = agent.tool_registry().specs();
-        assert_eq!(specs.len(), 1);
+        assert_eq!(specs.len(), 2);
+        let edit = specs.iter().find(|spec| spec.name == "edit_file").unwrap();
         assert_eq!(
-            specs[0].description,
+            edit.description,
+            "Edit a file by replacing a string with a new string. An exact match of old_string is \
+             preferred; when none exists, whitespace-, indentation- and escape-tolerant fuzzy \
+             matching is tried as a fallback. The old_string must identify a single location."
+        );
+        assert_eq!(
+            edit.input_schema["properties"]["replace_all"]["type"],
+            "boolean"
+        );
+        let write = specs.iter().find(|spec| spec.name == "write_file").unwrap();
+        assert_eq!(
+            write.description,
             "Write content to a file. Creates the file if it doesn't exist, or overwrites if it \
              does."
         );

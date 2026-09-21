@@ -56,10 +56,12 @@ def tool_names(request):
     return [tool["function"]["name"] for tool in request["tools"]]
 
 
-def schema_without_descriptions(tools):
+def schema_without_local_edit_changes(tools):
     normalized = copy.deepcopy(tools)
     for tool in normalized:
         tool["function"].pop("description", None)
+        if tool["function"]["name"] == "edit_file":
+            tool["function"]["parameters"]["properties"].pop("replace_all", None)
     return normalized
 
 
@@ -186,7 +188,9 @@ def verify(binary, evidence):
     assert compact_json(unknown_tools) == compact_json(off_tools)
     assert tool_names(on) == tool_names(off)
     assert "apply_patch" not in tool_names(on)
-    assert schema_without_descriptions(on_tools) == schema_without_descriptions(off_tools)
+    assert schema_without_local_edit_changes(
+        on_tools
+    ) == schema_without_local_edit_changes(off_tools)
 
     off_by_name = {tool["function"]["name"]: tool for tool in off_tools}
     on_by_name = {tool["function"]["name"]: tool for tool in on_tools}
@@ -201,6 +205,13 @@ def verify(binary, evidence):
         after = copy.deepcopy(on_by_name[name])
         before["function"].pop("description")
         after["function"].pop("description")
+        if name == "edit_file":
+            replace_all = after["function"]["parameters"]["properties"].pop(
+                "replace_all"
+            )
+            assert replace_all["type"] == "boolean"
+            assert replace_all["default"] is False
+            assert "replace_all" not in before["function"]["parameters"]["properties"]
         assert before == after, name
 
     off_prompt = normalized_system_prompt(off)
@@ -226,7 +237,9 @@ def verify(binary, evidence):
     assert GUIDANCE_HEADING not in trimmed_off_prompt
     assert trimmed_on_prompt.count(GUIDANCE_HEADING) == 1
     assert tool_names(trimmed_on) == tool_names(trimmed_off)
-    assert schema_without_descriptions(trimmed_on_tools) == schema_without_descriptions(
+    assert schema_without_local_edit_changes(
+        trimmed_on_tools
+    ) == schema_without_local_edit_changes(
         trimmed_off_tools
     )
     assert "unknown OCTOS_LOCAL_EDIT value" in unknown_stderr
@@ -261,13 +274,14 @@ def verify(binary, evidence):
             compact_json(unknown_tools) == compact_json(off_tools)
             and unknown_prompt == off_prompt
         ),
+        "replace_all_schema_enabled": True,
     }
     (evidence / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     print(
-        "PASS: H05 off is byte-compatible, on changes only three descriptions "
-        "and one prompt section, unknown values fall back to off."
+        "PASS: H05 off is byte-compatible; on adds local-edit guidance, "
+        "three descriptions, and edit_file.replace_all."
     )
 
 

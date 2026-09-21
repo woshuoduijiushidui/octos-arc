@@ -764,7 +764,11 @@ impl ToolRegistry {
                     local_edit_guidance,
                 )
                 .to_string(),
-                input_schema: t.input_schema(),
+                input_schema: crate::local_edit::tool_input_schema(
+                    t.name(),
+                    t.input_schema(),
+                    self.local_edit_policy.enabled,
+                ),
             })
             .collect();
 
@@ -2319,12 +2323,26 @@ mod registry_dispatch_tests {
         });
 
         registry.set_local_edit_policy(crate::local_edit::LocalEditPolicy { enabled: false });
+        let off_schema = registry
+            .specs()
+            .into_iter()
+            .find(|spec| spec.name == "edit_file")
+            .unwrap()
+            .input_schema;
+        assert!(off_schema["properties"].get("replace_all").is_none());
         let off = registry.execute("edit_file", &args).await.unwrap();
         assert!(!off.success);
         assert!(off.output.contains("Found 2 occurrences"));
         assert!(off.structured_metadata.is_none());
 
         registry.set_local_edit_policy(crate::local_edit::LocalEditPolicy { enabled: true });
+        let on_schema = registry
+            .specs()
+            .into_iter()
+            .find(|spec| spec.name == "edit_file")
+            .unwrap()
+            .input_schema;
+        assert_eq!(on_schema["properties"]["replace_all"]["type"], "boolean");
         let on = registry.execute("edit_file", &args).await.unwrap();
         assert!(!on.success);
         assert!(on.output.starts_with("[edit_ambiguous]"));

@@ -78,6 +78,29 @@ pub(crate) fn tool_description<'a>(name: &str, fallback: &'a str, enabled: bool)
     }
 }
 
+pub(crate) fn tool_input_schema(
+    name: &str,
+    mut schema: serde_json::Value,
+    enabled: bool,
+) -> serde_json::Value {
+    if enabled
+        && name == "edit_file"
+        && let Some(properties) = schema
+            .get_mut("properties")
+            .and_then(serde_json::Value::as_object_mut)
+    {
+        properties.insert(
+            "replace_all".to_string(),
+            serde_json::json!({
+                "type": "boolean",
+                "default": false,
+                "description": "Replace every non-overlapping exact or CRLF/LF-equivalent match. Use only when every occurrence should change."
+            }),
+        );
+    }
+    schema
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,5 +146,23 @@ mod tests {
         assert!(tool_description("edit_file", fallback, true).contains("contiguous"));
         assert!(tool_description("diff_edit", fallback, true).contains("multi-hunk"));
         assert_eq!(tool_description("read_file", fallback, true), fallback);
+    }
+
+    #[test]
+    fn replace_all_schema_is_exposed_only_when_local_edit_is_enabled() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "old_string": {"type": "string"}
+            }
+        });
+        let off = tool_input_schema("edit_file", schema.clone(), false);
+        let on = tool_input_schema("edit_file", schema.clone(), true);
+        let other = tool_input_schema("write_file", schema.clone(), true);
+
+        assert_eq!(off, schema);
+        assert_eq!(other, schema);
+        assert_eq!(on["properties"]["replace_all"]["type"], "boolean");
+        assert_eq!(on["properties"]["replace_all"]["default"], false);
     }
 }

@@ -16,6 +16,257 @@ use crate::policy::{FileAccessMode, FilesystemScope};
 const MAX_RENDERED_CANDIDATES: usize = 3;
 const CANDIDATE_EXCERPT_BYTES: usize = 512;
 const EDIT_REJECTION_OUTPUT_BYTES: usize = 3072;
+const MAX_REPLACE_ALL_MATCHES: usize = 1_000;
+const MAX_REPORTED_REPLACEMENT_LOCATIONS: usize = 20;
+const MAX_REPLACE_ALL_RESULT_BYTES: usize = 10_000_000;
+
+#[derive(Debug)]
+struct AppliedEdit {
+    matcher: &'static str,
+    content: String,
+    replacement_count: usize,
+    replacement_locations: Vec<super::replacer::CandidateLineRange>,
+    replace_all: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ReplacementOccurrence {
+    range: Range<usize>,
+    matcher: &'static str,
+}
+
+#[derive(Debug)]
+struct ReplaceAllScan {
+    occurrences: Vec<ReplacementOccurrence>,
+    count: usize,
+    matcher: &'static str,
+}
+
+#[derive(Clone, Copy)]
+enum LineEnding {
+    Lf,
+    Crlf,
+}
+
+fn find_replace_all_matches(content: &str, old_string: &str) -> ReplaceAllScan {
+    if !content.contains("\r\n") && !old_string.contains("\r\n") {
+        let mut occurrences = Vec::new();
+        let mut count = 0usize;
+        for (start, matched) in content.match_indices(old_string) {
+            count += 1;
+            if occurrences.len() < MAX_REPLACE_ALL_MATCHES {
+                occurrences.push(ReplacementOccurrence {
+                    range: start..start + matched.len(),
+                    matcher: "exact",
+                });
+            }
+        }
+        return ReplaceAllScan {
+            occurrences,
+            count,
+            matcher: if count == 0 { "none" } else { "exact" },
+        };
+    }
+
+    let (normalized, boundaries) = normalize_crlf_with_boundaries(content);
+    let normalized_old = old_string.replace("\r\n", "\n");
+    let mut occurrences = Vec::new();
+    let mut count = 0usize;
+    let mut exact_count = 0usize;
+    let mut equivalent_count = 0usize;
+
+    for (start, matched) in normalized.match_indices(&normalized_old) {
+        count += 1;
+        let range = boundaries[start]..boundaries[start + matched.len()];
+        let matcher = if &content[range.clone()] == old_string {
+            exact_count += 1;
+            "exact"
+        } else {
+            equivalent_count += 1;
+            "line_ending_equivalent"
+        };
+        if occurrences.len() < MAX_REPLACE_ALL_MATCHES {
+            occurrences.push(ReplacementOccurrence { range, matcher });
+        }
+    }
+
+    let matcher = match (exact_count > 0, equivalent_count > 0) {
+        (true, false) => "exact",
+        (false, true) => "line_ending_equivalent",
+        (true, true) => "exact_and_line_ending_equivalent",
+        (false, false) => "none",
+    };
+    ReplaceAllScan {
+        occurrences,
+        count,
+        matcher,
+    }
+}
+
+fn normalize_crlf_with_boundaries(content: &str) -> (String, Vec<usize>) {
+    let bytes = content.as_bytes();
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut boundaries = Vec::with_capacity(bytes.len() + 1);
+    boundaries.push(0);
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
+            normalized.push(b'\n');
+            index += 2;
+        } else {
+            normalized.push(bytes[index]);
+            index += 1;
+        }
+        boundaries.push(index);
+    }
+    (
+        String::from_utf8(normalized).expect("normalizing CRLF preserves UTF-8"),
+        boundaries,
+    )
+}
+
+fn line_range(content: &str, range: &Range<usize>) -> super::replacer::CandidateLineRange {
+    let start = content.as_bytes()[..range.start]
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count()
+        + 1;
+    let last = range.end.saturating_sub(1).max(range.start);
+    let end = content.as_bytes()[..last]
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count()
+        + 1;
+    super::replacer::CandidateLineRange { start, end }
+}
+
+fn replace_all_candidates(
+    content: &str,
+    occurrences: &[ReplacementOccurrence],
+) -> Vec<super::replacer::ReplacementCandidate> {
+    occurrences
+        .iter()
+        .take(MAX_RENDERED_CANDIDATES)
+        .map(|occurrence| super::replacer::ReplacementCandidate {
+            range: occurrence.range.clone(),
+            lines: line_range(content, &occurrence.range),
+            matcher: occurrence.matcher,
+            score: None,
+        })
+        .collect()
+}
+
+fn line_ending_near(content: &str, range: &Range<usize>) -> LineEnding {
+    let bytes = content.as_bytes();
+    if let Some(offset) = bytes[range.start..].iter().position(|byte| *byte == b'\n') {
+        let newline = range.start + offset;
+        return if newline > 0 && bytes[newline - 1] == b'\r' {
+            LineEnding::Crlf
+        } else {
+            LineEnding::Lf
+        };
+    }
+    if let Some(newline) = bytes[..range.start].iter().rposition(|byte| *byte == b'\n') {
+        return if newline > 0 && bytes[newline - 1] == b'\r' {
+            LineEnding::Crlf
+        } else {
+            LineEnding::Lf
+        };
+    }
+    LineEnding::Lf
+}
+
+fn replacement_for_line_ending(normalized_new: &str, ending: LineEnding) -> String {
+    match ending {
+        LineEnding::Lf => normalized_new.to_string(),
+        LineEnding::Crlf => normalized_new.replace('\n', "\r\n"),
+    }
+}
+
+fn replacement_result_len(
+    content: &str,
+    occurrences: &[ReplacementOccurrence],
+    normalized_new: &str,
+) -> usize {
+    let newline_count = normalized_new
+        .as_bytes()
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count();
+    occurrences.iter().fold(content.len(), |size, occurrence| {
+        let replacement_len = normalized_new.len()
+            + usize::from(matches!(
+                line_ending_near(content, &occurrence.range),
+                LineEnding::Crlf
+            )) * newline_count;
+        size.saturating_sub(occurrence.range.len())
+            .saturating_add(replacement_len)
+    })
+}
+
+fn apply_replace_all(
+    content: &str,
+    occurrences: &[ReplacementOccurrence],
+    normalized_new: &str,
+) -> String {
+    let mut result = content.to_string();
+    for occurrence in occurrences.iter().rev() {
+        let replacement = replacement_for_line_ending(
+            normalized_new,
+            line_ending_near(content, &occurrence.range),
+        );
+        result.replace_range(occurrence.range.clone(), &replacement);
+    }
+    result
+}
+
+fn replacement_locations(
+    content: &str,
+    occurrences: &[ReplacementOccurrence],
+) -> Vec<super::replacer::CandidateLineRange> {
+    occurrences
+        .iter()
+        .take(MAX_REPORTED_REPLACEMENT_LOCATIONS)
+        .map(|occurrence| line_range(content, &occurrence.range))
+        .collect()
+}
+
+fn replacement_locations_json(
+    locations: &[super::replacer::CandidateLineRange],
+) -> serde_json::Value {
+    locations
+        .iter()
+        .map(|location| {
+            json!({
+                "line_range": {
+                    "start": location.start,
+                    "end": location.end,
+                }
+            })
+        })
+        .collect()
+}
+
+fn replacement_lines_summary(
+    locations: &[super::replacer::CandidateLineRange],
+    total: usize,
+) -> String {
+    let mut summary = locations
+        .iter()
+        .map(|location| {
+            if location.start == location.end {
+                location.start.to_string()
+            } else {
+                format!("{}-{}", location.start, location.end)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    if total > locations.len() {
+        summary.push_str(&format!(",+{} more", total - locations.len()));
+    }
+    truncate_to_budget(&summary, 256)
+}
 
 /// Tool for editing files via string replacement.
 pub struct EditFileTool {
@@ -160,11 +411,21 @@ fn typed_edit_rejection(
     let short_version = format!("sha256:{}...", &digest[..digest.len().min(12)]);
     let metadata_path = metadata_path(rejection.path);
     let shown_path = displayed_path(rejection.path);
-    let remedy = "retry_with_current_exact_text";
+    let remedy = match rejection.reason {
+        "replace_all_match_limit" | "replace_all_result_limit" => {
+            "use_structured_generator_or_explicit_script"
+        }
+        _ => "retry_with_current_exact_text",
+    };
+    let limit = match rejection.reason {
+        "replace_all_match_limit" => format!(" limit={MAX_REPLACE_ALL_MATCHES}"),
+        "replace_all_result_limit" => format!(" limit_bytes={MAX_REPLACE_ALL_RESULT_BYTES}"),
+        _ => String::new(),
+    };
     let mut output = format!(
         "[{}] path={shown_path} count={} \
-         current={short_version} remedy={remedy}",
-        rejection.code, rejection.occurrence_count
+         current={short_version}{limit} remedy={remedy}",
+        rejection.code, rejection.occurrence_count,
     );
     let mut rendered_candidates = Vec::new();
 
@@ -232,6 +493,10 @@ fn typed_edit_rejection(
                 "occurrence_count": rejection.occurrence_count,
                 "candidates": candidate_metadata,
                 "remedy": remedy,
+                "replace_all_limits": {
+                    "matches": MAX_REPLACE_ALL_MATCHES,
+                    "result_bytes": MAX_REPLACE_ALL_RESULT_BYTES,
+                },
                 "file_modified": false,
             })),
             ..Default::default()
@@ -252,6 +517,8 @@ struct EditFileInput {
     old_string: String,
     #[serde(alias = "newString")]
     new_string: String,
+    #[serde(default, alias = "replaceAll")]
+    replace_all: bool,
 }
 
 #[async_trait]
@@ -275,7 +542,7 @@ impl Tool for EditFileTool {
     }
 
     fn input_schema(&self) -> serde_json::Value {
-        serde_json::json!({
+        let schema = serde_json::json!({
             "type": "object",
             "properties": {
                 "path": {
@@ -292,7 +559,8 @@ impl Tool for EditFileTool {
                 }
             },
             "required": ["path", "old_string", "new_string"]
-        })
+        });
+        crate::local_edit::tool_input_schema(self.name(), schema, self.local_edit_enabled)
     }
 
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
@@ -307,8 +575,25 @@ impl Tool for EditFileTool {
         ctx: &ToolContext,
         args: &serde_json::Value,
     ) -> Result<ToolResult> {
-        let input: EditFileInput =
-            super::args::parse_tool_args(self.name(), &self.input_schema(), args)?;
+        let local_edit_enabled =
+            self.local_edit_enabled || super::registry::local_edit_execution_enabled();
+        if !local_edit_enabled
+            && args.as_object().is_some_and(|args| {
+                args.contains_key("replace_all") || args.contains_key("replaceAll")
+            })
+        {
+            return Err(eyre::Report::new(super::ToolInputError::new(
+                "Invalid arguments for tool 'edit_file':\n\
+                 - replace_all: unknown parameter\n\
+                 Fix the arguments and call the tool again.",
+            )));
+        }
+        let schema = crate::local_edit::tool_input_schema(
+            self.name(),
+            self.input_schema(),
+            local_edit_enabled,
+        );
+        let input: EditFileInput = super::args::parse_tool_args(self.name(), &schema, args)?;
 
         if !self.file_access.allows_write() {
             return Ok(ToolResult {
@@ -393,8 +678,6 @@ impl Tool for EditFileTool {
             None
         };
 
-        let local_edit_enabled =
-            self.local_edit_enabled || super::registry::local_edit_execution_enabled();
         if input.old_string.is_empty() && !local_edit_enabled {
             return Ok(ToolResult {
                 output: "old_string must not be empty".to_string(),
@@ -405,6 +688,7 @@ impl Tool for EditFileTool {
 
         let old_string = input.old_string.clone();
         let new_string = input.new_string.clone();
+        let replace_all = input.replace_all;
         let display_path = input.path.clone();
         let guarded = super::mutation_guard::rewrite_existing(
             ctx,
@@ -453,7 +737,77 @@ impl Tool for EditFileTool {
                     }
                 };
                 if local_edit_enabled && old_string == new_string {
-                    return Ok((bytes.to_vec(), ("identical_input", String::new())));
+                    return Ok((
+                        bytes.to_vec(),
+                        AppliedEdit {
+                            matcher: "identical_input",
+                            content: String::new(),
+                            replacement_count: 0,
+                            replacement_locations: Vec::new(),
+                            replace_all,
+                        },
+                    ));
+                }
+                if replace_all {
+                    let scan = find_replace_all_matches(content, &old_string);
+                    if scan.count == 0 {
+                        let evidence =
+                            super::replacer::find_replacement_evidence(content, &old_string);
+                        return Err(typed_edit_rejection(EditRejection {
+                            code: "edit_no_match",
+                            path: &display_path,
+                            current_bytes: bytes,
+                            content: Some(content),
+                            old_string: &old_string,
+                            matcher: "exact_or_line_ending_equivalent",
+                            occurrence_count: 0,
+                            candidates: &evidence.candidates,
+                            reason: "replace_all_no_exact_match",
+                        }));
+                    }
+                    let candidates = replace_all_candidates(content, &scan.occurrences);
+                    if scan.count > MAX_REPLACE_ALL_MATCHES {
+                        return Err(typed_edit_rejection(EditRejection {
+                            code: "invalid_edit_input",
+                            path: &display_path,
+                            current_bytes: bytes,
+                            content: Some(content),
+                            old_string: &old_string,
+                            matcher: scan.matcher,
+                            occurrence_count: scan.count,
+                            candidates: &candidates,
+                            reason: "replace_all_match_limit",
+                        }));
+                    }
+                    let normalized_new = new_string.replace("\r\n", "\n");
+                    if replacement_result_len(content, &scan.occurrences, &normalized_new)
+                        > MAX_REPLACE_ALL_RESULT_BYTES
+                    {
+                        return Err(typed_edit_rejection(EditRejection {
+                            code: "invalid_edit_input",
+                            path: &display_path,
+                            current_bytes: bytes,
+                            content: Some(content),
+                            old_string: &old_string,
+                            matcher: scan.matcher,
+                            occurrence_count: scan.count,
+                            candidates: &candidates,
+                            reason: "replace_all_result_limit",
+                        }));
+                    }
+                    let locations = replacement_locations(content, &scan.occurrences);
+                    let new_content =
+                        apply_replace_all(content, &scan.occurrences, &normalized_new);
+                    return Ok((
+                        new_content.as_bytes().to_vec(),
+                        AppliedEdit {
+                            matcher: scan.matcher,
+                            content: new_content,
+                            replacement_count: scan.count,
+                            replacement_locations: locations,
+                            replace_all: true,
+                        },
+                    ));
                 }
                 let evidence = super::replacer::find_replacement_evidence(content, &old_string);
                 let (range, replacer_name) = match evidence.outcome.clone() {
@@ -544,9 +898,16 @@ impl Tool for EditFileTool {
                 new_content.push_str(&content[..range.start]);
                 new_content.push_str(&splice_new);
                 new_content.push_str(&content[range.end..]);
+                let location = line_range(content, &range);
                 Ok((
                     new_content.as_bytes().to_vec(),
-                    (replacer_name, new_content),
+                    AppliedEdit {
+                        matcher: replacer_name,
+                        content: new_content,
+                        replacement_count: 1,
+                        replacement_locations: vec![location],
+                        replace_all: false,
+                    },
                 ))
             },
         )
@@ -555,7 +916,14 @@ impl Tool for EditFileTool {
             Ok(rewrite) => rewrite,
             Err(error) => return Ok(error.into_tool_result(self.name(), &input.path)),
         };
-        let (replacer_name, new_content) = guarded.value;
+        let AppliedEdit {
+            matcher: replacer_name,
+            content: new_content,
+            replacement_count,
+            replacement_locations,
+            replace_all,
+        } = guarded.value;
+        let locations_truncated = replacement_count.saturating_sub(replacement_locations.len());
         if !guarded.changed {
             let mut metadata = super::mutation_report::no_change_metadata(
                 self.name(),
@@ -563,7 +931,22 @@ impl Tool for EditFileTool {
                 &guarded.before,
             );
             super::mutation_report::insert(&mut metadata, "matcher", json!(replacer_name));
-            super::mutation_report::insert(&mut metadata, "replacement_count", json!(0));
+            super::mutation_report::insert(
+                &mut metadata,
+                "replacement_count",
+                json!(replacement_count),
+            );
+            super::mutation_report::insert(&mut metadata, "replace_all", json!(replace_all));
+            super::mutation_report::insert(
+                &mut metadata,
+                "replacement_locations",
+                replacement_locations_json(&replacement_locations),
+            );
+            super::mutation_report::insert(
+                &mut metadata,
+                "replacement_locations_truncated",
+                json!(locations_truncated),
+            );
             return Ok(ToolResult {
                 output: format!(
                     "[no_change] path={} matcher={} current={}",
@@ -636,7 +1019,22 @@ impl Tool for EditFileTool {
         };
         if let Some(report) = report.as_mut() {
             super::mutation_report::insert(&mut report.metadata, "matcher", json!(replacer_name));
-            super::mutation_report::insert(&mut report.metadata, "replacement_count", json!(1));
+            super::mutation_report::insert(
+                &mut report.metadata,
+                "replacement_count",
+                json!(replacement_count),
+            );
+            super::mutation_report::insert(&mut report.metadata, "replace_all", json!(replace_all));
+            super::mutation_report::insert(
+                &mut report.metadata,
+                "replacement_locations",
+                replacement_locations_json(&replacement_locations),
+            );
+            super::mutation_report::insert(
+                &mut report.metadata,
+                "replacement_locations_truncated",
+                json!(locations_truncated),
+            );
         }
 
         // Invalidate every recorded workspace-owned version for this path.
@@ -657,13 +1055,25 @@ impl Tool for EditFileTool {
         // Report which replacer produced the match. The exact-match wording
         // is kept identical to the historical output for compatibility.
         let output = if let Some(report) = report.as_ref() {
-            format!(
-                "Edited {}: matcher={}, replacements=1, final={}, formatter={}",
-                displayed_path(&input.path),
-                replacer_name,
-                report.final_label,
-                report.formatter_label,
-            )
+            if replace_all {
+                format!(
+                    "Edited {}: matcher={}, replacements={}, lines={}, final={}, formatter={}",
+                    displayed_path(&input.path),
+                    replacer_name,
+                    replacement_count,
+                    replacement_lines_summary(&replacement_locations, replacement_count),
+                    report.final_label,
+                    report.formatter_label,
+                )
+            } else {
+                format!(
+                    "Edited {}: matcher={}, replacements=1, final={}, formatter={}",
+                    displayed_path(&input.path),
+                    replacer_name,
+                    report.final_label,
+                    report.formatter_label,
+                )
+            }
         } else if replacer_name == "exact" {
             format!("Successfully edited {}", input.path)
         } else {
@@ -1811,7 +2221,8 @@ mod tests {
             .execute(&serde_json::json!({
                 "path": "file.txt",
                 "old_string": "absent",
-                "new_string": "absent"
+                "new_string": "absent",
+                "replace_all": true
             }))
             .await
             .unwrap();
@@ -1821,7 +2232,233 @@ mod tests {
         let metadata = result.structured_metadata.as_ref().unwrap();
         assert_eq!(metadata["outcome"], "no_change");
         assert_eq!(metadata["matcher"], "identical_input");
+        assert_eq!(metadata["replace_all"], true);
         assert_eq!(std::fs::read_to_string(path).unwrap(), "current\n");
+    }
+
+    #[tokio::test]
+    async fn local_edit_replace_all_replaces_every_exact_non_overlapping_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("all.txt");
+        std::fs::write(&path, "aaaa\n").unwrap();
+
+        let result = EditFileTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .execute(&serde_json::json!({
+                "path": "all.txt",
+                "old_string": "aa",
+                "new_string": "猫",
+                "replace_all": true
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{}", result.output);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "猫猫\n");
+        assert!(result.output.contains("replacements=2"));
+        assert!(result.output.contains("lines=1,1"));
+        let metadata = result.structured_metadata.as_ref().unwrap();
+        assert_eq!(metadata["matcher"], "exact");
+        assert_eq!(metadata["replace_all"], true);
+        assert_eq!(metadata["replacement_count"], 2);
+        assert_eq!(
+            metadata["replacement_locations"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(
+            metadata["replacement_locations"][0]["line_range"]["start"],
+            1
+        );
+        assert_eq!(
+            metadata["replacement_locations"][1]["line_range"]["start"],
+            1
+        );
+    }
+
+    #[test]
+    fn replace_all_match_collection_never_selects_overlapping_ranges() {
+        let scan = find_replace_all_matches("aaa", "aa");
+
+        assert_eq!(scan.count, 1);
+        assert_eq!(scan.occurrences[0].range, 0..2);
+        assert_eq!(apply_replace_all("aaa", &scan.occurrences, "b"), "ba");
+    }
+
+    #[tokio::test]
+    async fn local_edit_replace_all_false_preserves_single_match_ambiguity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("default.txt");
+        let original = "same\nsame\n";
+        std::fs::write(&path, original).unwrap();
+
+        let result = EditFileTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .execute(&serde_json::json!({
+                "path": "default.txt",
+                "old_string": "same",
+                "new_string": "changed",
+                "replace_all": false
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert_eq!(
+            result.structured_metadata.as_ref().unwrap()["error_code"],
+            "edit_ambiguous"
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn local_edit_replace_all_never_uses_fuzzy_matchers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fuzzy.rs");
+        let original = "fn one() {\n    launch();\n}\n";
+        std::fs::write(&path, original).unwrap();
+
+        let result = EditFileTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .execute(&serde_json::json!({
+                "path": "fuzzy.rs",
+                "old_string": "fn one() {\nlaunch();\n}",
+                "new_string": "fn one() {\n    stop();\n}",
+                "replace_all": true
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        let metadata = result.structured_metadata.as_ref().unwrap();
+        assert_eq!(metadata["error_code"], "edit_no_match");
+        assert_eq!(metadata["reason"], "replace_all_no_exact_match");
+        assert_eq!(metadata["candidates"][0]["matcher"], "line_trimmed");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn local_edit_replace_all_handles_crlf_and_unicode_without_normalizing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unicode.txt");
+        std::fs::write(&path, "目标\r\nkeep\r\n目标\r\n").unwrap();
+
+        let result = EditFileTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .execute(&serde_json::json!({
+                "path": "unicode.txt",
+                "old_string": "目标\n",
+                "new_string": "结果\n",
+                "replace_all": true
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{}", result.output);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            "结果\r\nkeep\r\n结果\r\n".as_bytes()
+        );
+        let metadata = result.structured_metadata.as_ref().unwrap();
+        assert_eq!(metadata["matcher"], "line_ending_equivalent");
+        assert_eq!(metadata["replacement_count"], 2);
+        assert_eq!(
+            metadata["replacement_locations"][0]["line_range"]["start"],
+            1
+        );
+        assert_eq!(
+            metadata["replacement_locations"][1]["line_range"]["start"],
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn local_edit_replace_all_truncates_locations_but_keeps_total_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("many.txt");
+        std::fs::write(
+            &path,
+            "hit\n".repeat(MAX_REPORTED_REPLACEMENT_LOCATIONS + 5),
+        )
+        .unwrap();
+
+        let result = EditFileTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .execute(&serde_json::json!({
+                "path": "many.txt",
+                "old_string": "hit",
+                "new_string": "done",
+                "replace_all": true
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{}", result.output);
+        let metadata = result.structured_metadata.as_ref().unwrap();
+        assert_eq!(
+            metadata["replacement_count"],
+            MAX_REPORTED_REPLACEMENT_LOCATIONS + 5
+        );
+        assert_eq!(
+            metadata["replacement_locations"].as_array().unwrap().len(),
+            MAX_REPORTED_REPLACEMENT_LOCATIONS
+        );
+        assert_eq!(metadata["replacement_locations_truncated"], 5);
+    }
+
+    #[tokio::test]
+    async fn local_edit_replace_all_rejects_the_match_limit_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("too-many.txt");
+        let original = "x".repeat(MAX_REPLACE_ALL_MATCHES + 1);
+        std::fs::write(&path, &original).unwrap();
+
+        let result = EditFileTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .execute(&serde_json::json!({
+                "path": "too-many.txt",
+                "old_string": "x",
+                "new_string": "y",
+                "replace_all": true
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        let metadata = result.structured_metadata.as_ref().unwrap();
+        assert_eq!(metadata["error_code"], "invalid_edit_input");
+        assert_eq!(metadata["reason"], "replace_all_match_limit");
+        assert_eq!(metadata["occurrence_count"], MAX_REPLACE_ALL_MATCHES + 1);
+        assert!(
+            result
+                .output
+                .contains("use_structured_generator_or_explicit_script")
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn local_edit_replace_all_rejects_an_oversized_result_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("too-large.txt");
+        std::fs::write(&path, "x\n").unwrap();
+        let replacement = "y".repeat(MAX_REPLACE_ALL_RESULT_BYTES + 1);
+
+        let result = EditFileTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .execute(&serde_json::json!({
+                "path": "too-large.txt",
+                "old_string": "x",
+                "new_string": replacement,
+                "replace_all": true
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        let metadata = result.structured_metadata.as_ref().unwrap();
+        assert_eq!(metadata["error_code"], "invalid_edit_input");
+        assert_eq!(metadata["reason"], "replace_all_result_limit");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "x\n");
     }
 
     #[tokio::test]
@@ -1928,9 +2565,55 @@ mod tests {
         assert!(props.contains_key("path"));
         assert!(props.contains_key("old_string"));
         assert!(props.contains_key("new_string"));
+        assert!(!props.contains_key("replace_all"));
         assert!(!props.contains_key("filePath"));
         assert!(!props.contains_key("oldString"));
         assert!(!props.contains_key("newString"));
+        assert!(!props.contains_key("replaceAll"));
+
+        let enabled = EditFileTool::new("/tmp").with_local_edit_enabled(true);
+        let enabled_schema = enabled.input_schema();
+        assert_eq!(
+            enabled_schema["properties"]["replace_all"]["type"],
+            "boolean"
+        );
+        assert_eq!(
+            enabled_schema["properties"]["replace_all"]["default"],
+            false
+        );
+    }
+
+    #[tokio::test]
+    async fn local_edit_replace_all_rejects_wrong_type_and_unknown_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file.txt"), "same\nsame\n").unwrap();
+        let tool = EditFileTool::new(dir.path()).with_local_edit_enabled(true);
+
+        let wrong_type = tool
+            .execute(&serde_json::json!({
+                "path": "file.txt",
+                "old_string": "same",
+                "new_string": "changed",
+                "replace_all": "yes"
+            }))
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        let unknown = tool
+            .execute(&serde_json::json!({
+                "path": "file.txt",
+                "old_string": "same",
+                "new_string": "changed",
+                "replace_everything": true
+            }))
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+
+        assert!(wrong_type.contains("replace_all: expected boolean"));
+        assert!(unknown.contains("replace_everything: unknown parameter"));
     }
 
     #[tokio::test]
@@ -2171,6 +2854,59 @@ mod tests {
             crate::file_state_cache::FileVersion::sha256(&on_disk)
         );
         assert!(result.output.contains("formatter=formatted"));
+    }
+
+    #[tokio::test]
+    async fn local_edit_replace_all_reports_formatter_final_content() {
+        if !crate::format::binary_on_path("rustfmt") {
+            eprintln!("skipping: rustfmt not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("batch.rs");
+        std::fs::write(&path, "fn main(){let x=1;let y=1;println!(\"{}\",x+y);}\n").unwrap();
+        let mut ctx = ToolContext::zero();
+        ctx.format_after_edit = true;
+
+        let result = EditFileTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "path": "batch.rs",
+                    "old_string": "=1",
+                    "new_string": "=2",
+                    "replace_all": true,
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "{}", result.output);
+        let metadata = result.structured_metadata.as_ref().unwrap();
+        assert_eq!(metadata["replacement_count"], 2);
+        let status = metadata["formatter"]["status"].as_str().unwrap();
+        if status == "timed_out" {
+            eprintln!("skipping final formatter assertions: rustfmt timed out");
+            return;
+        }
+        assert_eq!(status, "formatted");
+        assert_eq!(metadata["formatter"]["changed"], true);
+        let on_disk = std::fs::read(&path).unwrap();
+        assert_eq!(
+            metadata["final_version"]["content_sha256"],
+            crate::file_state_cache::FileVersion::sha256(&on_disk)
+        );
+        assert!(
+            std::str::from_utf8(&on_disk)
+                .unwrap()
+                .contains("let x = 2;")
+        );
+        assert!(
+            std::str::from_utf8(&on_disk)
+                .unwrap()
+                .contains("let y = 2;")
+        );
     }
 
     #[tokio::test]
