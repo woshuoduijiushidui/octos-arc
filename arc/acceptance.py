@@ -100,6 +100,8 @@ class TestOutcome:
     message: str = ""
     steps: list[str] = field(default_factory=list)
     action_errors: list[str] = field(default_factory=list)
+    context_path: str = ""  # Playwright's error-context.md for this failure
+    rendered_page: str = ""  # its accessibility snapshot, filled in by the runner
 
 
 @dataclass
@@ -114,6 +116,7 @@ class RunSummary:
     run_id: str = ""
     command: str = ""
     exit_code: int | None = None
+    stores_written: list[str] = field(default_factory=list)  # files this run left changed on disk
 
     def slow(self, threshold_ms: int) -> list[str]:
         return [r.title for r in self.results if r.duration_ms >= threshold_ms]
@@ -156,7 +159,9 @@ def summarize_report(report: dict) -> RunSummary:
                     message=_ANSI.sub("", str(err.get("message") or "") + "\n" + "\n".join(
                         line for line in str(err.get("stack") or "").splitlines() if line.strip().startswith("at "))).strip(),
                     steps=steps, action_errors=[_ANSI.sub("", e)[:2000] for e in
-                        (report.get("action_errors", {}).get(spec.get("id"), []) or [])[:8] if isinstance(e, str)]))
+                        (report.get("action_errors", {}).get(spec.get("id"), []) or [])[:8] if isinstance(e, str)],
+                    context_path=next((str(a.get("path") or "") for a in (last.get("attachments") or [])
+                                       if isinstance(a, dict) and a.get("name") == "error-context"), "")))
             walk(suite.get("suites", []), file)
 
     walk(report.get("suites", []))
@@ -198,9 +203,117 @@ def _call_log_steps(message: str) -> list[str]:
     return steps
 
 
-def failure_summaries(summary: RunSummary, max_steps: int = 8, max_observation: int = 900) -> str:
+# The snapshot sits under a `# Page snapshot` heading after an action failure and
+# inline in `# Error details` after a failed expect(); it is the only YAML in the
+# document either way (the spec source is fenced as ```ts).
+_PAGE_SNAPSHOT = re.compile(r"(?m)^```yaml\n(.*?)\n```", re.S)
+
+
+def page_snapshot(error_context: str, max_chars: int = 4000) -> str:
+    """The accessibility tree of the page as it stood when the test failed.
+
+    Playwright writes `test-results/<test>/error-context.md` for every failure
+    and records the rendered page in it. Without that a repair only sees the
+    locator the test waited for and has to guess which roles and accessible
+    names the app actually produced. Only the snapshot is kept: the error and
+    the spec source are already summarised elsewhere.
+    """
+    match = _PAGE_SNAPSHOT.search(error_context)
+    if not match:
+        return ""
+    return _clip_lines(match.group(1), max_chars)
+
+
+def clip_ends(text: str, max_chars: int) -> str:
+    """Keep both ends of a tool log.
+
+    npm and the bundlers print the cause first and then a wall of exit
+    boilerplate, so a tail-only excerpt of a failed build can be nothing but log
+    paths — the line naming the missing module is the first thing dropped.
+    """
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text
+    head = max_chars * 2 // 3
+    elided = len(text) - max_chars
+    return f"{text[:head]}\n… {elided} characters elided …\n{text[head - max_chars:]}"
+
+
+def _clip_lines(text: str, max_chars: int) -> str:
+    """Keep whole lines only: a half-line of YAML reads as a different tree."""
+    kept: list[str] = []
+    budget = max_chars
+    for line in text.splitlines():
+        if len(line) + 1 > budget:
+            kept.append("… snapshot truncated")
+            break
+        kept.append(line)
+        budget -= len(line) + 1
+    return "\n".join(kept).strip()
+
+
+_STARTUP_NOISE = ("Failed to load the ES module", "--trace-warnings", "npm notice")
+_STARTUP_ERROR_MARKERS = ("SyntaxError", "ReferenceError", "TypeError", "RangeError",
+                          "Cannot find module", "MODULE_NOT_FOUND", "EADDRINUSE",
+                          "error TS", "Error:", "throw ")
+
+
+def startup_error_digest(text: str, limit: int) -> str:
+    """The slice of a build/start failure that actually names the cause.
+
+    When a CommonJS file fails to parse, Node prints `Warning: Failed to load the ES
+    module <abs path>. Make sure to set "type": "module" ...` *before* the real error,
+    and `npm start` adds its own two-line preamble. The warning is a wrong lead --
+    setting "type": "module" would break the require() calls the harness pins -- and
+    with an absolute path it spends roughly 220 of a 600-character observation budget
+    that is meant for the stack.
+
+    Measured on the local TB REQ-1 round-0 capture (2026-09-17, cause `Identifier
+    '__dirname' has already been declared`): the error line sat at character 530, so a
+    600-character head slice did still reach it -- this is not a fix for a lost error.
+    What it does is drop the misleading lead and hand the whole budget to the stack,
+    which also leaves room when the path is longer or npm prints more first.
+
+    So: drop the lines known to mislead, start at the first line that names an error,
+    and fall back to the tail (where a stack trace ends up) when nothing matches.
+    """
+    lines = [l for l in text.splitlines() if not any(n in l for n in _STARTUP_NOISE)]
+    header = lines[0] if lines and ("exited early" in lines[0] or "could not launch" in lines[0]) else None
+    body = lines[1:] if header else lines
+    start = next((i for i, l in enumerate(body) if any(m in l for m in _STARTUP_ERROR_MARKERS)), None)
+    # Budget the header first: clipping the joined result at the end would slice from
+    # the front and throw away the very tail this falls back to.
+    room = limit - (len(header) + 1) if header else limit
+    if room <= 0:
+        return (header or "")[:limit]
+    kept = "\n".join(body[start:] if start is not None else body).strip()
+    kept = kept[:room] if start is not None else kept[-room:]
+    return f"{header}\n{kept}".strip() if header else kept
+
+
+def failure_summaries(summary: RunSummary, max_steps: int = 8, max_observation: int = 900,
+                      max_snapshots: int = 18000) -> str:
     """Four-field digest of every failed test — the only thing the model sees."""
     blocks = []
+    # A full suite can fail on many nodes at once; share the snapshot budget so a
+    # long first tree cannot crowd the later failures out of the repair prompt.
+    # The share has to clear the page chrome — header, sidebar, banner run over a
+    # thousand characters before the content the test was actually looking at.
+    failing = sum(1 for r in summary.results if not r.ok) or 1
+    # A share below the page chrome -- header, sidebar, banner run over a thousand
+    # characters before the content the test looked at -- shows none of what the
+    # test could see, so the share has a floor. Above roughly twenty failures the
+    # floor wins every time and `max_snapshots` stops bounding anything: a
+    # 125-spec suite failing wholesale produced 100000 characters of trees under
+    # an 18000 budget, and a 236000-character prompt. That prompt still fits the
+    # model -- deepseek-v4-flash carries a 1048576 token window, and 236000
+    # characters is about 59000 -- so this bounds cost and noise, not a context
+    # overflow; do not reintroduce the floor believing the prompt would be
+    # rejected. Keep the floor, and spend it
+    # on as many failures as the budget really covers; the rest still report their
+    # feature, location, observation and steps, which is what names the cause.
+    per_snapshot = max(800, max_snapshots // failing)
+    snapshots_left = max(1, max_snapshots // per_snapshot)
     for r in summary.results:
         if r.ok:
             continue
@@ -215,6 +328,11 @@ def failure_summaries(summary: RunSummary, max_steps: int = 8, max_observation: 
         steps_src = r.steps or _call_log_steps(r.message)
         steps = " -> ".join(steps_src[-max_steps:]) if steps_src else "(no step trace)"
         blocks.append(f"- Feature: {r.title}\n  Failed at: {where}\n  Observation: {observation}\n  Steps: {steps}")
+        if r.rendered_page and snapshots_left > 0:
+            snapshots_left -= 1
+            indented = "\n".join("    " + line for line in _clip_lines(r.rendered_page, per_snapshot).splitlines())
+            blocks[-1] += ("\n  Page at failure (what the app actually rendered; roles and accessible "
+                           "names the test could see):\n" + indented)
         if r.action_errors:
             blocks[-1] += "\n  Browser diagnostics (helpers may have recovered; correlate with the final failure):\n" + "\n".join(r.action_errors)[:4000]
     return "\n".join(blocks)
@@ -259,11 +377,16 @@ def failure_source_context(summary: RunSummary, tests_dir: Path | None, max_char
     return ('\n\n' + '\n\n'.join(blocks))[:max_chars] if blocks else ''
 
 
-def failure_signature(summary: RunSummary) -> frozenset[tuple[str, ...]]:
+def failure_signature(summary: RunSummary, unstable: frozenset[str] = frozenset()) -> frozenset[tuple[str, ...]]:
     """Detect a stalled repair by the observation, not just the test name.
 
     Ignore elapsed milliseconds and retry counts, which vary without a code
     change, but retain locator text and source location to detect progress.
+
+    `unstable` names spec files already seen to pass and fail within the same
+    pass. Cloud e767e871a6c6 spent four full-suite rounds on eleven failures
+    that never moved, because a twelfth flaked in and out and made every round
+    look different from the one before it, so the stall was never noticed.
     """
     def normalize(text: str) -> str:
         text = _ANSI.sub("", text)
@@ -273,7 +396,8 @@ def failure_signature(summary: RunSummary) -> frozenset[tuple[str, ...]]:
 
     return frozenset((r.file, r.title, r.status, r.location,
                       normalize(r.message), normalize(" | ".join(r.steps)))
-                     for r in summary.results if not r.ok)
+                     for r in summary.results
+                     if not r.ok and Path(r.file or "").name not in unstable)
 
 
 # ---------------------------------------------------------------- processes
@@ -553,6 +677,38 @@ def port_open(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
+def listening_ports(root: Path) -> list[int]:
+    """Ports held by processes started from inside the app tree.
+
+    A backend that ignores PORT and binds its own is a common way to miss the
+    port the harness and the grader wait on. Naming the port it did take turns a
+    bare timeout into a one-line fix. Foreign listeners are left out, the way
+    `free_owned_ports` leaves them alone."""
+    try:
+        out = subprocess.run(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-Fpn"],
+                             capture_output=True, text=True, timeout=15).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    ports: set[int] = set()
+    owned: dict[str, bool] = {}
+    pid = ""
+    for line in out.splitlines():
+        if line.startswith("p"):
+            pid = line[1:]
+        elif line.startswith("n") and pid:
+            port = line.rsplit(":", 1)[-1]
+            if not port.isdigit():
+                continue
+            if pid not in owned:
+                try:
+                    owned[pid] = workspace_contains(process_cwd(int(pid)), root)
+                except ValueError:
+                    owned[pid] = False
+            if owned[pid]:
+                ports.add(int(port))
+    return sorted(ports)
+
+
 def tree_digest(root: Path) -> dict[str, str]:
     """rel path -> sha256 for every regular file under root (node_modules skipped)."""
     import hashlib
@@ -588,6 +744,19 @@ def snapshot_worktree(git_run: Callable[[list[str]], object]) -> None:
     """Stage everything so `restore_worktree` can undo what a test run mutates
     (persisted JSON stores, uploaded files) without losing the model's edits."""
     git_run(["add", "-A"])
+
+
+def mutated_by_tests(git_run: Callable[[list[str]], object],
+                     parts: tuple[str, ...] = ("frontend", "backend")) -> list[str]:
+    """Files the test run changed, against the snapshot `snapshot_worktree` staged.
+
+    An app that keeps its state in files carries one session's actions into the
+    next, which is how a spec that passes on its own fails in the suite. Naming
+    the files turns "shared state" into somewhere to look.
+    """
+    result = git_run(["diff", "--name-only", "--", *parts])
+    out = getattr(result, "stdout", "") or ""
+    return sorted({line.strip() for line in out.splitlines() if line.strip()})[:12]
 
 
 def restore_worktree(git_run: Callable[[list[str]], object], parts: tuple[str, ...] = ("frontend", "backend")) -> None:
@@ -662,7 +831,7 @@ class AppServer:
             return 124, f"timeout after {timeout}s"
         except OSError as exc:
             return 127, str(exc)
-        return r.returncode, ((r.stdout or "") + "\n" + (r.stderr or "")).strip()[-1500:]
+        return r.returncode, clip_ends((r.stdout or "") + "\n" + (r.stderr or ""), 1500)
 
     def build(self) -> str | None:
         frontend, backend = self.project / "frontend", self.project / "backend"
@@ -723,8 +892,12 @@ class AppServer:
                     return f"{err}\nserver log tail:\n{tail}"
                 return None
             time.sleep(0.5)
+        # Ask before stopping: the process still holds whatever it did bind.
+        elsewhere = [p for p in listening_ports(self.project) if p != self.port]
         self.stop()
-        return f"backend did not bind port {self.port} within {wait_seconds}s:\n" + \
+        where = (f" It is listening on {', '.join(str(p) for p in elsewhere)} instead."
+                 if elsewhere else " Nothing started from the app tree is listening on any port.")
+        return f"backend did not bind port {self.port} within {wait_seconds}s.{where}\n" + \
             (self.log_file.read_text(errors="replace")[-1500:] if self.log_file else "")
 
     def extra_ports_bound(self, wait_seconds: float = 5.0) -> str | None:
@@ -832,16 +1005,39 @@ class AcceptanceRunner:
         shutil.copyfile(Path(__file__).with_name("action_errors.cjs"), self.work_dir / "action_errors.cjs")
         (self.work_dir / "playwright.config.ts").write_text(
             "import { defineConfig } from '@playwright/test';\n"
-            f"export default defineConfig({{ testDir: './tests', timeout: {self.timeout_ms}, retries: 0, "
+            # outputDir otherwise resolves against the Playwright install, where
+            # failure artifacts (error-context.md) pile up across runs instead of
+            # being cleared with the work dir.
+            f"export default defineConfig({{ testDir: './tests', outputDir: './test-results', "
+            f"timeout: {self.timeout_ms}, retries: 0, "
             f"fullyParallel: {'true' if os.environ.get('OCTOS_ARC_FULLY_PARALLEL') == '1' else 'false'}, "
             f"workers: {workers or self.workers}, reporter: [['list'], ['json', {{ outputFile: 'report.json' }}], ['./action_errors.cjs', {{ output: 'action-errors.json' }}]], "
-            # Action/navigation/expect timeouts sit below the 10 s test timeout on
-            # purpose: a hanging click then fails with the locator named in the
-            # call log instead of an anonymous "Test timeout exceeded".
-            f"expect: {{ timeout: {min(4000, self.timeout_ms // 2)} }}, "
-            f"use: {{ headless: true, baseURL: process.env.E2E_BASE_URL, actionTimeout: {min(4000, self.timeout_ms // 2)}, "
-            f"navigationTimeout: {min(6000, self.timeout_ms * 3 // 5)} }} }});\n")
+            # The grader's own config gives expect the full test timeout and sets
+            # no action or navigation timeout. Anything stricter here fails tests
+            # that grading would pass and spends repair rounds on them. The
+            # tighter values used to buy a named locator in the error; the page
+            # snapshot and the action trace now carry that whichever timeout
+            # fires.
+            f"expect: {{ timeout: {self.timeout_ms} }}, "
+            f"use: {{ headless: true, baseURL: process.env.E2E_BASE_URL }} }});\n")
         return self.work_dir / "playwright.config.ts"
+
+    def _attach_rendered_pages(self, summary: RunSummary) -> None:
+        """Fill each failure's `rendered_page` from the error context Playwright
+        wrote for it. `_prepare` clears the work dir per run, so these files only
+        ever describe this run; anything outside it is ignored."""
+        work = self.work_dir.resolve()
+        for index, result in enumerate(summary.results):
+            if result.ok or not result.context_path:
+                continue
+            path = Path(result.context_path)
+            try:
+                if not path.resolve().is_relative_to(work) or path.stat().st_size > 1_000_000:
+                    continue
+                context = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                continue  # Diagnostics are optional; never fail a run over them.
+            summary.results[index] = replace(result, rendered_page=page_snapshot(context))
 
     def run(self, spec_rel_paths: list[str], base_url: str, wall_timeout: int = 900,
             workers: int | None = None) -> RunSummary:
@@ -887,6 +1083,7 @@ class AcceptanceRunner:
         summary.run_id = run_id
         summary.command = command
         summary.exit_code = r.returncode
+        self._attach_rendered_pages(summary)
         if summary.total == 0:
             # Cloud run a6ccc437539f: the model had edited /workspace/tests, the
             # copied spec no longer loaded, and "0/0" looked like a verdict.

@@ -1,9 +1,11 @@
+import shutil
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
 from acceptance import (
+    clip_ends,
     failure_summaries,
     isolated_install_env,
     map_specs_to_nodes,
@@ -261,6 +263,90 @@ class FinalWorkersAndReapTests(unittest.TestCase):
         self.assertEqual(workers_for_final(512 * 1024**2, 4), 1)
         self.assertEqual(workers_for_final(None, 4), 4)
 
+    def test_should_free_only_the_ports_our_own_tree_is_holding(self):
+        """A leftover listener stops the harness binding its own port, so these
+        get killed. It matches on cwd alone, not on the command, so the
+        must-not-kill direction is the one that matters: a listener belonging to
+        anything else on a shared host has to survive."""
+        import os, signal, socket, subprocess, tempfile, time
+        from pathlib import Path
+        from acceptance import free_owned_ports
+
+        def free_port():
+            s = socket.socket(); s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]; s.close(); return port
+
+        root = Path(tempfile.mkdtemp())
+        (root / "backend").mkdir()
+        outside = Path(tempfile.mkdtemp())
+        mine_port, theirs_port = free_port(), free_port()
+        listen = ("import socket,time;s=socket.socket();"
+                  "s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);"
+                  "s.bind(('127.0.0.1',%d));s.listen(5);time.sleep(30)")
+        mine = subprocess.Popen(["python3", "-c", listen % mine_port], cwd=root / "backend",
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        theirs = subprocess.Popen(["python3", "-c", listen % theirs_port], cwd=outside,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            time.sleep(1.0)
+            if mine.poll() is not None or theirs.poll() is not None:
+                self.skipTest("could not hold the test ports")
+            free_owned_ports([mine_port, theirs_port], root)
+            deadline = time.time() + 5
+            while time.time() < deadline and mine.poll() is None:
+                time.sleep(0.1)
+            self.assertIsNotNone(mine.poll(), "our own listener was left holding the port")
+            # A killed child still polls as None until it is reaped, so checking
+            # the survivor straight away passes even when it was killed. Give the
+            # signal time to land, then require it to be alive.
+            time.sleep(1.0)
+            self.assertIsNone(theirs.poll(), "a listener outside the app tree was killed")
+        finally:
+            for proc in (mine, theirs):
+                if proc.poll() is None:
+                    try:
+                        os.kill(proc.pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                proc.wait(timeout=5)
+
+    def test_should_kill_a_stray_in_the_app_and_spare_one_outside_it(self):
+        """`should_reap` decides correctly; nothing checked that the reaper asks
+        it. Stubbing the whole function out left the suite green, so a rewrite
+        that skipped the predicate would kill processes it must not touch.
+        Uses real processes: one started inside backend/, one outside."""
+        import os, signal, subprocess, tempfile, time
+        from pathlib import Path
+        from acceptance import reap_workspace_processes
+        root = Path(tempfile.mkdtemp())
+        (root / "backend").mkdir()
+        outside = Path(tempfile.mkdtemp())          # not under root at all
+        inside_p = subprocess.Popen(["sh", "-c", "sleep 30; :"], cwd=root / "backend",
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        outside_p = subprocess.Popen(["sh", "-c", "sleep 30; :"], cwd=outside,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            time.sleep(0.4)
+            killed = reap_workspace_processes(root, lambda m: None)
+            deadline = time.time() + 5
+            while time.time() < deadline and inside_p.poll() is None:
+                time.sleep(0.1)
+            self.assertGreaterEqual(killed, 1, "the stray inside backend/ was not reaped")
+            self.assertIsNotNone(inside_p.poll(), "the stray inside backend/ is still running")
+            # A killed child polls as None until it is reaped, so checking the
+            # survivor straight away can pass even when it was killed. Give the
+            # signal time to land first.
+            time.sleep(1.0)
+            self.assertIsNone(outside_p.poll(), "a process outside the app tree was killed")
+        finally:
+            for proc in (inside_p, outside_p):
+                if proc.poll() is None:
+                    try:
+                        os.kill(proc.pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                proc.wait(timeout=5)
+
     def test_should_reap_only_node_processes_inside_app_dirs(self):
         import tempfile
         from pathlib import Path
@@ -511,3 +597,525 @@ for (const fail of [false,true]) test('navigation status '+fail,async({page})=>{
             # contain URLs and must remain unchanged.
             diagnostics = summary.split('Browser diagnostics',1)[-1]
             self.assertNotIn('private-value',diagnostics)
+
+
+class FailurePageSnapshotTests(unittest.TestCase):
+    """Playwright records what the page actually rendered when a test fails;
+    without it a repair only sees the locator it was waiting for."""
+
+    def test_should_extract_the_accessibility_snapshot_from_an_error_context(self):
+        from acceptance import page_snapshot
+        context = ('# Test info\n\n- Name: x\n\n# Error details\n\n```\nTimeoutError\n```\n\n'
+                   '# Page snapshot\n\n```yaml\n- heading "Notes" [level=1]\n- text: Work\n```\n\n'
+                   '# Test source\n\n```ts\n  1 | secret-source-line\n```\n')
+        snapshot = page_snapshot(context)
+        self.assertIn('heading "Notes"', snapshot)
+        self.assertIn('text: Work', snapshot)
+        # Only the rendered page; the surrounding report is already summarised.
+        self.assertNotIn('secret-source-line', snapshot)
+        self.assertNotIn('TimeoutError', snapshot)
+        self.assertEqual(page_snapshot('no snapshot section here'), '')
+
+    def test_should_extract_the_snapshot_a_failed_expect_leaves_inline(self):
+        from acceptance import page_snapshot
+        # A failed expect() has no `# Page snapshot` heading; the tree is fenced
+        # inside the error details instead.
+        context = ('# Error details\n\n```\nexpect(locator).toBeVisible() failed\n```\n\n'
+                   '```yaml\n- heading "Settings" [level=1]\n```\n\n'
+                   '# Test source\n\n```ts\n  1 | secret-source-line\n```\n')
+        self.assertEqual(page_snapshot(context), '- heading "Settings" [level=1]')
+
+    def test_should_bound_a_large_snapshot_on_whole_lines(self):
+        from acceptance import page_snapshot
+        body = "\n".join(f'- generic [ref=e{n}]: row {n}' for n in range(400))
+        snapshot = page_snapshot(f'# Page snapshot\n\n```yaml\n{body}\n```\n', max_chars=200)
+        self.assertLessEqual(len(snapshot), 300)
+        self.assertTrue(snapshot.startswith('- generic [ref=e0]: row 0'))
+        self.assertNotIn('row 399', snapshot)
+        for line in snapshot.splitlines():
+            self.assertTrue(line.startswith('- generic') or line.startswith('…'), line)
+
+    def test_should_share_the_snapshot_budget_across_a_failing_suite(self):
+        from acceptance import RunSummary, TestOutcome
+        tree = "\n".join(f'- generic [ref=e{n}]: row {n}' for n in range(400))
+        results = [TestOutcome(title=f'REQ-{n}', ok=False, status='timedOut', duration_ms=1,
+                               file=f'REQ-{n}.spec.ts', message='TimeoutError', rendered_page=tree)
+                   for n in range(8)]
+        summary = failure_summaries(RunSummary(passed=0, total=8, results=results),
+                                    max_snapshots=8000)
+        # Every failure keeps a usable share; none of them takes the whole prompt.
+        for n in range(8):
+            self.assertIn(f'- Feature: REQ-{n}\n', summary)
+        self.assertEqual(summary.count('Page at failure'), 8)
+        quoted = sum(len(line) for line in summary.splitlines() if line.startswith('    - generic'))
+        self.assertLessEqual(quoted, 8000 + 8 * 200)  # + the four-space quote indent per line
+
+    def _wholesale_failure(self, n, rows=80):
+        from acceptance import RunSummary, TestOutcome
+        tree = "\n".join(f'- generic [ref=e{i}]: row {i}' for i in range(rows))
+        return RunSummary(passed=0, total=125, results=[
+            TestOutcome(title=f'REQ-{i}', ok=False, status='timedOut', duration_ms=1,
+                        file=f'REQ-{i}.spec.ts', message='TimeoutError ' + 'd' * 600,
+                        rendered_page=tree) for i in range(n)])
+
+    def test_should_keep_snapshots_inside_their_budget_when_a_suite_fails_wholesale(self):
+        """The share has a floor, so above ~20 failures the floor won every time and
+        the budget bounded nothing: a 125-spec suite produced 100000 characters of
+        trees under an 18000 budget, in a 236000-character prompt."""
+        for failing in (40, 60, 125):
+            with self.subTest(failing=failing):
+                text = failure_summaries(self._wholesale_failure(failing), max_snapshots=18000)
+                quoted = sum(len(l) for l in text.splitlines() if l.startswith('    - generic'))
+                self.assertLessEqual(quoted, 18000 + 22 * 200)   # + the quote indent per line
+
+    def test_should_still_name_every_failure_it_cannot_show_a_page_for(self):
+        text = failure_summaries(self._wholesale_failure(125), max_snapshots=18000)
+        for i in (0, 60, 124):
+            self.assertIn(f'- Feature: REQ-{i}\n', text)         # nothing is silently dropped
+        self.assertIn('Observation:', text)
+
+    def test_should_not_change_a_suite_small_enough_to_fit(self):
+        # keep-sized runs must be byte-identical; only the runaway case changes.
+        text = failure_summaries(self._wholesale_failure(12), max_snapshots=18000)
+        self.assertEqual(text.count('Page at failure'), 12)
+
+    def test_should_report_the_rendered_page_for_a_real_failure(self):
+        from acceptance import AcceptanceRunner
+        import os
+        install = os.environ.get('OCTOS_TEST_PLAYWRIGHT_ROOT')
+        if not install:
+            self.skipTest('set OCTOS_TEST_PLAYWRIGHT_ROOT to an installed Playwright root')
+        root = Path(install)
+        with tempfile.TemporaryDirectory(prefix='page-snapshot-', dir=root) as folder:
+            base = Path(folder); specs = base/'source'; specs.mkdir()
+            (specs/'labels.spec.ts').write_text("""import {test} from '@playwright/test';
+test('remove label from a note',async({page})=>{
+ await page.route('http://example.test/**', route=>route.fulfill({status:200,contentType:'text/html',
+   body:'<h1>Notes</h1><div>Groceries</div><span>Work</span>'}));
+ await page.goto('http://example.test/');
+ await page.getByRole('checkbox',{name:/Work/i}).first().click();
+});
+""")
+            runner = AcceptanceRunner(root, specs, base/'prepared', lambda _: None, workers=1)
+            result = runner.run(['labels.spec.ts'], 'http://127.0.0.1:1')
+            self.assertEqual((result.passed, result.total), (0, 1), result.error)
+            summary = failure_summaries(result)
+            # The repair has to see that "Work" is plain text, not a checkbox.
+            self.assertIn('heading "Notes"', summary)
+            self.assertIn('Work', summary.split('Page at failure', 1)[-1])
+
+
+class ActionTargetTests(unittest.TestCase):
+    """Playwright names the element each action ran against in `step.subtitle`;
+    without it a trace reads "Hover -> Click -> Click" and says nothing about
+    which control the test actually operated."""
+
+    REPORTER = Path(__file__).resolve().parents[1] / 'action_errors.cjs'
+
+    def test_should_name_the_target_of_each_preceding_action(self):
+        script = r"""
+const assert = require('assert'); const Reporter = require(process.argv[1]);
+const api = (title, subtitle, error) => ({category:'pw:api', title, subtitle, duration:1, error, steps:[]});
+const steps = [
+  api('Navigate', 'example.test/'),
+  api('Hover', "getByRole('button', { name: /Edit note: Team retro/i }).first()"),
+  api('Click', "getByRole('button', { name: /more/i }).first()"),
+  api('Click', "getByRole('checkbox', { name: /Work/i }).first()", {message:'Timeout 4000ms exceeded'}),
+];
+const result = {status:'timedOut', steps}; const before = JSON.stringify(result);
+const reporter = new Reporter(); reporter.onTestEnd({id:'t'}, result);
+const text = reporter.rows.t.join('\n');
+assert(text.includes('Edit note: Team retro'), 'hover target missing: ' + text);
+assert(text.includes("name: /more/i"), 'click target missing: ' + text);
+assert(text.includes('Navigate example.test/'), 'navigation target missing: ' + text);
+assert(text.includes("checkbox"), 'failing step target missing: ' + text);
+assert.equal(JSON.stringify(result), before);
+"""
+        result = subprocess.run(['node', '-e', script, str(self.REPORTER)], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_should_keep_query_values_out_of_navigation_targets(self):
+        script = r"""
+const assert = require('assert'); const Reporter = require(process.argv[1]);
+const steps = [
+  {category:'pw:api', title:'Navigate', subtitle:'example.test/route?token=private-value#frag', duration:1, steps:[]},
+  {category:'pw:api', title:'Click', subtitle:"getByRole('button', { name: /more?/i }).first()", duration:1,
+   error:{message:'boom'}, steps:[]},
+];
+const reporter = new Reporter(); reporter.onTestEnd({id:'t'}, {status:'failed', steps});
+const text = reporter.rows.t.join('\n');
+assert(text.includes('example.test/route'), 'route missing: ' + text);
+assert(!text.includes('private-value'), 'query value leaked: ' + text);
+assert(!text.includes('frag'), 'fragment leaked: ' + text);
+assert(text.includes('/more?/i'), 'locator truncated at its own ?: ' + text);
+"""
+        result = subprocess.run(['node', '-e', script, str(self.REPORTER)], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_should_trace_actions_when_the_spec_itself_raises(self):
+        script = r"""
+const assert = require('assert'); const Reporter = require(process.argv[1]);
+// A spec that compares two values it collected raises outside any Playwright
+// call, so no pw:api step carries the error and the trace used to come out empty.
+const steps = [
+  {category:'pw:api', title:'Navigate', subtitle:'example.test/', duration:1, steps:[]},
+  {category:'pw:api', title:'Screenshot', subtitle:"getByText(/Garden tasks/i).first()", duration:1, steps:[]},
+  {category:'pw:api', title:'Click', subtitle:"getByRole('button', { name: /colou?r/i }).first()", duration:1, steps:[]},
+];
+const reporter = new Reporter();
+reporter.onTestEnd({id:'t'}, {status:'failed', steps, error:{message:'expect(received).toBe(expected)'}});
+const text = reporter.rows.t.join('\n');
+assert(text.includes('Actions preceding the final failed step'), 'no trace: ' + text);
+assert(text.includes('Garden tasks'), 'screenshot target missing: ' + text);
+assert(text.includes('colou?r'), 'click target missing: ' + text);
+reporter.onTestEnd({id:'ok'}, {status:'passed', steps});
+assert(!reporter.rows.ok.join('\n').includes('Actions preceding'), 'trace leaked into a passing test');
+"""
+        result = subprocess.run(['node', '-e', script, str(self.REPORTER)], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_should_stay_bounded_when_targets_are_long(self):
+        script = r"""
+const assert = require('assert'); const Reporter = require(process.argv[1]);
+const steps = Array.from({length:10}, (_, i) => ({category:'pw:api', title:'Click',
+  subtitle:'getByRole("button", { name: /' + 'x'.repeat(4000) + i + '/i })', duration:1, steps:[]}));
+steps.push({category:'pw:api', title:'Click', subtitle:'y'.repeat(4000), duration:2,
+            error:{message:'boom'}, steps:[]});
+const reporter = new Reporter(); reporter.onTestEnd({id:'t'}, {status:'failed', steps});
+const rows = reporter.rows.t;
+assert(rows.length <= 8 && rows.every(x => x.length <= 2000), 'unbounded diagnostics');
+"""
+        result = subprocess.run(['node', '-e', script, str(self.REPORTER)], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class ApiFailureDiagnosticsTests(unittest.TestCase):
+    """The page observer reported failed navigations only. A generated app does
+    most of its work over fetch/XHR, so a 500 from its own API left the page
+    empty and the evidence silent about why."""
+
+    def test_should_report_a_failed_api_request_without_changing_verdict(self):
+        from acceptance import AcceptanceRunner
+        import os
+        install = os.environ.get('OCTOS_TEST_PLAYWRIGHT_ROOT')
+        if not install:
+            self.skipTest('requires installed Playwright')
+        root = Path(install)
+        with tempfile.TemporaryDirectory(prefix='api-error-', dir=root) as folder:
+            base = Path(folder); specs = base/'source'; specs.mkdir()
+            source = """import {test,expect} from '@playwright/test';
+for (const fail of [false,true]) test('api status '+fail,async({page})=>{
+ await page.route('http://example.test/api/**', route=>route.fulfill({status:500,contentType:'application/json',body:'{}'}));
+ await page.route('http://example.test/', route=>route.fulfill({status:200,contentType:'text/html',body:'<h1>Notes</h1>'}));
+ await page.goto('http://example.test/');
+ await page.evaluate(() => fetch('/api/notes?token=private-value').catch(() => {}));
+ await page.waitForTimeout(300);
+ expect(fail).toBe(false);
+});
+"""
+            spec = specs/'api.spec.ts'; spec.write_text(source)
+            runner = AcceptanceRunner(root, specs, base/'prepared', lambda _: None, workers=1)
+            result = runner.run(['api.spec.ts'], 'http://127.0.0.1:1')
+            self.assertEqual((result.passed, result.total), (1, 2), result.error)
+            self.assertEqual(spec.read_text(), source)
+            summary = failure_summaries(result)
+            self.assertIn('HTTP 500', summary)
+            self.assertIn('/api/notes', summary)
+            diagnostics = summary.split('Browser diagnostics', 1)[-1]
+            self.assertNotIn('private-value', diagnostics)
+
+
+class ConsoleErrorDiagnosticsTests(unittest.TestCase):
+    """An app that catches its own failure and logs it renders a placeholder and
+    throws nothing, so `pageerror` never fires and the cause is lost."""
+
+    BODY = ("<h1>Notes</h1><div id=list>Failed to load notes</div><script>"
+            "try { JSON.parse('not json'); } catch (e) { console.error('loadNotes failed', e.message); }"
+            "console.log('chatty startup log'); console.warn('deprecated call');"
+            "</script>")
+
+    def test_should_report_a_caught_error_the_app_logged(self):
+        from acceptance import AcceptanceRunner
+        import json, os
+        install = os.environ.get('OCTOS_TEST_PLAYWRIGHT_ROOT')
+        if not install:
+            self.skipTest('requires installed Playwright')
+        root = Path(install)
+        with tempfile.TemporaryDirectory(prefix='console-error-', dir=root) as folder:
+            base = Path(folder); specs = base / 'source'; specs.mkdir()
+            source = ("import {test,expect} from '@playwright/test';\n"
+                      "const BODY = " + json.dumps(self.BODY) + ";\n"
+                      "for (const fail of [false,true]) test('console status '+fail,async({page})=>{\n"
+                      " await page.route('http://example.test/**', route=>route.fulfill("
+                      "{status:200,contentType:'text/html',body:BODY}));\n"
+                      " await page.goto('http://example.test/');\n"
+                      " await page.waitForTimeout(200);\n"
+                      " expect(fail).toBe(false);\n"
+                      "});\n")
+            spec = specs / 'console.spec.ts'; spec.write_text(source)
+            runner = AcceptanceRunner(root, specs, base / 'prepared', lambda _: None, workers=1)
+            result = runner.run(['console.spec.ts'], 'http://127.0.0.1:1')
+            self.assertEqual((result.passed, result.total), (1, 2), result.error)
+            self.assertEqual(spec.read_text(), source)
+            summary = failure_summaries(result)
+            self.assertIn('loadNotes failed', summary)
+            # Ordinary chatter must not crowd out the real diagnostics.
+            self.assertNotIn('chatty startup log', summary)
+            self.assertNotIn('deprecated call', summary)
+
+
+class BuildFailureEvidenceTests(unittest.TestCase):
+    """npm and bundlers print the cause first and a wall of exit boilerplate
+    after it, so a tail-only excerpt of a failed build can be all noise."""
+
+    def test_should_keep_both_ends_of_a_long_tool_log(self):
+        cause = "src/app.js:12:3: ERROR: Cannot find module './notes-store'"
+        noise = "\n".join(f"npm ERR! trailing line {i}" for i in range(200))
+        text = f"{cause}\n{noise}\nnpm ERR! exit status 1"
+        kept = clip_ends(text, 600)
+        self.assertLessEqual(len(kept), 700)
+        self.assertIn(cause, kept)
+        self.assertIn("npm ERR! exit status 1", kept)
+        self.assertIn("elided", kept)
+
+    def test_should_leave_short_output_untouched(self):
+        self.assertEqual(clip_ends("  short build log  ", 600), "short build log")
+
+    def test_should_report_the_cause_of_a_real_failed_build(self):
+        from acceptance import AppServer
+        with tempfile.TemporaryDirectory(prefix='build-failure-') as folder:
+            root = Path(folder)
+            (root / "frontend").mkdir(); (root / "backend").mkdir()
+            (root / "frontend" / "package.json").write_text(
+                '{"name":"f","private":true,"scripts":{"build":"node build.js"}}')
+            (root / "frontend" / "build.js").write_text(
+                "console.error(\"src/app.js:12:3: ERROR: Cannot find module './notes-store'\");\n"
+                "for (let i = 0; i < 60; i++) console.error("
+                "`npm ERR! trailing diagnostic ${i} - a complete log of this run can be found in "
+                "/root/.npm/_logs/2026-09-16T04_00_00_000Z-debug-${i}.log`);\n"
+                "process.exit(1);\n")
+            (root / "backend" / "package.json").write_text(
+                '{"name":"b","private":true,"scripts":{"start":"node server.js"}}')
+            (root / "backend" / "server.js").write_text("")
+            error = AppServer(root, 3999, lambda _: None).build()
+            self.assertIsNotNone(error)
+            self.assertIn("Cannot find module", error)
+            # And what the rehearsal repair turn is handed must still name it.
+            import main
+            prompt = main.REHEARSAL_REPAIR_PROMPT.format(error=clip_ends(error, 1200), port=3000, smoke=3100)
+            self.assertIn("Cannot find module", prompt)
+
+
+class BoundPortEvidenceTests(unittest.TestCase):
+    """A backend that ignores PORT and binds its own is a common way to miss the
+    expected port; a bare timeout says nothing about where it went."""
+
+    def test_should_name_the_port_the_backend_bound_instead(self):
+        from acceptance import AppServer
+        with tempfile.TemporaryDirectory(prefix='wrong-port-') as folder:
+            root = Path(folder)
+            (root / "frontend").mkdir(); (root / "backend").mkdir()
+            (root / "backend" / "package.json").write_text(
+                '{"name":"b","private":true,"scripts":{"start":"node server.js"}}')
+            # Ignores PORT, the way a hardcoded server does.
+            (root / "backend" / "server.js").write_text(
+                "require('http').createServer((q,s)=>s.end('ok')).listen(38217);\n")
+            server = AppServer(root, 38218, lambda _: None)
+            try:
+                error = server.start(wait_seconds=8)
+            finally:
+                server.stop()
+            self.assertIsNotNone(error)
+            self.assertIn("did not bind port 38218", error)
+            self.assertIn("38217", error)
+
+    def test_should_say_so_when_nothing_in_the_tree_is_listening(self):
+        from acceptance import AppServer
+        with tempfile.TemporaryDirectory(prefix='no-port-') as folder:
+            root = Path(folder)
+            (root / "frontend").mkdir(); (root / "backend").mkdir()
+            (root / "backend" / "package.json").write_text(
+                '{"name":"b","private":true,"scripts":{"start":"node server.js"}}')
+            (root / "backend" / "server.js").write_text("setTimeout(() => {}, 60000);\n")
+            server = AppServer(root, 38219, lambda _: None)
+            try:
+                error = server.start(wait_seconds=6)
+            finally:
+                server.stop()
+            self.assertIsNotNone(error)
+            self.assertIn("did not bind port 38219", error)
+            self.assertIn("Nothing started from the app tree is listening", error)
+
+
+class GraderParityTests(unittest.TestCase):
+    """The official config that grades a run (read from cloud 3ffe9702bf15):
+
+        timeout: 10000, expect: { timeout: 10000 }, fullyParallel: false,
+        workers: 4, use: { baseURL, channel: 'chromium', trace/screenshot off }
+
+    Anything stricter here fails tests grading would pass, and the harness then
+    spends repair rounds on them."""
+
+    def _config(self, timeout_ms=10000):
+        from acceptance import AcceptanceRunner
+        with tempfile.TemporaryDirectory(prefix='grader-parity-') as folder:
+            base = Path(folder); specs = base / 'source'; specs.mkdir()
+            (specs / 'a.spec.ts').write_text("import {test} from '@playwright/test';\ntest('a',()=>{});\n")
+            runner = AcceptanceRunner(base / 'pw', specs, base / 'prepared', lambda _: None,
+                                      timeout_ms=timeout_ms, workers=1)
+            return runner._prepare().read_text()
+
+    def test_should_give_expect_the_whole_test_timeout(self):
+        self.assertIn('expect: { timeout: 10000 }', self._config())
+        self.assertIn('timeout: 10000', self._config())
+
+    def test_should_not_add_an_action_or_navigation_deadline_of_its_own(self):
+        config = self._config()
+        self.assertNotIn('actionTimeout', config)
+        self.assertNotIn('navigationTimeout', config)
+
+    def test_should_keep_the_graders_serial_ordering_by_default(self):
+        self.assertIn('fullyParallel: false', self._config())
+
+
+class MutatedStoresTests(unittest.TestCase):
+    """A spec that passes alone and fails in the suite usually shares state
+    through a file the app writes. `snapshot_worktree` staged the tree before the
+    run, so afterwards git already knows which files that was."""
+
+    def _repo(self):
+        root = Path(tempfile.mkdtemp())
+        env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t",
+               "GIT_COMMITTER_EMAIL": "t@x", "PATH": "/usr/bin:/bin:/opt/homebrew/bin"}
+        run = lambda args: subprocess.run(["git", *args], cwd=root, check=False,  # noqa: E731
+                                          capture_output=True, text=True, env=env)
+        run(["init", "-q"])
+        (root / "backend" / "data").mkdir(parents=True)
+        (root / "frontend").mkdir()
+        (root / "backend" / "data" / "notes.json").write_text('["seed"]')
+        (root / "backend" / "server.js").write_text("v1")
+        run(["add", "-A"]); run(["commit", "-qm", "init"])
+        return root, run
+
+    def test_should_name_the_files_a_test_run_changed(self):
+        from acceptance import mutated_by_tests, snapshot_worktree
+        root, run = self._repo()
+        snapshot_worktree(run)
+        (root / "backend" / "data" / "notes.json").write_text('["seed","added by a test"]')
+        self.assertEqual(mutated_by_tests(run), ["backend/data/notes.json"])
+
+    def test_should_say_nothing_when_the_run_changed_nothing(self):
+        from acceptance import mutated_by_tests, snapshot_worktree
+        root, run = self._repo()
+        snapshot_worktree(run)
+        self.assertEqual(mutated_by_tests(run), [])
+
+    def test_should_not_report_the_models_own_edits(self):
+        from acceptance import mutated_by_tests, snapshot_worktree
+        root, run = self._repo()
+        (root / "backend" / "server.js").write_text("v2 (a repair edit)")
+        snapshot_worktree(run)  # the edit is part of the snapshot, not of the run
+        self.assertEqual(mutated_by_tests(run), [])
+
+
+class StallDetectionTests(unittest.TestCase):
+    """Cloud e767e871a6c6 spent four full-suite rounds on eleven failures that
+    never moved. A twelfth, REQ-2.7.4, flaked in and out, so every round looked
+    different from the one before and the stall was never noticed."""
+
+    def _summary(self, failing):
+        from acceptance import RunSummary, TestOutcome
+        names = ["REQ-a", "REQ-b", "REQ-flaky"]
+        rows = [TestOutcome(title=n, ok=n not in failing, status="failed" if n in failing else "passed",
+                            duration_ms=1, file=f"{n}.spec.ts", message="TimeoutError" if n in failing else "")
+                for n in names]
+        return RunSummary(passed=sum(1 for r in rows if r.ok), total=3, results=rows)
+
+    def test_should_see_a_stall_through_one_flaky_spec(self):
+        from acceptance import failure_signature
+        unstable = frozenset({"REQ-flaky.spec.ts"})
+        a = self._summary({"REQ-a", "REQ-b", "REQ-flaky"})
+        b = self._summary({"REQ-a", "REQ-b"})
+        self.assertNotEqual(failure_signature(a), failure_signature(b))          # today: looks like progress
+        self.assertEqual(failure_signature(a, unstable), failure_signature(b, unstable))
+
+    def test_should_still_see_real_progress(self):
+        from acceptance import failure_signature
+        unstable = frozenset({"REQ-flaky.spec.ts"})
+        a = self._summary({"REQ-a", "REQ-b"})
+        b = self._summary({"REQ-a"})
+        self.assertNotEqual(failure_signature(a, unstable), failure_signature(b, unstable))
+
+    def test_should_behave_as_before_with_nothing_unstable(self):
+        from acceptance import failure_signature
+        a = self._summary({"REQ-a"})
+        self.assertEqual(failure_signature(a), failure_signature(a, frozenset()))
+
+
+class StartupErrorDigestTests(unittest.TestCase):
+    """A start failure must hand the repair turn the line that names the cause.
+
+    Sample is the real capture from local TB REQ-1 round 0 (2026-09-17): npm's
+    preamble plus Node's misleading ES-module warning filled the head slice, so the
+    repair turn never saw `Identifier '__dirname' has already been declared`.
+    """
+
+    SAMPLE = (
+        "backend `npm start` exited early (rc=1):\n"
+        "\n"
+        "> start\n"
+        "> node server.js\n"
+        "\n"
+        "(node:77941) Warning: Failed to load the ES module: "
+        "/Users/mac/Desktop/code/octos-org/octos-arc-0917/arc/arc-output/tb-glm-0917/backend/server.js. "
+        'Make sure to set "type": "module" in the nearest package.json file or use the .mjs extension.\n'
+        "(Use `node --trace-warnings ...` to show where the warning was created)\n"
+        "/Users/mac/Desktop/code/octos-org/octos-arc-0917/arc/arc-output/tb-glm-0917/backend/server.js:11\n"
+        "const __dirname = path.resolve(__dirname);\n"
+        "      ^\n"
+        "\n"
+        "SyntaxError: Identifier '__dirname' has already been declared\n"
+        "    at wrapSafe (node:internal/modules/cjs/loader:1861:18)\n"
+    )
+
+    def test_should_keep_the_real_error(self):
+        from acceptance import startup_error_digest
+        out = startup_error_digest(self.SAMPLE, 600)
+        self.assertIn("Identifier '__dirname' has already been declared", out)
+
+    def test_should_drop_the_misleading_esm_warning(self):
+        from acceptance import startup_error_digest
+        out = startup_error_digest(self.SAMPLE, 600)
+        self.assertNotIn("Failed to load the ES module", out)
+        self.assertNotIn("--trace-warnings", out)
+
+    def test_should_keep_the_harness_header(self):
+        from acceptance import startup_error_digest
+        self.assertTrue(startup_error_digest(self.SAMPLE, 600).startswith("backend `npm start` exited early"))
+
+    def test_should_free_most_of_the_budget_for_the_stack(self):
+        """Pins why this helper exists: the warning is a wrong lead, not a lost error.
+
+        A 600-character head slice of this capture does still reach the SyntaxError
+        (measured at character 530), so the gain is budget and a correct lead, not
+        recovering something that was cut off.
+        """
+        from acceptance import startup_error_digest
+        self.assertIn("SyntaxError", self.SAMPLE[:600])
+        self.assertLess(len(startup_error_digest(self.SAMPLE, 600)),
+                        len(self.SAMPLE[:600]) - 180)
+
+    def test_should_fall_back_to_the_tail_when_no_marker_matches(self):
+        from acceptance import startup_error_digest
+        text = "backend `npm start` exited early (rc=1):\n" + "\n".join(f"noise line {i}" for i in range(200))
+        out = startup_error_digest(text, 120)
+        self.assertIn("noise line 199", out)
+        self.assertLessEqual(len(out), 120)
+
+    def test_should_respect_the_limit(self):
+        from acceptance import startup_error_digest
+        self.assertLessEqual(len(startup_error_digest(self.SAMPLE, 80)), 80)
+
+    def test_should_survive_empty_output(self):
+        from acceptance import startup_error_digest
+        self.assertEqual(startup_error_digest("", 600), "")
