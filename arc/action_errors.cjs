@@ -21,6 +21,21 @@ module.exports = class ActionErrors {
     const seen = new Set();
     const recentActions = [];
     let precedingFailure = [];
+    // Playwright puts the locator (or the URL) an action ran against in the
+    // step's subtitle. Without it a trace reads "Hover -> Click -> Click" and
+    // never shows that the click landed on a different item's control.
+    // A navigation subtitle is a bare URL and carries whatever the test put in
+    // its query or fragment; keep routing evidence without those values, the way
+    // the page observer already does. Locator expressions always have a call in
+    // them, so they keep any `?` they contain.
+    const target = subtitle => {
+      const text = String(subtitle);
+      return text.includes('(') ? text : text.split(/[?#]/)[0];
+    };
+    const describe = (step, titleLimit, targetLimit) => {
+      const suffix = step.subtitle ? ' ' + clip(target(step.subtitle), targetLimit) : '';
+      return clip(step.title, titleLimit) + suffix;
+    };
     const visit = steps => {
       for (const step of steps || []) {
         const message = String(step.error?.message || '').replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');
@@ -28,7 +43,7 @@ module.exports = class ActionErrors {
         if (step.category === 'pw:api') {
           // Locator probes can otherwise evict the actions that changed the page.
           if (!message && !/^Query\b/i.test(step.title)) {
-            recentActions.push(clip(step.title, 160));
+            recentActions.push(describe(step, 40, 120));
             if (recentActions.length > 6) recentActions.shift();
           }
         }
@@ -36,15 +51,19 @@ module.exports = class ActionErrors {
           seen.add(message);
           const location = step.location ? ` at ${clip(path.basename(step.location.file), 160)}:${step.location.line}` : '';
           errors.push({ order: errors.length, duration: step.duration || 0,
-            text: `${clip(step.title, 200)} (${step.duration || 0} ms)${location}:\n${clip(message, 1800)}` });
+            text: `${describe(step, 200, 200)} (${step.duration || 0} ms)${location}:\n${clip(message, 1800)}` });
         }
         visit(step.steps);
       }
     };
     visit(result.steps);
-    if (result.status !== 'passed' && result.status !== 'skipped' && precedingFailure.length) {
+    // A spec that compares values it collected itself raises outside any
+    // Playwright call, so no step carries the error and there is nothing to cut
+    // the trace at. Everything the test did is then the trace.
+    const preceding = precedingFailure.length ? precedingFailure : recentActions;
+    if (result.status !== 'passed' && result.status !== 'skipped' && preceding.length) {
       errors.push({order:-1, duration:Number.MAX_SAFE_INTEGER,
-        text:'Actions preceding the final failed step (diagnostic only):\n'+precedingFailure.join(' -> ')});
+        text:'Actions preceding the final failed step (diagnostic only):\n'+preceding.join(' -> ')});
     }
     // Keep the most time-consuming failures, then present them in execution order.
     this.rows[test.id] = errors.sort((a,b) => b.duration-a.duration).slice(0,8)

@@ -53,27 +53,37 @@ does not prove the original project passed any tests.
 
 The repository's `arc-runtime-lock.json` contains the verified Linux x86_64
 release manifest. Actual coding verifies this immutable state before execution.
-A release manifest must contain:
+A release manifest must name the downstream repository that published the
+release, and the release URL must live under that same repository:
 
 ```json
 {
   "schema_version": 1,
+  "repository": "<owner>/<repository> that published the release",
   "runtime_release": {
-    "version": "v2.0.3-rc.11-arc.10",
+    "version": "v2.0.3-rc.11-arc.14",
     "source_commit": "<40-character build commit>",
     "target": "x86_64-unknown-linux-gnu",
     "binary_sha256": "<64-character executable SHA-256>",
     "archive_sha256": "<64-character archive SHA-256>",
-    "url": "https://github.com/octos-org/octos-arc/releases/download/<immutable downstream tag>/<artifact>"
+    "url": "https://github.com/<owner>/<repository>/releases/download/<immutable downstream tag>/<artifact>"
   }
 }
 ```
 
+`repository` is the authority for the URL: a manifest that names one repository
+while pointing at another's release is refused, so a fork cannot silently
+inherit upstream's binary. It must be a plain `owner/repository` pair — the
+value is interpolated into the release URL.
+
 Use a clean checkout and fresh build for release provenance. Create the final
 manifest after building; do not embed the binary's own checksum in its source.
 This crate verifies the current executable. `arc/main.py` downloads the pinned
-archive and verifies its SHA-256 before extraction; the environment may override
-the URL only explicitly for controlled tests.
+archive but does NOT verify its SHA-256 before extraction — it only checks that
+the archive contains an `octos` member. The lock is not part of the packed
+bundle (`pack.sh`), so `main.py`'s `OCTOS_RELEASE_URL` constant cannot read it
+and MUST be bumped together with the manifest. The environment may override that
+URL only explicitly for controlled tests.
 
 Normal execution additionally needs `OPENAI_API_KEY`, explicit `--model`/`MODEL`
 and `--base-url`/`OPENAI_BASE_URL`. Optional `--temperature` records an explicit
