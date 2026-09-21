@@ -1,15 +1,21 @@
 //! Edit file tool for making precise text replacements.
 
-use std::path::PathBuf;
+use std::ops::Range;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use eyre::Result;
 use serde::Deserialize;
+use serde_json::json;
 use tracing::warn;
 
 use super::write_grant::WritePathGrant;
 use super::{ConcurrencyClass, Tool, ToolContext, ToolResult};
 use crate::policy::{FileAccessMode, FilesystemScope};
+
+const MAX_RENDERED_CANDIDATES: usize = 3;
+const CANDIDATE_EXCERPT_BYTES: usize = 512;
+const EDIT_REJECTION_OUTPUT_BYTES: usize = 3072;
 
 /// Tool for editing files via string replacement.
 pub struct EditFileTool {
@@ -23,6 +29,7 @@ pub struct EditFileTool {
     /// is refused (allowlisted paths may only be created); otherwise edits
     /// follow the allowlist. `None` = pre-#1976 behaviour.
     write_grant: Option<WritePathGrant>,
+    local_edit_enabled: bool,
 }
 
 impl EditFileTool {
@@ -33,6 +40,7 @@ impl EditFileTool {
             filesystem_scope: FilesystemScope::Workspace,
             file_access: FileAccessMode::ReadWrite,
             write_grant: None,
+            local_edit_enabled: false,
         }
     }
 
@@ -54,6 +62,181 @@ impl EditFileTool {
         self.write_grant = Some(write_grant);
         self
     }
+
+    /// Enable typed, bounded recovery evidence for rejected edits.
+    pub fn with_local_edit_enabled(mut self, enabled: bool) -> Self {
+        self.local_edit_enabled = enabled;
+        self
+    }
+}
+
+fn displayed_path(path: &str) -> String {
+    truncate_to_budget(&metadata_path(path), 96)
+}
+
+fn metadata_path(path: &str) -> String {
+    if Path::new(path).is_absolute() {
+        Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("<file>")
+            .to_string()
+    } else {
+        path.to_string()
+    }
+}
+
+fn truncate_to_budget(text: &str, budget: usize) -> String {
+    if text.len() <= budget {
+        return text.to_string();
+    }
+    const SUFFIX: &str = "...";
+    let mut end = budget.saturating_sub(SUFFIX.len()).min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &text[..end], SUFFIX)
+}
+
+fn candidate_excerpt(content: &str, range: &Range<usize>) -> String {
+    const MARKER_BYTES: usize = 6;
+    if range.len() + MARKER_BYTES >= CANDIDATE_EXCERPT_BYTES {
+        let matched = &content[range.clone()];
+        let head_budget = (CANDIDATE_EXCERPT_BYTES - MARKER_BYTES) / 2;
+        let tail_budget = CANDIDATE_EXCERPT_BYTES - MARKER_BYTES - head_budget;
+        let mut head_end = head_budget.min(matched.len());
+        while head_end > 0 && !matched.is_char_boundary(head_end) {
+            head_end -= 1;
+        }
+        let mut tail_start = matched.len().saturating_sub(tail_budget);
+        while tail_start < matched.len() && !matched.is_char_boundary(tail_start) {
+            tail_start += 1;
+        }
+        let raw = format!("{}[...]{}", &matched[..head_end], &matched[tail_start..]);
+        return truncate_to_budget(
+            &crate::sanitize::sanitize_tool_output(&raw),
+            CANDIDATE_EXCERPT_BYTES,
+        );
+    }
+
+    let context_budget = CANDIDATE_EXCERPT_BYTES - range.len();
+    let mut start = range.start.saturating_sub(context_budget / 2);
+    while start < range.start && !content.is_char_boundary(start) {
+        start += 1;
+    }
+    let mut end =
+        (range.end + context_budget.saturating_sub(range.start - start)).min(content.len());
+    while end > range.end && !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    let prefix = if start > 0 { "..." } else { "" };
+    let suffix = if end < content.len() { "..." } else { "" };
+    let raw = format!("{prefix}{}{suffix}", &content[start..end]);
+    let safe = crate::sanitize::sanitize_tool_output(&raw);
+    truncate_to_budget(&safe, CANDIDATE_EXCERPT_BYTES)
+}
+
+struct EditRejection<'a> {
+    code: &'static str,
+    path: &'a str,
+    current_bytes: &'a [u8],
+    content: Option<&'a str>,
+    old_string: &'a str,
+    matcher: &'static str,
+    occurrence_count: usize,
+    candidates: &'a [super::replacer::ReplacementCandidate],
+    reason: &'static str,
+}
+
+fn typed_edit_rejection(
+    rejection: EditRejection<'_>,
+) -> super::mutation_guard::MutationTransformError {
+    let current_digest = crate::file_state_cache::FileVersion::sha256(rejection.current_bytes);
+    let searched_old_digest =
+        crate::file_state_cache::FileVersion::sha256(rejection.old_string.as_bytes());
+    let digest = current_digest
+        .strip_prefix("sha256:")
+        .unwrap_or(&current_digest);
+    let short_version = format!("sha256:{}...", &digest[..digest.len().min(12)]);
+    let metadata_path = metadata_path(rejection.path);
+    let shown_path = displayed_path(rejection.path);
+    let remedy = "retry_with_current_exact_text";
+    let mut output = format!(
+        "[{}] path={shown_path} count={} \
+         current={short_version} remedy={remedy}",
+        rejection.code, rejection.occurrence_count
+    );
+    let mut rendered_candidates = Vec::new();
+
+    if let Some(content) = rejection.content {
+        for candidate in rejection.candidates.iter().take(MAX_RENDERED_CANDIDATES) {
+            let excerpt = candidate_excerpt(content, &candidate.range);
+            let score_text = candidate
+                .score
+                .map(|score| format!(" score={score:.3}"))
+                .unwrap_or_default();
+            let summary = format!(
+                "\nc{} suggestion=true lines={}-{} matcher={}{}",
+                rendered_candidates.len() + 1,
+                candidate.lines.start,
+                candidate.lines.end,
+                candidate.matcher,
+                score_text
+            );
+            if output.len() + summary.len() > EDIT_REJECTION_OUTPUT_BYTES {
+                break;
+            }
+            output.push_str(&summary);
+            rendered_candidates.push((candidate, excerpt));
+        }
+    }
+
+    let mut candidate_metadata = Vec::with_capacity(rendered_candidates.len());
+    for (index, (candidate, excerpt)) in rendered_candidates.into_iter().enumerate() {
+        let body = format!("\ncandidate {} excerpt:\n{}", index + 1, excerpt);
+        if output.len() + body.len() <= EDIT_REJECTION_OUTPUT_BYTES {
+            output.push_str(&body);
+        }
+        candidate_metadata.push(json!({
+            "byte_range": {
+                "start": candidate.range.start,
+                "end": candidate.range.end,
+            },
+            "line_range": {
+                "start": candidate.lines.start,
+                "end": candidate.lines.end,
+            },
+            "matcher": candidate.matcher,
+            "score": candidate.score,
+            "suggestion": true,
+            "excerpt": excerpt,
+        }));
+    }
+
+    let output_document = crate::output_recovery::OutputDocument::unavailable(output.clone());
+    super::mutation_guard::MutationTransformError::Rejected(
+        super::mutation_guard::MutationRejection::new(ToolResult {
+            output,
+            output_document: Some(output_document),
+            success: false,
+            structured_metadata: Some(json!({
+                "error_code": rejection.code,
+                "path": metadata_path,
+                "current_version": {
+                    "content_sha256": current_digest,
+                    "size": rejection.current_bytes.len(),
+                },
+                "searched_old_digest": searched_old_digest,
+                "reason": rejection.reason,
+                "matcher": rejection.matcher,
+                "occurrence_count": rejection.occurrence_count,
+                "candidates": candidate_metadata,
+                "remedy": remedy,
+                "file_modified": false,
+            })),
+            ..Default::default()
+        }),
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -210,7 +393,9 @@ impl Tool for EditFileTool {
             None
         };
 
-        if input.old_string.is_empty() {
+        let local_edit_enabled =
+            self.local_edit_enabled || super::registry::local_edit_execution_enabled();
+        if input.old_string.is_empty() && !local_edit_enabled {
             return Ok(ToolResult {
                 output: "old_string must not be empty".to_string(),
                 success: false,
@@ -220,6 +405,7 @@ impl Tool for EditFileTool {
 
         let old_string = input.old_string.clone();
         let new_string = input.new_string.clone();
+        let display_path = input.path.clone();
         let guarded = super::mutation_guard::rewrite_existing(
             ctx,
             &workspace_root,
@@ -227,39 +413,114 @@ impl Tool for EditFileTool {
             super::mutation_guard::ExpectedVersionPolicy::Optional,
             None,
             opened_file,
-            move |bytes| {
-                let content = std::str::from_utf8(bytes)
-                    .map_err(|_| "File is not valid UTF-8 and cannot be edited".to_string())?;
-                let (range, replacer_name) =
-                    match super::replacer::find_replacement(content, &old_string) {
-                        super::replacer::ChainOutcome::Match { range, replacer } => {
-                            (range, replacer)
-                        }
-                        super::replacer::ChainOutcome::Ambiguous { count, replacer } => {
-                            return Err(format!(
-                                "Found {count} occurrences of the string (via {replacer} \
+            move |bytes| -> Result<_, super::mutation_guard::MutationTransformError> {
+                if old_string.is_empty() {
+                    return Err(typed_edit_rejection(EditRejection {
+                        code: "invalid_edit_input",
+                        path: &display_path,
+                        current_bytes: bytes,
+                        content: None,
+                        old_string: &old_string,
+                        matcher: "none",
+                        occurrence_count: 0,
+                        candidates: &[],
+                        reason: "empty_old_string",
+                    }));
+                }
+                let content = match std::str::from_utf8(bytes) {
+                    Ok(content) => content,
+                    Err(_) if local_edit_enabled => {
+                        return Err(typed_edit_rejection(EditRejection {
+                            code: "invalid_edit_input",
+                            path: &display_path,
+                            current_bytes: bytes,
+                            content: None,
+                            old_string: &old_string,
+                            matcher: "none",
+                            occurrence_count: 0,
+                            candidates: &[],
+                            reason: "invalid_utf8",
+                        }));
+                    }
+                    Err(_) => {
+                        return Err("File is not valid UTF-8 and cannot be edited"
+                            .to_string()
+                            .into());
+                    }
+                };
+                let evidence = super::replacer::find_replacement_evidence(content, &old_string);
+                let (range, replacer_name) = match evidence.outcome.clone() {
+                    super::replacer::ChainOutcome::Match { range, replacer } => (range, replacer),
+                    super::replacer::ChainOutcome::Ambiguous { count, replacer }
+                        if local_edit_enabled =>
+                    {
+                        return Err(typed_edit_rejection(EditRejection {
+                            code: "edit_ambiguous",
+                            path: &display_path,
+                            current_bytes: bytes,
+                            content: Some(content),
+                            old_string: &old_string,
+                            matcher: replacer,
+                            occurrence_count: count,
+                            candidates: &evidence.candidates,
+                            reason: "ambiguous_current_matches",
+                        }));
+                    }
+                    super::replacer::ChainOutcome::Ambiguous { count, replacer } => {
+                        return Err(format!(
+                            "Found {count} occurrences of the string (via {replacer} \
                                  replacer). Please provide more context to make the match unique.",
-                            ));
-                        }
-                        super::replacer::ChainOutcome::NoMatch => {
-                            return Err(format!(
-                                "String not found in file. No exact match, and no fuzzy match via \
+                        )
+                        .into());
+                    }
+                    super::replacer::ChainOutcome::NoMatch if local_edit_enabled => {
+                        return Err(typed_edit_rejection(EditRejection {
+                            code: "edit_no_match",
+                            path: &display_path,
+                            current_bytes: bytes,
+                            content: Some(content),
+                            old_string: &old_string,
+                            matcher: "none",
+                            occurrence_count: 0,
+                            candidates: &evidence.candidates,
+                            reason: "no_safe_match",
+                        }));
+                    }
+                    super::replacer::ChainOutcome::NoMatch => {
+                        return Err(format!(
+                            "String not found in file. No exact match, and no fuzzy match via \
                                  the line-trimmed, whitespace-normalized, indentation-flexible, \
                                  escape-normalized or block-anchor replacers.\n\nSearched for:\n\
                                  ```\n{old_string}\n```"
-                            ));
-                        }
-                    };
-                let (guard_needle, splice_new) = if replacer_name == "escape_normalized" {
-                    (
-                        super::replacer::unescape_find(&old_string),
-                        super::replacer::unescape_find(&new_string),
-                    )
+                        )
+                        .into());
+                    }
+                };
+                let guard_needle = if replacer_name == "escape_normalized" {
+                    super::replacer::unescape_find(&old_string)
                 } else {
-                    (old_string, new_string)
+                    old_string.clone()
+                };
+                let splice_new = if replacer_name == "escape_normalized" {
+                    super::replacer::unescape_find(&new_string)
+                } else {
+                    new_string
                 };
                 let matched_text = &content[range.clone()];
                 if super::replacer::is_disproportionate_match(matched_text, &guard_needle) {
+                    if local_edit_enabled {
+                        return Err(typed_edit_rejection(EditRejection {
+                            code: "edit_no_match",
+                            path: &display_path,
+                            current_bytes: bytes,
+                            content: Some(content),
+                            old_string: &old_string,
+                            matcher: replacer_name,
+                            occurrence_count: 0,
+                            candidates: &evidence.candidates,
+                            reason: "disproportionate_fuzzy_span",
+                        }));
+                    }
                     return Err(format!(
                         "Fuzzy match rejected as disproportionate: the {replacer_name} replacer \
                          matched {} lines / {} bytes for an old_string of {} lines / {} bytes. \
@@ -268,7 +529,8 @@ impl Tool for EditFileTool {
                         matched_text.len(),
                         guard_needle.lines().count(),
                         guard_needle.len(),
-                    ));
+                    )
+                    .into());
                 }
                 let mut new_content =
                     String::with_capacity(content.len() - range.len() + splice_new.len());
@@ -426,6 +688,263 @@ mod tests {
 
         assert!(!result.success);
         assert!(result.output.contains("3 occurrences"));
+    }
+
+    #[tokio::test]
+    async fn local_edit_ambiguity_returns_bounded_current_unicode_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = "开头\r\n目标 α\r\n中间\r\n目标 α\r\n更多\r\n目标 α\r\n末尾\r\n目标 α\r\n";
+        std::fs::write(dir.path().join("重复.txt"), original).unwrap();
+
+        let result = EditFileTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .execute(&serde_json::json!({
+                "path": "重复.txt",
+                "old_string": "目标 α",
+                "new_string": "替换"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.file_modified.is_none());
+        assert!(result.output.starts_with("[edit_ambiguous]"));
+        assert!(result.output.len() <= EDIT_REJECTION_OUTPUT_BYTES);
+        let metadata = result.structured_metadata.as_ref().unwrap();
+        assert_eq!(metadata["error_code"], "edit_ambiguous");
+        assert_eq!(metadata["matcher"], "exact");
+        assert_eq!(metadata["occurrence_count"], 4);
+        assert_eq!(
+            metadata["current_version"]["content_sha256"],
+            crate::file_state_cache::FileVersion::sha256(original.as_bytes())
+        );
+        assert_eq!(
+            metadata["searched_old_digest"],
+            crate::file_state_cache::FileVersion::sha256("目标 α".as_bytes())
+        );
+        let candidates = metadata["candidates"].as_array().unwrap();
+        assert_eq!(candidates.len(), MAX_RENDERED_CANDIDATES);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate["line_range"]["start"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![2, 4, 6]
+        );
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate["suggestion"] == true)
+        );
+        assert!(
+            result
+                .output_document
+                .as_ref()
+                .is_some_and(|document| document.file_read.is_none()),
+            "candidate output must not be eligible for a full-file read receipt"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("重复.txt")).unwrap(),
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn local_edit_no_match_returns_optional_current_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = "begin\ncompletely different middle here\nfinish\n";
+        std::fs::write(dir.path().join("candidate.txt"), original).unwrap();
+
+        let result = EditFileTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .execute(&serde_json::json!({
+                "path": "candidate.txt",
+                "old_string": "begin\nzzzz\nfinish",
+                "new_string": "replacement"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.output.starts_with("[edit_no_match]"));
+        assert!(result.output.contains("suggestion=true"));
+        let metadata = result.structured_metadata.as_ref().unwrap();
+        assert_eq!(metadata["error_code"], "edit_no_match");
+        assert_eq!(metadata["matcher"], "none");
+        assert_eq!(metadata["occurrence_count"], 0);
+        assert_eq!(metadata["candidates"][0]["matcher"], "block_anchor");
+        assert!(
+            metadata["candidates"][0]["score"]
+                .as_f64()
+                .is_some_and(|score| score < 0.65)
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("candidate.txt")).unwrap(),
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn local_edit_no_match_without_candidate_stays_typed_and_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = "alpha\nbeta\n";
+        std::fs::write(dir.path().join("none.txt"), original).unwrap();
+
+        let result = EditFileTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .execute(&serde_json::json!({
+                "path": "none.txt",
+                "old_string": "one\ntwo\nthree",
+                "new_string": "replacement"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.output.starts_with("[edit_no_match]"));
+        assert!(!result.output.contains("suggestion=true"));
+        assert!(
+            result.structured_metadata.as_ref().unwrap()["candidates"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("none.txt")).unwrap(),
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn local_edit_keeps_fuzzy_writes_but_types_multistage_ambiguity() {
+        let dir = tempfile::tempdir().unwrap();
+        let unique = "fn one() {\n    launch();\n}\n";
+        std::fs::write(dir.path().join("unique.rs"), unique).unwrap();
+        let tool = EditFileTool::new(dir.path()).with_local_edit_enabled(true);
+
+        let applied = tool
+            .execute(&serde_json::json!({
+                "path": "unique.rs",
+                "old_string": "fn one() {\nlaunch();\n}",
+                "new_string": "fn one() {\n    stop();\n}"
+            }))
+            .await
+            .unwrap();
+        assert!(applied.success, "{}", applied.output);
+        assert!(applied.output.contains("line_trimmed"));
+
+        let repeated = "fn a() {\n    launch();\n}\nfn b() {\n  launch();\n}\n";
+        std::fs::write(dir.path().join("repeated.rs"), repeated).unwrap();
+        let rejected = tool
+            .execute(&serde_json::json!({
+                "path": "repeated.rs",
+                "old_string": "launch(); ",
+                "new_string": "stop();"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!rejected.success);
+        let metadata = rejected.structured_metadata.as_ref().unwrap();
+        assert_eq!(metadata["error_code"], "edit_ambiguous");
+        assert_eq!(metadata["matcher"], "line_trimmed");
+        assert_eq!(metadata["occurrence_count"], 2);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("repeated.rs")).unwrap(),
+            repeated
+        );
+    }
+
+    #[tokio::test]
+    async fn local_edit_candidate_excerpt_bounds_long_unicode_line_and_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = "long-directory-name-".repeat(8);
+        std::fs::create_dir(dir.path().join(&nested)).unwrap();
+        let relative = format!("{nested}/long.txt");
+        let long_line = format!("prefix {} target suffix", "界".repeat(2000));
+        let original = format!("{long_line}\n{long_line}\n");
+        std::fs::write(dir.path().join(&relative), &original).unwrap();
+
+        let result = EditFileTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .execute(&serde_json::json!({
+                "path": relative,
+                "old_string": "target",
+                "new_string": "replacement"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.output.len() <= EDIT_REJECTION_OUTPUT_BYTES);
+        let candidates = result.structured_metadata.as_ref().unwrap()["candidates"]
+            .as_array()
+            .unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates.iter().all(|candidate| {
+            candidate["excerpt"]
+                .as_str()
+                .is_some_and(|excerpt| excerpt.len() <= CANDIDATE_EXCERPT_BYTES)
+        }));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(&relative)).unwrap(),
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn local_edit_rejection_does_not_expose_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("private.txt");
+        std::fs::write(&path, "same\nsame\n").unwrap();
+        let absolute = path.display().to_string();
+
+        let result = EditFileTool::new(dir.path())
+            .with_filesystem_scope(FilesystemScope::Host)
+            .with_local_edit_enabled(true)
+            .execute(&serde_json::json!({
+                "path": absolute,
+                "old_string": "same",
+                "new_string": "changed"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(!result.output.contains(&dir.path().display().to_string()));
+        assert_eq!(
+            result.structured_metadata.as_ref().unwrap()["path"],
+            "private.txt"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_edit_candidate_evidence_is_sanitized() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = "a".repeat(64);
+        let original = format!("{secret} target\n{secret} target\n");
+        std::fs::write(dir.path().join("secret.txt"), &original).unwrap();
+
+        let result = EditFileTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .execute(&serde_json::json!({
+                "path": "secret.txt",
+                "old_string": "target",
+                "new_string": "changed"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.output.contains(&secret));
+        assert!(result.output.contains("[hex-redacted]"));
+        let metadata = result.structured_metadata.unwrap();
+        assert!(
+            metadata["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|candidate| !candidate["excerpt"].as_str().unwrap().contains(&secret))
+        );
     }
 
     #[tokio::test]
@@ -1072,6 +1591,34 @@ mod tests {
 
         assert!(!result.success);
         assert!(result.output.contains("must not be empty"));
+    }
+
+    #[tokio::test]
+    async fn local_edit_empty_old_string_is_typed_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "content").unwrap();
+
+        let result = EditFileTool::new(dir.path())
+            .with_local_edit_enabled(true)
+            .execute(&serde_json::json!({
+                "path": "f.txt",
+                "old_string": "",
+                "new_string": "x"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert_eq!(
+            result.structured_metadata.as_ref().unwrap()["error_code"],
+            "invalid_edit_input"
+        );
+        assert_eq!(
+            result.structured_metadata.as_ref().unwrap()["reason"],
+            "empty_old_string"
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "content");
     }
 
     #[tokio::test]

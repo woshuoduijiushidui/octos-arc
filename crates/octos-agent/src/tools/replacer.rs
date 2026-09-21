@@ -28,6 +28,8 @@ use std::ops::Range;
 /// Minimum block similarity (see [`block_similarity`]) for the
 /// `block_anchor` replacer to accept a candidate block.
 const BLOCK_ANCHOR_SIMILARITY_THRESHOLD: f64 = 0.65;
+pub(crate) const MAX_REPORTED_CANDIDATES: usize = 3;
+type ScoredRange = (Range<usize>, Option<f64>);
 
 /// Outcome of running the replacer chain over a file's content.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +48,26 @@ pub(crate) enum ChainOutcome {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CandidateLineRange {
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ReplacementCandidate {
+    pub range: Range<usize>,
+    pub lines: CandidateLineRange,
+    pub matcher: &'static str,
+    pub score: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ReplacementEvidence {
+    pub outcome: ChainOutcome,
+    pub candidates: Vec<ReplacementCandidate>,
+}
+
 /// Byte span of one line's content (newline excluded).
 #[derive(Debug, Clone, Copy)]
 struct LineSpan {
@@ -61,47 +83,135 @@ impl LineSpan {
 
 /// Run the cascading replacer chain. The first stage with any matches
 /// decides the outcome (see module docs).
+#[cfg(test)]
 pub(crate) fn find_replacement(content: &str, find: &str) -> ChainOutcome {
+    find_replacement_evidence(content, find).outcome
+}
+
+pub(crate) fn find_replacement_evidence(content: &str, find: &str) -> ReplacementEvidence {
     if find.is_empty() {
-        return ChainOutcome::NoMatch;
+        return ReplacementEvidence {
+            outcome: ChainOutcome::NoMatch,
+            candidates: Vec::new(),
+        };
     }
     let lines = index_lines(content);
     for stage in 0..6u8 {
-        let (name, matches): (&'static str, Vec<Range<usize>>) = match stage {
-            0 => ("exact", exact_matches(content, find)),
-            1 => ("line_trimmed", line_trimmed_matches(content, &lines, find)),
+        let (name, matches): (&'static str, Vec<ScoredRange>) = match stage {
+            0 => (
+                "exact",
+                exact_matches(content, find)
+                    .into_iter()
+                    .map(|range| (range, None))
+                    .collect(),
+            ),
+            1 => (
+                "line_trimmed",
+                line_trimmed_matches(content, &lines, find)
+                    .into_iter()
+                    .map(|range| (range, None))
+                    .collect(),
+            ),
             2 => (
                 "whitespace_normalized",
-                whitespace_normalized_matches(content, &lines, find),
+                whitespace_normalized_matches(content, &lines, find)
+                    .into_iter()
+                    .map(|range| (range, None))
+                    .collect(),
             ),
             3 => (
                 "indentation_flexible",
-                indentation_flexible_matches(content, &lines, find),
+                indentation_flexible_matches(content, &lines, find)
+                    .into_iter()
+                    .map(|range| (range, None))
+                    .collect(),
             ),
             4 => (
                 "escape_normalized",
-                escape_normalized_matches(content, find),
+                escape_normalized_matches(content, find)
+                    .into_iter()
+                    .map(|range| (range, None))
+                    .collect(),
             ),
-            5 => ("block_anchor", block_anchor_matches(content, &lines, find)),
+            5 => (
+                "block_anchor",
+                block_anchor_candidates(content, &lines, find)
+                    .into_iter()
+                    .filter(|(_, score)| *score >= BLOCK_ANCHOR_SIMILARITY_THRESHOLD)
+                    .map(|(range, score)| (range, Some(score)))
+                    .collect(),
+            ),
             _ => unreachable!(),
         };
+        let candidates = matches
+            .iter()
+            .take(MAX_REPORTED_CANDIDATES)
+            .map(|(range, score)| replacement_candidate(content, range.clone(), name, *score))
+            .collect();
         match matches.len() {
             0 => continue,
             1 => {
-                return ChainOutcome::Match {
-                    range: matches.into_iter().next().expect("len checked"),
-                    replacer: name,
+                return ReplacementEvidence {
+                    outcome: ChainOutcome::Match {
+                        range: matches.into_iter().next().expect("len checked").0,
+                        replacer: name,
+                    },
+                    candidates,
                 };
             }
             count => {
-                return ChainOutcome::Ambiguous {
-                    count,
-                    replacer: name,
+                return ReplacementEvidence {
+                    outcome: ChainOutcome::Ambiguous {
+                        count,
+                        replacer: name,
+                    },
+                    candidates,
                 };
             }
         }
     }
-    ChainOutcome::NoMatch
+    let mut candidates = block_anchor_candidates(content, &lines, find);
+    candidates.sort_by(|(left_range, left_score), (right_range, right_score)| {
+        right_score
+            .total_cmp(left_score)
+            .then_with(|| left_range.start.cmp(&right_range.start))
+            .then_with(|| left_range.end.cmp(&right_range.end))
+    });
+    candidates.truncate(MAX_REPORTED_CANDIDATES);
+    ReplacementEvidence {
+        outcome: ChainOutcome::NoMatch,
+        candidates: candidates
+            .into_iter()
+            .map(|(range, score)| {
+                replacement_candidate(content, range, "block_anchor", Some(score))
+            })
+            .collect(),
+    }
+}
+
+fn replacement_candidate(
+    content: &str,
+    range: Range<usize>,
+    matcher: &'static str,
+    score: Option<f64>,
+) -> ReplacementCandidate {
+    let start = content.as_bytes()[..range.start]
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count()
+        + 1;
+    let last_byte = range.end.saturating_sub(1).max(range.start);
+    let end = content.as_bytes()[..last_byte]
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count()
+        + 1;
+    ReplacementCandidate {
+        range,
+        lines: CandidateLineRange { start, end },
+        matcher,
+        score,
+    }
 }
 
 /// Safety guard: reject fuzzy matches whose span is far larger than the
@@ -421,7 +531,20 @@ fn block_similarity(middle_find: &[&str], middle_content: &[&str]) -> f64 {
 /// that clears the threshold wins. Spans whose middles outnumber the
 /// needle's by more than `1/threshold` are pruned outright: even perfect
 /// pairs cannot lift them over the bar, which also bounds the scan.
+#[cfg(test)]
 fn block_anchor_matches(content: &str, lines: &[LineSpan], find: &str) -> Vec<Range<usize>> {
+    block_anchor_candidates(content, lines, find)
+        .into_iter()
+        .filter(|(_, score)| *score >= BLOCK_ANCHOR_SIMILARITY_THRESHOLD)
+        .map(|(range, _)| range)
+        .collect()
+}
+
+fn block_anchor_candidates(
+    content: &str,
+    lines: &[LineSpan],
+    find: &str,
+) -> Vec<(Range<usize>, f64)> {
     let (find_lines, trailing_newline) = split_find(find);
     if find_lines.len() < 3 {
         return Vec::new();
@@ -458,13 +581,13 @@ fn block_anchor_matches(content: &str, lines: &[LineSpan], find: &str) -> Vec<Ra
             let middle_content: Vec<&str> =
                 (i + 1..j).map(|k| lines[k].text(content).trim()).collect();
             let score = block_similarity(&middle_find, &middle_content);
-            if score >= BLOCK_ANCHOR_SIMILARITY_THRESHOLD && best.is_none_or(|(s, _)| score > s) {
+            if best.is_none_or(|(s, _)| score > s) {
                 best = Some((score, j));
             }
         }
-        if let Some((_, j)) = best {
+        if let Some((score, j)) = best {
             let n = j - i + 1;
-            out.push(window_range(content, lines, i, n, trailing_newline));
+            out.push((window_range(content, lines, i, n, trailing_newline), score));
         }
     }
     out
@@ -536,6 +659,35 @@ mod tests {
                 count: 2,
                 replacer: "exact"
             }
+        );
+    }
+
+    #[test]
+    fn evidence_should_bound_exact_candidates_and_keep_stable_lines() {
+        let content = "foo\nmiddle\nfoo\nmore\nfoo\nlast\nfoo\n";
+        let evidence = find_replacement_evidence(content, "foo");
+
+        assert_eq!(
+            evidence.outcome,
+            ChainOutcome::Ambiguous {
+                count: 4,
+                replacer: "exact"
+            }
+        );
+        assert_eq!(evidence.candidates.len(), MAX_REPORTED_CANDIDATES);
+        assert_eq!(
+            evidence
+                .candidates
+                .iter()
+                .map(|candidate| candidate.lines.start)
+                .collect::<Vec<_>>(),
+            vec![1, 3, 5]
+        );
+        assert!(
+            evidence
+                .candidates
+                .iter()
+                .all(|candidate| candidate.matcher == "exact" && candidate.score.is_none())
         );
     }
 
@@ -698,6 +850,27 @@ mod tests {
         let lines = index_lines(content);
         let matches = block_anchor_matches(content, &lines, "begin\nzzzz\nfinish");
         assert!(matches.is_empty(), "similarity below 0.65 must not match");
+    }
+
+    #[test]
+    fn evidence_should_keep_low_score_block_as_no_match_suggestion() {
+        let content = "begin\ncompletely different middle here\nfinish\n";
+        let evidence = find_replacement_evidence(content, "begin\nzzzz\nfinish");
+
+        assert_eq!(evidence.outcome, ChainOutcome::NoMatch);
+        assert_eq!(evidence.candidates.len(), 1);
+        let candidate = &evidence.candidates[0];
+        assert_eq!(candidate.matcher, "block_anchor");
+        assert_eq!(candidate.range, 0..content.trim_end_matches('\n').len());
+        assert_eq!((candidate.lines.start, candidate.lines.end), (1, 3));
+        assert!(candidate.score.is_some_and(|score| score < 0.65));
+    }
+
+    #[test]
+    fn evidence_should_return_no_candidate_without_shared_anchors() {
+        let evidence = find_replacement_evidence("alpha\nbeta\n", "one\ntwo\nthree");
+        assert_eq!(evidence.outcome, ChainOutcome::NoMatch);
+        assert!(evidence.candidates.is_empty());
     }
 
     #[test]

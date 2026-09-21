@@ -39,7 +39,7 @@ pub(crate) struct StaleMutation {
 #[derive(Debug)]
 pub(crate) enum GuardedMutationError {
     Stale(StaleMutation),
-    Rejected(String),
+    Rejected(Box<MutationRejection>),
     Io {
         error: std::io::Error,
         may_have_modified: bool,
@@ -47,13 +47,44 @@ pub(crate) enum GuardedMutationError {
 }
 
 pub(crate) enum MutationTransformError {
-    Rejected(String),
+    Rejected(Box<MutationRejection>),
     StaleContext,
+}
+
+#[derive(Debug)]
+pub(crate) struct MutationRejection {
+    output: String,
+    output_document: Option<crate::output_recovery::OutputDocument>,
+    structured_metadata: Option<serde_json::Value>,
+}
+
+impl MutationRejection {
+    pub(crate) fn new(result: ToolResult) -> Box<Self> {
+        Box::new(Self {
+            output: result.output,
+            output_document: result.output_document,
+            structured_metadata: result.structured_metadata,
+        })
+    }
+
+    fn into_tool_result(self: Box<Self>) -> ToolResult {
+        ToolResult {
+            output: self.output,
+            output_document: self.output_document,
+            success: false,
+            structured_metadata: self.structured_metadata,
+            ..Default::default()
+        }
+    }
 }
 
 impl From<String> for MutationTransformError {
     fn from(message: String) -> Self {
-        Self::Rejected(message)
+        Self::Rejected(Box::new(MutationRejection {
+            output: message,
+            output_document: None,
+            structured_metadata: None,
+        }))
     }
 }
 
@@ -61,11 +92,7 @@ impl GuardedMutationError {
     pub(crate) fn into_tool_result(self, tool: &str, display_path: &str) -> ToolResult {
         match self {
             Self::Stale(stale) => stale_result(stale, tool, display_path),
-            Self::Rejected(message) => ToolResult {
-                output: message,
-                success: false,
-                ..Default::default()
-            },
+            Self::Rejected(rejection) => rejection.into_tool_result(),
             Self::Io {
                 error,
                 may_have_modified,
@@ -402,8 +429,27 @@ where
             }
             let (new_bytes, value) = match transform(&bytes).map_err(Into::into) {
                 Ok(transformed) => transformed,
-                Err(MutationTransformError::Rejected(message)) => {
-                    return Err(RewriteFailure::Rejected(message));
+                Err(MutationTransformError::Rejected(rejection)) => {
+                    let (_, after_rejection) = match read_current(&mut file, &path, &workspace_root)
+                    {
+                        Ok(observation) => observation,
+                        Err(ObservationError::Concurrent) => {
+                            return Ok(RewriteOutcome::Stale {
+                                reason: "concurrent_change",
+                                current: None,
+                            });
+                        }
+                        Err(ObservationError::Io(error)) => {
+                            return Err(RewriteFailure::IoBeforeWrite(error));
+                        }
+                    };
+                    if after_rejection != current {
+                        return Ok(RewriteOutcome::Stale {
+                            reason: "concurrent_change",
+                            current: Some(Box::new(after_rejection)),
+                        });
+                    }
+                    return Err(RewriteFailure::Rejected(rejection));
                 }
                 Err(MutationTransformError::StaleContext) => {
                     return Ok(RewriteOutcome::Stale {
@@ -679,7 +725,7 @@ enum RemoveFailure {
 }
 
 enum RewriteFailure {
-    Rejected(String),
+    Rejected(Box<MutationRejection>),
     IoBeforeWrite(std::io::Error),
     IoAfterWrite(std::io::Error),
 }
@@ -841,6 +887,51 @@ mod tests {
             result.structured_metadata.as_ref().unwrap()["error_code"],
             json!("stale_file_version")
         );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "external\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replacement_during_typed_rejection_returns_stale_not_old_evidence() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join("target.txt");
+        let replacement = workspace.path().join("replacement.txt");
+        std::fs::write(&path, "observed\n").unwrap();
+        std::fs::write(&replacement, "external\n").unwrap();
+        let path_for_swap = path.clone();
+        let replacement_for_swap = replacement.clone();
+
+        let error = rewrite_existing(
+            &ToolContext::zero(),
+            workspace.path(),
+            &path,
+            ExpectedVersionPolicy::Optional,
+            None,
+            None,
+            move |_| -> Result<(Vec<u8>, ()), MutationTransformError> {
+                std::fs::rename(replacement_for_swap, path_for_swap).unwrap();
+                Err(MutationTransformError::Rejected(MutationRejection::new(
+                    ToolResult {
+                        output: "[edit_no_match] stale candidate".into(),
+                        success: false,
+                        structured_metadata: Some(json!({
+                            "error_code": "edit_no_match",
+                        })),
+                        ..Default::default()
+                    },
+                )))
+            },
+        )
+        .await
+        .expect_err("a changed file must hide rejection evidence");
+        let result = error.into_tool_result("edit_file", "target.txt");
+
+        assert!(result.output.contains("[stale_file_version]"));
+        assert_eq!(
+            result.structured_metadata.as_ref().unwrap()["error_code"],
+            json!("stale_file_version")
+        );
+        assert!(!result.output.contains("stale candidate"));
         assert_eq!(std::fs::read_to_string(path).unwrap(), "external\n");
     }
 

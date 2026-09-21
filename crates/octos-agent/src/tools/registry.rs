@@ -25,6 +25,16 @@ use super::{
 };
 use crate::sandbox::{NoSandbox, Sandbox};
 
+tokio::task_local! {
+    static LOCAL_EDIT_EXECUTION_ENABLED: bool;
+}
+
+pub(crate) fn local_edit_execution_enabled() -> bool {
+    LOCAL_EDIT_EXECUTION_ENABLED
+        .try_with(|enabled| *enabled)
+        .unwrap_or(false)
+}
+
 fn policy_equivalent_tool_names(name: &str) -> Vec<&str> {
     match name {
         "spawn_agent" => vec!["spawn_agent", "spawn"],
@@ -1183,7 +1193,10 @@ impl ToolRegistry {
         // and both degrade to a failed ToolResult. The timeout wraps the
         // catch_unwind so an elapsed timeout drops the (possibly panicking)
         // tool future entirely and returns a fresh failure.
-        let invocation = tool.execute_with_context(ctx, args);
+        let invocation = LOCAL_EDIT_EXECUTION_ENABLED.scope(
+            self.local_edit_policy.enabled,
+            tool.execute_with_context(ctx, args),
+        );
         let guarded = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(invocation));
 
         // #1 — human-wait exemption. A tool that blocks on human input (e.g.
@@ -2291,6 +2304,33 @@ mod registry_dispatch_tests {
             payload.len() < 1024,
             "spawn_only handle envelope must be < 1KB, got {} bytes",
             payload.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn local_edit_policy_controls_registered_edit_failure_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("target.txt"), "same\nsame\n").unwrap();
+        let mut registry = ToolRegistry::with_builtins(dir.path());
+        let args = serde_json::json!({
+            "path": "target.txt",
+            "old_string": "same",
+            "new_string": "changed",
+        });
+
+        registry.set_local_edit_policy(crate::local_edit::LocalEditPolicy { enabled: false });
+        let off = registry.execute("edit_file", &args).await.unwrap();
+        assert!(!off.success);
+        assert!(off.output.contains("Found 2 occurrences"));
+        assert!(off.structured_metadata.is_none());
+
+        registry.set_local_edit_policy(crate::local_edit::LocalEditPolicy { enabled: true });
+        let on = registry.execute("edit_file", &args).await.unwrap();
+        assert!(!on.success);
+        assert!(on.output.starts_with("[edit_ambiguous]"));
+        assert_eq!(
+            on.structured_metadata.as_ref().unwrap()["error_code"],
+            "edit_ambiguous"
         );
     }
 }
