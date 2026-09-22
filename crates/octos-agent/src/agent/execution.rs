@@ -545,6 +545,9 @@ impl Agent {
         // default delegation), so every field above was reaching only
         // task-local (`TOOL_CTX`) readers. TOOL_CTX stays scoped for plugin
         // tools that read the task-local.
+        if self.config.no_progress {
+            crate::agent::h07_metrics::record_tool_execution();
+        }
         let mut result = TOOL_APPROVAL_CTX
             .scope(
                 approver,
@@ -654,6 +657,7 @@ impl Agent {
         // #1774: post-edit formatting opt-in, threaded into the foreground
         // ToolContext so edit_file/write_file/diff_edit see it.
         let format_after_edit = self.config.format_after_edit;
+        let h07_observability = self.config.no_progress;
         let tc_name = tool_call.name.clone();
         let tc_id = tool_call.id.clone();
         let tc_args = tool_call.arguments.clone();
@@ -1203,6 +1207,9 @@ impl Agent {
                         // of the statement, which the longer-lived `exec`
                         // future would outlive).
                         let exec_ctx = make_ctx();
+                        if h07_observability {
+                            crate::agent::h07_metrics::record_tool_execution();
+                        }
                         let exec = TOOL_CTX.scope(
                             make_ctx(),
                             bg_tools.execute_with_context(&exec_ctx, &bg_name, &bg_args),
@@ -1282,6 +1289,9 @@ impl Agent {
                             // still abort the worker rather than soldier on.
                             let retry = async {
                                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                if h07_observability {
+                                    crate::agent::h07_metrics::record_tool_execution();
+                                }
                                 TOOL_CTX
                                     .scope(
                                         make_ctx(),
@@ -2226,6 +2236,9 @@ impl Agent {
             // (`Some(_)`), so a non-interactive turn (CLI / gateway batch with
             // no requester) keeps the graceful-degradation path unchanged.
             let exec_future = TOOL_CTX.scope(ctx.clone(), async {
+                if h07_observability {
+                    crate::agent::h07_metrics::record_tool_execution();
+                }
                 tools
                     .execute_with_context(&ctx, &tc_name, &effective_args)
                     .await

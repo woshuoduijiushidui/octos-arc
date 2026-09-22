@@ -4536,6 +4536,18 @@ fn h07_m4_typed_progress_overrides_legacy_productive_text_heuristic() {
         Some(ProgressClass::StateChanged),
         "ok",
     ));
+    assert!(should_record_productive_tool_call(
+        true,
+        Some(&typed),
+        Some(ProgressClass::ValidationImproved),
+        "ok",
+    ));
+    assert!(!should_record_productive_tool_call(
+        true,
+        Some(&typed),
+        Some(ProgressClass::Regressed),
+        "tests passed",
+    ));
 
     let untyped = ProgressObservation::placeholder(
         &ToolCall {

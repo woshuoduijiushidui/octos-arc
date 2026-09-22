@@ -11,6 +11,7 @@ mod compaction;
 mod convergence;
 mod detection;
 mod execution;
+pub(crate) mod h07_metrics;
 mod llm_call;
 mod loop_compaction;
 mod loop_runner;

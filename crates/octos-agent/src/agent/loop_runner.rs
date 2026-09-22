@@ -449,6 +449,10 @@ impl Agent {
         }
 
         let before = turn.total_usage().clone();
+        let h07_reflection = reason.contains_semantic_no_progress();
+        if h07_reflection {
+            crate::agent::h07_metrics::record_reflection("requested");
+        }
         match self
             .call_llm_with_hooks_silent(
                 &checkpoint_messages,
@@ -472,6 +476,14 @@ impl Agent {
                 let content = reflection.content.unwrap_or_default();
                 let usable = !content.trim().is_empty();
                 convergence.complete(turn.total_usage(), Some(&usage), content);
+                if h07_reflection {
+                    crate::agent::h07_metrics::record_reflection_tokens(&usage);
+                    crate::agent::h07_metrics::record_reflection(if usable {
+                        "completed"
+                    } else {
+                        "failed"
+                    });
+                }
                 if usable {
                     tracing::info!(
                         iteration,
@@ -492,6 +504,10 @@ impl Agent {
                 // llm_call.rs. Exclude that delta from action-token thresholds
                 // while charging it to the turn's actual budget.
                 let reflection_usage = usage_delta(&before, turn.total_usage());
+                if h07_reflection {
+                    crate::agent::h07_metrics::record_reflection_tokens(&reflection_usage);
+                    crate::agent::h07_metrics::record_reflection("failed");
+                }
                 let reflection_usage =
                     (active_tokens(&reflection_usage) > 0).then_some(&reflection_usage);
                 convergence.complete(turn.total_usage(), reflection_usage, String::new());
@@ -2188,6 +2204,7 @@ impl Agent {
                             let sanitized_response = handled.response;
 
                             if let Some(terminal) = handled.terminal {
+                                crate::agent::h07_metrics::record_terminal("conversation");
                                 self.emit_cost_update(&turn, &sanitized_response, attributed_cost);
                                 return Ok(ConversationResponse {
                                     content: terminal.message,
@@ -3132,6 +3149,7 @@ impl Agent {
                             },
                         };
                         if let Some(terminal) = handled.terminal {
+                            crate::agent::h07_metrics::record_terminal("task");
                             self.emit_cost_update(&turn, &handled.response, attributed_cost);
                             self.reporter().report(ProgressEvent::TaskCompleted {
                                 success: false,
@@ -3984,7 +4002,11 @@ fn should_record_productive_tool_call(
     {
         return matches!(
             progress,
-            Some(ProgressClass::StateChanged | ProgressClass::EvidenceChanged)
+            Some(
+                ProgressClass::ValidationImproved
+                    | ProgressClass::StateChanged
+                    | ProgressClass::EvidenceChanged
+            )
         );
     }
     is_productive_tool_message(content)

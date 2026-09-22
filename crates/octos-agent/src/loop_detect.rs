@@ -4,7 +4,6 @@
 //! repeating patterns in the last N calls. When a cycle is detected,
 //! returns a warning message that should be injected as a system message.
 
-use metrics::counter;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -148,6 +147,9 @@ impl LoopDetector {
 
     pub(crate) fn observe_semantic(&mut self, observation: &ProgressObservation) -> EpisodeOutcome {
         let outcome = self.episodes.observe(observation);
+        if outcome.episode_created {
+            crate::agent::h07_metrics::record_episode_created();
+        }
         if !self.semantic_reflection_requested
             && let Some(request) = outcome.request_reflection.clone()
         {
@@ -170,10 +172,12 @@ impl LoopDetector {
             ProgressDecision::TerminalNonRetryable => "terminal_non_retryable",
         };
         let progress_class = match outcome.class {
+            ProgressClass::ValidationImproved => "validation_improved",
             ProgressClass::StateChanged => "state_changed",
             ProgressClass::NoProgress => "no_progress",
             ProgressClass::EvidenceChanged => "evidence_changed",
             ProgressClass::VerifiedWait => "verified_wait",
+            ProgressClass::Regressed => "regressed",
             ProgressClass::Unknown => "unknown",
         };
         let confidence = match observation.confidence {
@@ -181,14 +185,28 @@ impl LoopDetector {
             ObservationConfidence::TrustedAdapter => "trusted_adapter",
             ObservationConfidence::ExactTextFallback => "exact_text_fallback",
         };
-        counter!(
-            "octos_no_progress_observation_total",
-            "family" => family,
-            "progress_class" => progress_class,
-            "decision" => decision,
-            "confidence" => confidence,
-        )
-        .increment(1);
+        let reflection_status = if outcome.request_reflection.is_some() {
+            "requested"
+        } else {
+            "not_requested"
+        };
+        crate::agent::h07_metrics::record_observation(
+            family,
+            progress_class,
+            decision,
+            confidence,
+            reflection_status,
+        );
+        match outcome.decision {
+            ProgressDecision::Hint => crate::agent::h07_metrics::record_decision("hint"),
+            ProgressDecision::SwitchRequired => {
+                crate::agent::h07_metrics::record_decision("switch")
+            }
+            ProgressDecision::TerminalNonRetryable => {
+                crate::agent::h07_metrics::record_decision("terminal")
+            }
+            ProgressDecision::Continue => {}
+        }
         outcome
     }
 
@@ -222,7 +240,11 @@ impl LoopDetector {
             self.exact_result_streak = 0;
             return None;
         }
-        (self.exact_result_streak >= 2).then_some(3)
+        let rejected = (self.exact_result_streak >= 2).then_some(3);
+        if rejected.is_some() {
+            crate::agent::h07_metrics::record_decision("pre_call_reject");
+        }
+        rejected
     }
 
     /// Shared post-result exact history. A blocked or ambiguous result cannot
@@ -260,7 +282,11 @@ impl LoopDetector {
             };
         self.exact_last_call = Some(call);
         self.exact_last_result = Some(result);
-        (self.exact_result_streak == 2).then(|| H07_EXACT_HINT.to_owned())
+        let hint = (self.exact_result_streak == 2).then(|| H07_EXACT_HINT.to_owned());
+        if hint.is_some() {
+            crate::agent::h07_metrics::record_decision("hint");
+        }
+        hint
     }
 
     /// Record a successful file-mutating tool call. Returns a model-facing
@@ -574,6 +600,7 @@ mod tests {
             state_digest: None,
             evidence_key: format!("sha256:{:0>64}", target.len()),
             validation_key: None,
+            validation_score: None,
             wait_key: None,
             error_kind: Some("diff_context_no_match".into()),
             confidence: ObservationConfidence::Typed,

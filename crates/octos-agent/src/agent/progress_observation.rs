@@ -125,11 +125,18 @@ pub(crate) struct ProgressObservation {
     pub state_digest: Option<String>,
     pub evidence_key: String,
     pub validation_key: Option<String>,
+    pub validation_score: Option<ValidationScore>,
     pub wait_key: Option<String>,
     pub error_kind: Option<String>,
     pub confidence: ObservationConfidence,
     pub diagnostic: Option<ObservationDiagnostic>,
     pub semantic_eligible: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ValidationScore {
+    pub errors: u64,
+    pub warnings: u64,
 }
 
 pub(super) struct ObservationFacts(ProgressObservation);
@@ -231,6 +238,28 @@ impl ObservationFacts {
                     }
                 }
             }
+        }
+
+        if observation.family == OperationFamily::Validate
+            && let Some(validation) = metadata.and_then(|value| value.get("validation"))
+            && validation.get("schema").and_then(Value::as_str) == Some("octos.validation.v1")
+            && validation.get("adapter").and_then(Value::as_str) == Some("check")
+            && validation.get("ran").and_then(Value::as_bool) == Some(true)
+            && let (Some(errors), Some(warnings)) = (
+                validation.get("errors").and_then(Value::as_u64),
+                validation.get("warnings").and_then(Value::as_u64),
+            )
+        {
+            let score = ValidationScore { errors, warnings };
+            let key = digest(
+                &serde_json::to_vec(&(observation.target_key.as_str(), errors, warnings))
+                    .unwrap_or_default(),
+            );
+            observation.validation_key = Some(key.clone());
+            observation.validation_score = Some(score);
+            observation.evidence_key = key;
+            observation.confidence = ObservationConfidence::Typed;
+            observation.semantic_eligible = true;
         }
 
         if call.name == "recall"
@@ -439,6 +468,7 @@ impl ProgressObservation {
                     .unwrap_or_default(),
             ),
             validation_key: None,
+            validation_score: None,
             wait_key: Some(wait_key),
             error_kind: None,
             confidence: ObservationConfidence::TrustedAdapter,
@@ -489,6 +519,7 @@ impl ProgressObservation {
             state_digest: None,
             evidence_key: String::new(),
             validation_key: None,
+            validation_score: None,
             wait_key: None,
             error_kind: None,
             confidence: ObservationConfidence::ExactTextFallback,
@@ -548,10 +579,12 @@ const MAX_HINT_BYTES: usize = 320;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ProgressClass {
+    ValidationImproved,
     StateChanged,
     NoProgress,
     EvidenceChanged,
     VerifiedWait,
+    Regressed,
     Unknown,
 }
 
@@ -569,6 +602,7 @@ pub(crate) struct EpisodeOutcome {
     pub decision: ProgressDecision,
     pub hint: Option<String>,
     pub request_reflection: Option<SemanticReflectionRequest>,
+    pub episode_created: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -605,6 +639,7 @@ struct EpisodeKey {
     outcome: Option<MutationOutcome>,
     error_kind: Option<String>,
     evidence_key: String,
+    validation_score: Option<ValidationScore>,
 }
 
 impl EpisodeKey {
@@ -616,6 +651,7 @@ impl EpisodeKey {
             outcome: observation.outcome,
             error_kind: observation.error_kind.clone(),
             evidence_key: observation.evidence_key.clone(),
+            validation_score: observation.validation_score,
         }
     }
 
@@ -664,6 +700,7 @@ impl EpisodeTracker {
                 decision: ProgressDecision::Continue,
                 hint: None,
                 request_reflection: None,
+                episode_created: false,
             };
         }
         if observation.family == OperationFamily::Wait && observation.wait_key.is_some() {
@@ -675,6 +712,7 @@ impl EpisodeTracker {
                     decision: ProgressDecision::Continue,
                     hint: None,
                     request_reflection: None,
+                    episode_created: false,
                 };
             }
             let known_scope = self
@@ -703,6 +741,54 @@ impl EpisodeTracker {
                 decision: ProgressDecision::Continue,
                 hint: None,
                 request_reflection: None,
+                episode_created: true,
+            };
+        }
+        if observation.family == OperationFamily::Validate
+            && let Some(current) = observation.validation_score
+            && let Some(previous) = self
+                .episodes
+                .iter()
+                .rev()
+                .find(|episode| {
+                    episode.key.family == OperationFamily::Validate
+                        && episode.key.target_key == key.target_key
+                        && episode.key.validation_score.is_some()
+                })
+                .and_then(|episode| episode.key.validation_score)
+            && current != previous
+        {
+            let class = if current < previous {
+                ProgressClass::ValidationImproved
+            } else {
+                ProgressClass::Regressed
+            };
+            // A changed trusted validation score ends the prior validation
+            // episode for this scope. The new score becomes a fresh bounded
+            // baseline; it never clears unrelated mutation/read episodes.
+            self.episodes.retain(|episode| {
+                episode.key.family != OperationFamily::Validate
+                    || episode.key.target_key != key.target_key
+            });
+            if self.episodes.len() == MAX_EPISODES {
+                self.episodes.pop_front();
+            }
+            self.episodes.push_back(Episode {
+                key: key.clone(),
+                samples: VecDeque::from([key.evidence_key]),
+                observations: 1,
+                hinted: false,
+                switch_required: false,
+                reflection_requested: false,
+                post_switch_probe: false,
+                terminal: false,
+            });
+            return EpisodeOutcome {
+                class,
+                decision: ProgressDecision::Continue,
+                hint: None,
+                request_reflection: None,
+                episode_created: true,
             };
         }
         if let Some(index) = self.episodes.iter().position(|episode| episode.key == key) {
@@ -754,6 +840,7 @@ impl EpisodeTracker {
                 decision,
                 hint,
                 request_reflection,
+                episode_created: false,
             };
         }
         let known_scope = self
@@ -787,6 +874,7 @@ impl EpisodeTracker {
             decision: ProgressDecision::Continue,
             hint: None,
             request_reflection: None,
+            episode_created: true,
         }
     }
 
@@ -809,6 +897,104 @@ mod tests {
     use super::*;
     use crate::output_recovery::{OutputRange, OutputStream};
     use serde_json::json;
+
+    fn h07_m7_validation(errors: u64, warnings: u64) -> ProgressObservation {
+        let call = call("check", json!({"path": "."}));
+        let result = ToolResult {
+            output: format!("trusted fixture: {errors} errors, {warnings} warnings"),
+            success: true,
+            structured_metadata: Some(json!({
+                "validation": {
+                    "schema": "octos.validation.v1",
+                    "adapter": "check",
+                    "ran": true,
+                    "errors": errors,
+                    "warnings": warnings,
+                }
+            })),
+            ..Default::default()
+        };
+        ObservationFacts::from_result(&call, &result).finish(&result.output, None)
+    }
+
+    #[test]
+    fn h07_m7_trusted_validation_improvement_and_regression_are_directional() {
+        let mut tracker = EpisodeTracker::default();
+        let failing = h07_m7_validation(2, 1);
+        assert_eq!(tracker.observe(&failing).class, ProgressClass::Unknown);
+        assert_eq!(tracker.observe(&failing).class, ProgressClass::NoProgress);
+
+        let improved = h07_m7_validation(1, 1);
+        let outcome = tracker.observe(&improved);
+        assert_eq!(outcome.class, ProgressClass::ValidationImproved);
+        assert!(outcome.episode_created);
+
+        let regressed = h07_m7_validation(3, 0);
+        let outcome = tracker.observe(&regressed);
+        assert_eq!(outcome.class, ProgressClass::Regressed);
+        assert!(outcome.episode_created);
+    }
+
+    #[test]
+    fn h07_m7_plain_tests_passed_text_is_not_trusted_validation_progress() {
+        let call = call("check", json!({"path": "."}));
+        let result = ToolResult {
+            output: "tests passed".to_owned(),
+            success: true,
+            ..Default::default()
+        };
+        let observation =
+            ObservationFacts::from_result(&call, &result).finish(&result.output, None);
+        assert_eq!(
+            observation.confidence,
+            ObservationConfidence::ExactTextFallback
+        );
+        assert!(!observation.semantic_eligible);
+        assert_eq!(observation.validation_score, None);
+        let outcome = EpisodeTracker::default().observe(&observation);
+        assert_eq!(outcome.class, ProgressClass::Unknown);
+        assert!(!outcome.episode_created);
+    }
+
+    #[test]
+    fn h07_m7_unrelated_successful_read_does_not_clear_validation_stall() {
+        let mut tracker = EpisodeTracker::default();
+        let stalled = h07_m7_validation(2, 1);
+        assert_eq!(
+            tracker.observe(&stalled).decision,
+            ProgressDecision::Continue
+        );
+        assert_eq!(tracker.observe(&stalled).decision, ProgressDecision::Hint);
+
+        let read = call("read_file", json!({"path": "diagnostic.txt"}));
+        let source = OutputSource::File {
+            target: "/workspace/diagnostic.txt".into(),
+            sha256: format!("sha256:{}", "d".repeat(64)),
+        };
+        let ranges = [OutputRange {
+            stream: OutputStream::File,
+            start: 0,
+            end: 10,
+            lines: Some((1, 1)),
+        }];
+        let unrelated = ObservationFacts::from_result(
+            &read,
+            &ToolResult {
+                output: "diagnostic".into(),
+                success: true,
+                ..Default::default()
+            },
+        )
+        .finish_with_source("diagnostic", Some((&source, &ranges, false)));
+        assert_eq!(
+            tracker.observe(&unrelated).decision,
+            ProgressDecision::Continue
+        );
+        assert_eq!(
+            tracker.observe(&stalled).decision,
+            ProgressDecision::SwitchRequired
+        );
+    }
 
     #[test]
     fn h07_m5_verified_wait_requires_a_live_runtime_handle() {
@@ -874,6 +1060,7 @@ mod tests {
             decision: ProgressDecision::TerminalNonRetryable,
             hint: None,
             request_reflection: None,
+            episode_created: false,
         };
         let terminal = EpisodeTracker::terminal_for(&observation, &outcome).unwrap();
         assert!(terminal.message.contains("mutation"));
