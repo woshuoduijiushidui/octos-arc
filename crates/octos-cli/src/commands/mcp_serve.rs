@@ -39,6 +39,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use clap::{Args, ValueEnum};
@@ -49,7 +50,8 @@ use octos_agent::arc_task::{
 };
 use octos_agent::completion_gate::{
     ArtifactCheckKind, ArtifactCheckOutcome, ArtifactReasonCode, ArtifactState, CheckOutcome,
-    CompletionCandidate, CompletionDecision, CompletionReceipt, classify,
+    CompletionCandidate, CompletionDecision, CompletionGate, CompletionReceipt, TerminalReason,
+    classify,
 };
 use octos_agent::mcp_server::{
     McpServer, McpServerError, McpSessionCost, McpSessionDispatch, McpSessionOutcome,
@@ -101,6 +103,10 @@ pub struct McpServeCommand {
     /// Path to config file.
     #[arg(long)]
     pub config: Option<PathBuf>,
+
+    /// Allow one in-task repair of a failed MCP completion gate (H06).
+    #[arg(long)]
+    pub h06_completion_repair: bool,
 }
 
 impl Executable for McpServeCommand {
@@ -166,6 +172,7 @@ impl McpServeCommand {
             tool_policy_by_provider,
             provider_name,
             output_recovery: octos_agent::output_recovery::OutputPolicy::from_env(),
+            h06_completion_repair: self.h06_completion_repair,
         };
         let dispatch: Arc<dyn McpSessionDispatch> =
             Arc::new(RealSessionDispatch::new(dispatch_config, factory));
@@ -361,6 +368,8 @@ pub struct SessionDispatchConfig {
     /// Invocation-local output recovery policy. Each MCP call gets a distinct
     /// owner and may recover only outputs created during that call.
     pub output_recovery: octos_agent::output_recovery::OutputPolicy,
+    /// Opt-in single-round MCP completion repair.
+    pub h06_completion_repair: bool,
 }
 
 impl SessionDispatchConfig {
@@ -488,6 +497,12 @@ impl RealSessionDispatch {
     /// Alias used by integration tests for visibility.
     pub fn new_for_test(config: SessionDispatchConfig, factory: AgentLlmFactory) -> Self {
         Self::new(config, factory)
+    }
+
+    /// Set the H06 repair switch for a locally constructed dispatch.
+    pub fn with_completion_repair(mut self, enabled: bool) -> Self {
+        self.config.h06_completion_repair = enabled;
+        self
     }
 }
 
@@ -731,6 +746,105 @@ impl McpSessionDispatch for RealSessionDispatch {
             )
         };
 
+        if self.config.h06_completion_repair {
+            let gate = McpRepairGate {
+                contract,
+                expected_artifact: expected_artifact.as_deref(),
+                artifact_name,
+                native_arc: arc_request.is_some(),
+                response_schema: arc_request
+                    .as_ref()
+                    .and_then(|request| request.task.response_schema.as_ref()),
+                tools: &tools,
+                sandbox: &effective_sandbox_config,
+                latest: Mutex::new(None),
+            };
+            let gated = match agent.run_task_with_completion_gate(&task, &gate).await {
+                Ok(result) => result,
+                Err(err) => {
+                    observer.mark_state(TaskLifecycleState::Failed);
+                    return Ok(McpSessionOutcome {
+                        final_state: TaskLifecycleState::Failed,
+                        artifact_path: None,
+                        artifact_content: None,
+                        validator_results: Vec::new(),
+                        cost: McpSessionCost::default(),
+                        error: Some(format!("llm_error: {err}")),
+                    });
+                }
+            };
+            if let Some(decision) = gated.decision.as_ref() {
+                // A budget/cancel stop can carry the previous receipt, but it
+                // has no verified final candidate. Never project that stale
+                // artifact or its validator results as the final outcome.
+                if !matches!(
+                    decision,
+                    CompletionDecision::TerminalFailure {
+                        reason: TerminalReason::TaskBudgetExhausted | TerminalReason::Cancelled,
+                        ..
+                    }
+                ) {
+                    let revision = decision.receipt().candidate_revision;
+                    let mut outcome = gate
+                        .latest
+                        .lock()
+                        .expect("MCP gate result mutex")
+                        .take()
+                        .filter(|(checked_revision, _)| *checked_revision == revision)
+                        .map(|(_, outcome)| outcome)
+                        .expect("final gate decision must have its own projection");
+                    let ready = matches!(decision, CompletionDecision::Pass(_))
+                        && gated.task_result.success;
+                    outcome.final_state = if ready {
+                        TaskLifecycleState::Ready
+                    } else {
+                        TaskLifecycleState::Failed
+                    };
+                    if !ready {
+                        outcome.artifact_path = None;
+                        outcome.artifact_content = None;
+                        if outcome.error.is_none() {
+                            outcome.error = Some(
+                                "contract_failed: completion gate rejected the final candidate"
+                                    .into(),
+                            );
+                        }
+                    }
+                    outcome.cost = McpSessionCost::from(&gated.task_result.token_usage);
+                    observer.mark_state(TaskLifecycleState::Verifying);
+                    observer.mark_state(outcome.final_state);
+                    return Ok(outcome);
+                }
+            }
+            let detail = gated.task_result.output.trim();
+            let error = if detail.is_empty() {
+                "session_failed: agent task reported unsuccessful completion without an explanatory message".to_string()
+            } else {
+                format!("session_failed: agent task reported unsuccessful completion: {detail}")
+            };
+            let final_state = if matches!(
+                gated.decision,
+                Some(CompletionDecision::TerminalFailure {
+                    reason: TerminalReason::Cancelled,
+                    ..
+                })
+            ) {
+                TaskLifecycleState::Cancelled
+            } else {
+                TaskLifecycleState::Failed
+            };
+            let outcome = McpSessionOutcome {
+                final_state,
+                artifact_path: None,
+                artifact_content: None,
+                validator_results: Vec::new(),
+                cost: McpSessionCost::from(&gated.task_result.token_usage),
+                error: Some(error),
+            };
+            observer.mark_state(final_state);
+            return Ok(outcome);
+        }
+
         let task_result = match agent.run_task(&task).await {
             Ok(result) => result,
             Err(err) => {
@@ -797,6 +911,189 @@ impl McpSessionDispatch for RealSessionDispatch {
         debug_assert_eq!(ready, gate.outcome.final_state == TaskLifecycleState::Ready);
         observer.mark_state(gate.outcome.final_state);
         Ok(gate.outcome)
+    }
+}
+
+/// The H06 gate lives only for one MCP invocation. Its last projection is
+/// matched to the final candidate revision before it becomes an MCP outcome.
+struct McpRepairGate<'a> {
+    contract: &'a str,
+    expected_artifact: Option<&'a Path>,
+    artifact_name: &'a str,
+    native_arc: bool,
+    response_schema: Option<&'a Value>,
+    tools: &'a Arc<ToolRegistry>,
+    sandbox: &'a SandboxConfig,
+    latest: Mutex<Option<(u64, McpSessionOutcome)>>,
+}
+
+#[async_trait]
+impl CompletionGate for McpRepairGate<'_> {
+    async fn verify(
+        &self,
+        candidate: &CompletionCandidate,
+        core_contract_failure: Option<&str>,
+        repair_rounds_sent: u8,
+    ) -> CompletionDecision {
+        let mut result = run_completion_gate(CompletionGateInput {
+            candidate: candidate.clone(),
+            contract: self.contract,
+            expected_artifact: self.expected_artifact,
+            artifact_name: self.artifact_name,
+            native_arc: self.native_arc,
+            response_schema: self.response_schema,
+            tools: self.tools,
+            sandbox: self.sandbox,
+        })
+        .await;
+        let mut receipt = result.decision.receipt().clone();
+        if core_contract_failure.is_some() {
+            // The Agent's project-root contract is a hard gate for this same
+            // candidate. Its raw diagnostics can contain workspace paths, so
+            // the repair-facing receipt gets a fixed, nonrepairable check.
+            let mut check = artifact_check(
+                Path::new(""),
+                ArtifactCheckKind::Location,
+                ValidatorStatus::Error,
+                ArtifactReasonCode::Other,
+                "project workspace contract did not pass",
+                false,
+            );
+            if let CheckOutcome::Artifact(ref mut artifact) = check {
+                artifact.gate_id = "core/workspace_contract".into();
+            }
+            receipt.checks.push(check);
+            result.outcome.error =
+                Some("contract_failed: project workspace contract did not pass".into());
+        }
+        sanitize_repair_receipt(&mut receipt, &candidate.working_dir);
+        let decision = if repair_allowed(&receipt) {
+            classify(candidate, receipt, repair_rounds_sent.saturating_add(1), 1)
+        } else {
+            match classify(candidate, receipt, repair_rounds_sent.saturating_add(1), 1) {
+                CompletionDecision::Repairable { receipt, .. } => {
+                    CompletionDecision::TerminalFailure {
+                        reason: TerminalReason::GateError,
+                        receipt,
+                    }
+                }
+                other => other,
+            }
+        };
+        *self.latest.lock().expect("MCP gate result mutex") =
+            Some((candidate.revision, result.outcome));
+        decision
+    }
+}
+
+/// Only the first H06 repair classes may enter a second provider request.
+fn repair_allowed(receipt: &CompletionReceipt) -> bool {
+    receipt
+        .checks
+        .iter()
+        .filter(|check| match check {
+            CheckOutcome::Validator(v) => !v.required_gate_passed(),
+            CheckOutcome::Artifact(a) => a.status != ValidatorStatus::Pass,
+        })
+        .all(|check| match check {
+            CheckOutcome::Validator(v) => v.required && v.status == ValidatorStatus::Fail,
+            CheckOutcome::Artifact(a) => {
+                a.status == ValidatorStatus::Fail
+                    && match a.reason_code {
+                        ArtifactReasonCode::Missing
+                        | ArtifactReasonCode::InvalidJson
+                        | ArtifactReasonCode::SchemaMismatch => true,
+                        ArtifactReasonCode::UnsafeLocation => a.safe_target,
+                        _ => false,
+                    }
+            }
+        })
+}
+
+/// Tickets have a small, controlled diagnostic vocabulary. Full validator
+/// output remains in the typed MCP result, never in the model-facing ticket.
+fn sanitize_repair_receipt(receipt: &mut CompletionReceipt, workspace: &Path) {
+    for check in &mut receipt.checks {
+        match check {
+            CheckOutcome::Validator(v) => {
+                v.validator_id = ticket_label(&v.validator_id);
+                v.kind = ticket_label(&v.kind);
+                if v.status != ValidatorStatus::Pass {
+                    v.reason = format!(
+                        "required validator {}",
+                        match v.status {
+                            ValidatorStatus::Fail => "failed",
+                            ValidatorStatus::Timeout => "timed out",
+                            ValidatorStatus::Error => "could not run",
+                            ValidatorStatus::Pass => unreachable!(),
+                        }
+                    );
+                    v.stderr = None;
+                }
+            }
+            CheckOutcome::Artifact(a) => {
+                a.expected_artifact = a
+                    .expected_artifact
+                    .as_deref()
+                    .and_then(|path| path.strip_prefix(workspace).ok())
+                    .filter(|path| {
+                        path.components()
+                            .all(|part| matches!(part, std::path::Component::Normal(_)))
+                    })
+                    .map(Path::to_path_buf);
+                a.observed_artifact = a
+                    .observed_artifact
+                    .as_deref()
+                    .and_then(|path| path.strip_prefix(workspace).ok())
+                    .filter(|path| {
+                        path.components()
+                            .all(|part| matches!(part, std::path::Component::Normal(_)))
+                    })
+                    .map(Path::to_path_buf);
+                if a.status != ValidatorStatus::Pass {
+                    if a.reason_code == ArtifactReasonCode::SchemaMismatch {
+                        a.schema_pointer = a
+                            .reason
+                            .split_whitespace()
+                            .find(|part| part.starts_with('$'))
+                            .map(|part| part.trim_end_matches([':', ',', ';']))
+                            .filter(|part| {
+                                part.len() <= 96
+                                    && part.bytes().all(|byte| {
+                                        byte.is_ascii_alphanumeric() || b"$._[]".contains(&byte)
+                                    })
+                            })
+                            .map(str::to_string);
+                    }
+                    a.reason = match a.reason_code {
+                        ArtifactReasonCode::Missing => "expected artifact is missing",
+                        ArtifactReasonCode::InvalidJson => "artifact is not valid JSON",
+                        ArtifactReasonCode::SchemaMismatch => {
+                            "artifact does not match the response schema"
+                        }
+                        ArtifactReasonCode::UnsafeLocation => "artifact location is unsafe",
+                        ArtifactReasonCode::TooLarge => "artifact exceeds inline size limit",
+                        ArtifactReasonCode::InvalidUtf8 => "artifact is not UTF-8 text",
+                        ArtifactReasonCode::Other => "artifact check could not pass",
+                    }
+                    .into();
+                    a.stderr = None;
+                }
+            }
+        }
+    }
+}
+
+fn ticket_label(value: &str) -> String {
+    if !value.is_empty()
+        && value.len() <= 80
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+    {
+        value.to_string()
+    } else {
+        "<redacted>".into()
     }
 }
 
@@ -1218,6 +1515,110 @@ fn read_small_text_artifact(path: &std::path::Path) -> Result<String, ArtifactRe
 mod tests {
     use super::*;
 
+    #[test]
+    fn h06_m4_repair_classes_are_explicitly_bounded() {
+        let workspace = tempfile::tempdir().unwrap();
+        let candidate = gate_candidate(workspace.path());
+        let allowed = [
+            (ArtifactReasonCode::Missing, ArtifactCheckKind::Exists, true),
+            (
+                ArtifactReasonCode::InvalidJson,
+                ArtifactCheckKind::Json,
+                true,
+            ),
+            (
+                ArtifactReasonCode::SchemaMismatch,
+                ArtifactCheckKind::Schema,
+                true,
+            ),
+            (
+                ArtifactReasonCode::UnsafeLocation,
+                ArtifactCheckKind::Location,
+                true,
+            ),
+        ];
+        let terminal = [
+            (
+                ArtifactReasonCode::UnsafeLocation,
+                ArtifactCheckKind::Location,
+                false,
+            ),
+            (ArtifactReasonCode::TooLarge, ArtifactCheckKind::Text, true),
+            (
+                ArtifactReasonCode::InvalidUtf8,
+                ArtifactCheckKind::Text,
+                true,
+            ),
+            (ArtifactReasonCode::Other, ArtifactCheckKind::Exists, true),
+        ];
+        for (code, kind, safe_target) in allowed {
+            let mut check = artifact_check(
+                Path::new("result.json"),
+                kind,
+                ValidatorStatus::Fail,
+                code,
+                "failure",
+                safe_target,
+            );
+            if let CheckOutcome::Artifact(ref mut artifact) = check {
+                artifact.safe_target = safe_target;
+            }
+            let receipt = CompletionReceipt {
+                task_id: candidate.task_id.clone(),
+                candidate_revision: candidate.revision,
+                gate_policy_version: 1,
+                checks: vec![check],
+                artifact_state: ArtifactState::Rejected,
+                artifact_path: None,
+                artifact_content: None,
+                validator_references: BTreeMap::new(),
+            };
+            assert!(repair_allowed(&receipt), "{code:?}");
+        }
+        for (code, kind, safe_target) in terminal {
+            let check = artifact_check(
+                Path::new("result.json"),
+                kind,
+                ValidatorStatus::Fail,
+                code,
+                "failure",
+                safe_target,
+            );
+            let receipt = CompletionReceipt {
+                task_id: candidate.task_id.clone(),
+                candidate_revision: candidate.revision,
+                gate_policy_version: 1,
+                checks: vec![check],
+                artifact_state: ArtifactState::Rejected,
+                artifact_path: None,
+                artifact_content: None,
+                validator_references: BTreeMap::new(),
+            };
+            assert!(!repair_allowed(&receipt), "{code:?}");
+        }
+        for status in [ValidatorStatus::Timeout, ValidatorStatus::Error] {
+            let check = artifact_check(
+                Path::new("result.json"),
+                ArtifactCheckKind::Exists,
+                status,
+                ArtifactReasonCode::Other,
+                "failure",
+                true,
+            );
+            let receipt = CompletionReceipt {
+                task_id: candidate.task_id.clone(),
+                candidate_revision: candidate.revision,
+                gate_policy_version: 1,
+                checks: vec![check],
+                artifact_state: ArtifactState::Rejected,
+                artifact_path: None,
+                artifact_content: None,
+                validator_references: BTreeMap::new(),
+            };
+            assert!(!repair_allowed(&receipt), "{status:?}");
+        }
+    }
+
     fn gate_candidate(workspace: &Path) -> CompletionCandidate {
         CompletionCandidate {
             task_id: octos_core::TaskId::new(),
@@ -1468,6 +1869,7 @@ mod tests {
             cwd: None,
             data_dir: None,
             config: None,
+            h06_completion_repair: false,
         };
         assert!(matches!(cmd.transport, McpTransport::Http));
     }
@@ -1483,6 +1885,7 @@ mod tests {
             tool_policy_by_provider: HashMap::new(),
             provider_name: String::new(),
             output_recovery: octos_agent::output_recovery::OutputPolicy::default(),
+            h06_completion_repair: false,
         };
 
         // A disabled policy must produce a pass-through backend, proving the
