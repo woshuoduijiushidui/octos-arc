@@ -17,6 +17,7 @@ mod loop_runner;
 pub mod loop_state;
 pub mod memory;
 mod message_repair;
+mod progress_observation;
 mod prompt_cache;
 pub mod prompt_segments;
 pub mod realtime;

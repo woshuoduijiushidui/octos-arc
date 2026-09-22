@@ -64,6 +64,44 @@ use octos_llm::{
     ChatResponse, LlmError, LlmErrorKind, LlmProvider, StopReason, TokenUsage as LlmTokenUsage,
     ToolChoice,
 };
+
+#[test]
+fn h07_m1_limited_batch_keeps_duplicate_ids_and_blocked_slot_aligned() {
+    let call = |id: &str, ordinal: u64| ToolCall {
+        id: id.into(),
+        name: "read_file".into(),
+        arguments: serde_json::json!({"path": format!("file_{ordinal}.rs")}),
+        metadata: None,
+    };
+    let calls = vec![call("duplicate", 1), call("duplicate", 2), call("last", 3)];
+    let original = ChatResponse {
+        content: None,
+        reasoning_content: None,
+        tool_calls: calls.clone(),
+        stop_reason: StopReason::ToolUse,
+        usage: LlmTokenUsage::default(),
+        provider_index: None,
+    };
+    let limited = ChatResponse {
+        tool_calls: vec![calls[0].clone(), calls[2].clone()],
+        ..original.clone()
+    };
+    let executed = [0, 2].map(|index| {
+        ProgressObservation::placeholder(&calls[index], ObservationStatus::Success, "visible")
+    });
+    let blocked = vec![session_limit_message(
+        &calls[1],
+        "[SESSION LIMIT] blocked".into(),
+    )];
+    let ordered = order_progress_observations(&original, &limited, executed.into(), &blocked);
+    assert_eq!(ordered.len(), 3);
+    assert_eq!(ordered[0].target_label, "file_1.rs");
+    assert_eq!(ordered[1].target_label, "file_2.rs");
+    assert_eq!(ordered[1].status, ObservationStatus::Blocked);
+    assert_eq!(ordered[2].target_label, "file_3.rs");
+    assert_eq!(ordered[0].call_id, ordered[1].call_id);
+    assert_ne!(ordered[0].target_key, ordered[1].target_key);
+}
 use octos_memory::EpisodeStore;
 
 #[cfg(unix)]

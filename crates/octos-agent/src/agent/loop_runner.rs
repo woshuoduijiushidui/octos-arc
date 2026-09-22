@@ -19,6 +19,7 @@ use super::convergence::{
 use super::loop_compaction::{prepare_conversation_messages, prepare_task_messages};
 use super::loop_state::{LoopDecision, LoopRetryState, SHELL_SPIRAL_VARIANT};
 use super::message_repair::sanitize_tool_call_id;
+use super::progress_observation::{ObservationDiagnostic, ObservationStatus, ProgressObservation};
 use super::turn_state::{LoopRetryReason, LoopTurnState, attach_partial_usage};
 use super::verifier::{TurnLedger, ledger_entry_from_tool_result};
 use super::{Agent, AssistantSegmentProvenance, ConversationResponse, TASK_REPORTER, TokenTracker};
@@ -3286,6 +3287,7 @@ impl Agent {
         let mut tool_send_files = Vec::new();
         let mut tool_tokens = TokenUsage::default();
         let mut tool_metadata: Vec<(String, serde_json::Value)> = Vec::new();
+        let mut tool_observations = Vec::new();
         // Codex round-2 MAJOR 2 (PR #1187 fixup): collect per-tool-call
         // success bits across every batch in this turn. Threaded out via
         // `tool_success_by_id` so the synth-ack gate can read the
@@ -3303,7 +3305,15 @@ impl Agent {
                 batch_tokens,
                 batch_metadata,
                 batch_success,
+                batch_observations,
             ) = self.execute_tools(&batch_response).await?;
+            debug_assert!(
+                batch_response
+                    .tool_calls
+                    .iter()
+                    .zip(&batch_observations)
+                    .all(|(call, observation)| call.id == observation.call_id)
+            );
             tool_messages.extend(batch_messages);
             tool_files.extend(batch_files);
             tool_send_files.extend(batch_send_files);
@@ -3313,6 +3323,7 @@ impl Agent {
             tool_tokens.cache_write_tokens += batch_tokens.cache_write_tokens;
             tool_metadata.extend(batch_metadata);
             tool_success.extend(batch_success);
+            tool_observations.extend(batch_observations);
         }
         if let Some(terminal_tools) = terminal_tools_for_turn {
             let tool_name_by_id: HashMap<&str, &str> = limited_response
@@ -3340,6 +3351,40 @@ impl Agent {
             sink.extend(tool_success);
         }
 
+        let mut seen_ids = HashSet::new();
+        let duplicate_ids: HashSet<&str> = limited_response
+            .tool_calls
+            .iter()
+            .filter_map(|call| (!seen_ids.insert(call.id.as_str())).then_some(call.id.as_str()))
+            .collect();
+        for ((call, message), observation) in limited_response
+            .tool_calls
+            .iter()
+            .zip(&tool_messages)
+            .zip(&mut tool_observations)
+        {
+            if duplicate_ids.contains(call.id.as_str()) {
+                observation.downgrade_ambiguous_read(&message.content);
+            }
+        }
+        let _ordered_observations = order_progress_observations(
+            &response,
+            &limited_response,
+            tool_observations,
+            &blocked_messages,
+        );
+        let conflict_count = _ordered_observations
+            .iter()
+            .filter(|observation| {
+                observation.diagnostic == Some(ObservationDiagnostic::ConflictingMutationFields)
+            })
+            .count();
+        if conflict_count > 0 {
+            tracing::debug!(
+                conflicting_mutation_fields = conflict_count,
+                "H07 observation diagnostics"
+            );
+        }
         let mut merged = merge_tool_messages_in_order(
             &response,
             &limited_response,
@@ -3677,6 +3722,30 @@ fn merge_tool_messages_in_order(
     }
     ordered.extend(executed_by_id);
     ordered
+}
+
+fn order_progress_observations(
+    original: &ChatResponse,
+    limited: &ChatResponse,
+    executed: Vec<ProgressObservation>,
+    blocked: &[Message],
+) -> Vec<ProgressObservation> {
+    let mut executed = executed.into_iter();
+    let mut allowed = limited.tool_calls.iter().peekable();
+    let mut blocked = blocked.iter();
+    original
+        .tool_calls
+        .iter()
+        .map(|call| {
+            if allowed.peek().is_some_and(|next| *next == call) {
+                allowed.next();
+                executed.next().expect("executed call has an observation")
+            } else {
+                let message = blocked.next().expect("blocked call has a placeholder");
+                ProgressObservation::placeholder(call, ObservationStatus::Blocked, &message.content)
+            }
+        })
+        .collect()
 }
 
 fn recover_shell_retry(

@@ -63,6 +63,7 @@ use octos_llm::ChatResponse;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+use super::progress_observation::{ObservationFacts, ObservationStatus, ProgressObservation};
 use super::{Agent, MAX_TOOL_TIMEOUT_SECS};
 use crate::harness_errors::HarnessError;
 use crate::harness_events::{lookup_event_sink_context, write_event_to_sink};
@@ -101,6 +102,7 @@ type ToolCallResult = (
     // failure — a [`crate::tools::ToolInputError`] from malformed model
     // arguments — that must NOT nuke well-formed sibling calls (#1690).
     bool,
+    Option<ProgressObservation>,
 );
 
 fn should_auto_send_tool_files(
@@ -653,6 +655,7 @@ impl Agent {
         let tc_name = tool_call.name.clone();
         let tc_id = tool_call.id.clone();
         let tc_args = tool_call.arguments.clone();
+        let mut observation_call = tool_call.clone();
         let attachment_ctx = turn_attachment_ctx.clone();
         let harness_event_sink = self.harness_event_sink.clone();
         // M8.2/M8.4 reconciliation: M8.8 rewrite must thread agent_definitions
@@ -796,6 +799,7 @@ impl Agent {
                             None,
                             // hook denial is an intentional stop — cascade to peers
                             true,
+                            None,
                         );
                     }
                     HookResult::Modified(new_args) => {
@@ -864,6 +868,7 @@ impl Agent {
                             None,
                             // policy denial is an intentional stop — cascade to peers
                             true,
+                            None,
                         );
                     }
                 }
@@ -920,6 +925,7 @@ impl Agent {
                             None,
                             // pre-execution denial is an intentional stop — cascade
                             true,
+                            None,
                         );
                     }
                 }
@@ -1014,6 +1020,7 @@ impl Agent {
                         None,
                         // fanout-cap denial is an intentional stop — cascade
                         true,
+                        None,
                     );
                 }
                 tools.mark_spawn_only_invoked();
@@ -2123,6 +2130,7 @@ impl Agent {
                     None,
                     // spawn_only success — cascade flag is moot when success=true
                     true,
+                    None,
                 );
             }
 
@@ -2252,6 +2260,7 @@ impl Agent {
             let duration = tool_start.elapsed();
 
             let mut output_document = None;
+            observation_call.arguments = effective_args.clone();
             let (
                 content,
                 tool_files_modified,
@@ -2260,8 +2269,11 @@ impl Agent {
                 tool_success,
                 tool_structured_metadata,
                 tool_cascades,
+                observation_facts,
             ) = match result {
                 Ok(mut tool_result) => {
+                    let observation_facts =
+                        ObservationFacts::from_result(&observation_call, &tool_result);
                     output_document = tool_result.output_document.take();
                     debug!(
                         tool = %tc_name,
@@ -2346,6 +2358,7 @@ impl Agent {
                         // (legacy behaviour); only never-ran input errors below
                         // opt out.
                         true,
+                        observation_facts,
                     )
                 }
                 Err(e) => {
@@ -2400,6 +2413,7 @@ impl Agent {
                         false,
                         None,
                         cascades,
+                        ObservationFacts::from_error(&observation_call, classified.variant_name()),
                     )
                 }
             };
@@ -2493,6 +2507,11 @@ impl Agent {
             // call id so the session actor (which keys cost rows by
             // tool_call_id) can match them on the SSE done event.
             let structured_metadata = tool_structured_metadata.map(|meta| (tc_id.clone(), meta));
+            let rendered = output_state
+                .lookup_unambiguous(&tc_id, &content)
+                .filter(|rendered| tc_name == "recall" || rendered.view.output_id == ctx.output_id);
+            let observation =
+                observation_facts.finish(&content, rendered.as_ref().map(|r| &r.view));
 
             (
                 Message {
@@ -2512,6 +2531,7 @@ impl Agent {
                 tool_success,
                 structured_metadata,
                 tool_cascades,
+                Some(observation),
             )
         })
     }
@@ -2575,6 +2595,7 @@ impl Agent {
         // the synth-ack branch would still fabricate a "Background work
         // started" bubble alongside it.
         Vec<(String, bool)>,
+        Vec<ProgressObservation>,
     )> {
         let tool_names: Vec<&str> = response
             .tool_calls
@@ -2712,7 +2733,7 @@ impl Agent {
         // Log completion of the tool batch.
         let result_sizes: Vec<usize> = results
             .iter()
-            .map(|(m, _, _, _, _, _, _)| m.content.len())
+            .map(|(m, _, _, _, _, _, _, _)| m.content.len())
             .collect();
         let total_result_bytes: usize = result_sizes.iter().sum();
         tracing::info!(
@@ -2734,17 +2755,44 @@ impl Agent {
         // authoritatively decide whether the synth-ack branch fires
         // alongside a failed tool. Capacity matches the result count.
         let mut success_by_id: Vec<(String, bool)> = Vec::with_capacity(results.len());
+        let mut observations = Vec::with_capacity(results.len());
+        let mut seen_ids = std::collections::HashSet::new();
+        let duplicate_ids: std::collections::HashSet<&str> = response
+            .tool_calls
+            .iter()
+            .filter_map(|call| (!seen_ids.insert(call.id.as_str())).then_some(call.id.as_str()))
+            .collect();
+        debug_assert_eq!(response.tool_calls.len(), results.len());
 
         for (
-            message,
-            tool_files_modified,
-            tool_files_to_send,
-            tool_tokens,
-            success,
-            tool_structured_metadata,
-            _cascades,
-        ) in results
+            call,
+            (
+                message,
+                tool_files_modified,
+                tool_files_to_send,
+                tool_tokens,
+                success,
+                tool_structured_metadata,
+                _cascades,
+                observation,
+            ),
+        ) in response.tool_calls.iter().zip(results)
         {
+            let mut observation = observation.unwrap_or_else(|| {
+                ProgressObservation::placeholder(
+                    call,
+                    if success {
+                        ObservationStatus::Unknown
+                    } else {
+                        ObservationStatus::Blocked
+                    },
+                    &message.content,
+                )
+            });
+            if duplicate_ids.contains(call.id.as_str()) {
+                observation.downgrade_ambiguous_read(&message.content);
+            }
+            observations.push(observation);
             // Pair every executed tool result with its `tool_call_id` so
             // downstream gating logic does not need to guess at the
             // identity from content shape.
@@ -2772,6 +2820,7 @@ impl Agent {
             tokens_used,
             structured_metadata,
             success_by_id,
+            observations,
         ))
     }
 
@@ -3094,6 +3143,11 @@ fn cancelled_result(tool_call: &octos_core::ToolCall) -> ToolCallResult {
         None,
         // a cancelled peer raised no error of its own — do not further cascade
         false,
+        Some(ProgressObservation::placeholder(
+            tool_call,
+            ObservationStatus::Blocked,
+            "cancelled due to sibling error",
+        )),
     )
 }
 
@@ -3126,6 +3180,11 @@ fn timed_out_result(tool_call: &octos_core::ToolCall, elapsed_secs: u64) -> Tool
         None,
         // a timeout cascades to peers the same way a regular error does
         true,
+        Some(ProgressObservation::placeholder(
+            tool_call,
+            ObservationStatus::TimedOut,
+            "tool batch timeout",
+        )),
     )
 }
 
@@ -3150,6 +3209,11 @@ fn panic_result(tool_call: &octos_core::ToolCall, reason: &str) -> ToolCallResul
         None,
         // a panic is an unexpected hard failure — cascade to peers
         true,
+        Some(ProgressObservation::placeholder(
+            tool_call,
+            ObservationStatus::Failed,
+            "tool task panic",
+        )),
     )
 }
 
@@ -3835,7 +3899,7 @@ mod tests {
             usage: LlmTokenUsage::default(),
             provider_index: None,
         };
-        let (messages, _fm, _fs, _tok, _st, success_by_id) = agent
+        let (messages, _fm, _fs, _tok, _st, success_by_id, _observations) = agent
             .execute_tools(&response)
             .await
             .expect("execute_tools must not error");
@@ -3855,6 +3919,254 @@ mod tests {
             },
         )
         .await
+    }
+
+    async fn observation_batch(
+        tool_calls: Vec<ToolCall>,
+        tools: ToolRegistry,
+    ) -> (Vec<octos_core::Message>, Vec<super::ProgressObservation>) {
+        let dir = tempfile::tempdir().unwrap();
+        let provider: Arc<dyn LlmProvider> = Arc::new(NoChatProvider);
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("observation"), provider, tools, memory);
+        let response = ChatResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls,
+            stop_reason: StopReason::ToolUse,
+            usage: LlmTokenUsage::default(),
+            provider_index: None,
+        };
+        let (messages, _, _, _, _, _, observations) = agent.execute_tools(&response).await.unwrap();
+        (messages, observations)
+    }
+
+    #[tokio::test]
+    async fn h07_m1_parallel_duplicate_call_ids_keep_positional_observations() {
+        let mut tools = ToolRegistry::new();
+        tools.register(InstantTool);
+        let mut first = tool_call("duplicate", "fast_tool");
+        first.arguments = serde_json::json!({"position": 1});
+        let mut second = tool_call("duplicate", "fast_tool");
+        second.arguments = serde_json::json!({"position": 2});
+        let (messages, observations) = observation_batch(vec![first, second], tools).await;
+        assert_eq!(messages.len(), 2);
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].call_id, "duplicate");
+        assert_eq!(observations[1].call_id, "duplicate");
+        assert_ne!(observations[0].target_key, observations[1].target_key);
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.content == "FAST_TOOL_REAL_OUTPUT")
+        );
+    }
+
+    #[tokio::test]
+    async fn h07_m1_serial_failure_and_blocked_sibling_keep_order() {
+        let mut tools = ToolRegistry::new();
+        tools.register(HardErrorTool);
+        tools.register(GoodExclusiveTool);
+        let (messages, observations) = observation_batch(
+            vec![
+                tool_call("failed", "hard_error_tool"),
+                tool_call("blocked", "good_tool"),
+            ],
+            tools,
+        )
+        .await;
+        assert_eq!(messages.len(), 2);
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].call_id, "failed");
+        assert_eq!(observations[0].status, super::ObservationStatus::Failed);
+        assert_eq!(
+            observations[0].error_kind.as_deref(),
+            Some("tool_execution")
+        );
+        assert_eq!(observations[1].call_id, "blocked");
+        assert_eq!(observations[1].status, super::ObservationStatus::Blocked);
+        assert!(
+            messages[1]
+                .content
+                .contains("cancelled due to earlier sibling error")
+        );
+    }
+
+    fn typed_file_document() -> crate::output_recovery::OutputDocument {
+        let body = "alpha\n";
+        crate::output_recovery::OutputDocument {
+            source: crate::output_recovery::OutputSource::File {
+                target: "read.txt".into(),
+                sha256: format!("sha256:{}", "d".repeat(64)),
+            },
+            parts: vec![crate::output_recovery::OutputPart {
+                stream: crate::output_recovery::OutputStream::File,
+                text: body.into(),
+                start: 0,
+                first_line: None,
+                total: Some(body.len() as u64),
+            }],
+            capture: crate::output_recovery::CaptureState::Complete,
+            execution: crate::output_recovery::ExecutionStatus::NotApplicable,
+            transformed: false,
+            loss_reason: None,
+            file_read: None,
+        }
+    }
+
+    struct TypedReadProbe;
+
+    #[async_trait]
+    impl Tool for TypedReadProbe {
+        fn name(&self) -> &str {
+            "read_file"
+        }
+        fn description(&self) -> &str {
+            "typed read observation probe"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: &serde_json::Value) -> eyre::Result<ToolResult> {
+            Ok(ToolResult {
+                output: "alpha\n".into(),
+                output_document: Some(typed_file_document()),
+                success: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn h07_m1_real_executor_uses_h03_rendered_file_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tools = ToolRegistry::new();
+        tools.register(TypedReadProbe);
+        let owner = crate::model_read_receipts::ReadReceiptOwner::new(
+            "workspace",
+            "task",
+            "session",
+            "branch",
+        )
+        .unwrap();
+        let state = Arc::new(crate::output_recovery::OutputState::new(
+            crate::output_recovery::OutputPolicy { enabled: true },
+            owner,
+        ));
+        let provider: Arc<dyn LlmProvider> = Arc::new(NoChatProvider);
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("typed-read"), provider, tools, memory)
+            .with_output_state(state);
+        let response = ChatResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![tool_call("read_call", "read_file")],
+            stop_reason: StopReason::ToolUse,
+            usage: LlmTokenUsage::default(),
+            provider_index: None,
+        };
+        let (messages, _, _, _, _, _, observations) = agent.execute_tools(&response).await.unwrap();
+        assert_eq!(observations.len(), 1);
+        let version = format!("sha256:{}", "d".repeat(64));
+        assert_eq!(
+            observations[0].state_digest.as_deref(),
+            Some(version.as_str())
+        );
+        assert_eq!(
+            observations[0].confidence,
+            super::super::progress_observation::ObservationConfidence::Typed
+        );
+        assert!(messages[0].content.contains("alpha"));
+    }
+
+    struct TypedRecallProbe;
+
+    #[async_trait]
+    impl Tool for TypedRecallProbe {
+        fn name(&self) -> &str {
+            "recall"
+        }
+        fn description(&self) -> &str {
+            "registered recall observation probe"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, args: &serde_json::Value) -> eyre::Result<ToolResult> {
+            self.execute_with_context(&crate::tools::ToolContext::zero(), args)
+                .await
+        }
+        async fn execute_with_context(
+            &self,
+            ctx: &crate::tools::ToolContext,
+            args: &serde_json::Value,
+        ) -> eyre::Result<ToolResult> {
+            let state = ctx.output_state.as_ref().expect("test output state");
+            let rendered = state.register(
+                "historical-output-id".into(),
+                &ctx.tool_id,
+                args,
+                typed_file_document(),
+                true,
+                8192,
+            )?;
+            Ok(ToolResult {
+                output: rendered.content,
+                success: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn h07_m1_recall_trusts_only_unique_registered_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tools = ToolRegistry::new();
+        tools.register(TypedRecallProbe);
+        let owner = crate::model_read_receipts::ReadReceiptOwner::new(
+            "workspace",
+            "task",
+            "session",
+            "branch",
+        )
+        .unwrap();
+        let state = Arc::new(crate::output_recovery::OutputState::new(
+            crate::output_recovery::OutputPolicy { enabled: true },
+            owner,
+        ));
+        let provider: Arc<dyn LlmProvider> = Arc::new(NoChatProvider);
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("typed-recall"), provider, tools, memory)
+            .with_output_state(state.clone());
+        let response = ChatResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![tool_call("recall_call", "recall")],
+            stop_reason: StopReason::ToolUse,
+            usage: LlmTokenUsage::default(),
+            provider_index: None,
+        };
+        let (messages, _, _, _, _, _, observations) = agent.execute_tools(&response).await.unwrap();
+        assert_eq!(
+            observations[0].state_digest,
+            Some(format!("sha256:{}", "d".repeat(64)))
+        );
+        let duplicate = state
+            .register(
+                "historical-output-id".into(),
+                "recall_call",
+                &response.tool_calls[0].arguments,
+                typed_file_document(),
+                true,
+                8192,
+            )
+            .unwrap();
+        assert_eq!(messages[0].content, duplicate.content);
+        assert!(
+            state
+                .lookup_unambiguous("recall_call", &duplicate.content)
+                .is_none()
+        );
     }
 
     async fn run_serial_pair(
@@ -4147,11 +4459,18 @@ mod tests {
             provider_index: None,
         };
 
-        let (messages, _files_modified, _files_to_send, _tokens, _structured, success_by_id) =
-            agent
-                .execute_tools(&response)
-                .await
-                .expect("execute_tools must not error on a batch timeout");
+        let (
+            messages,
+            _files_modified,
+            _files_to_send,
+            _tokens,
+            _structured,
+            success_by_id,
+            _observations,
+        ) = agent
+            .execute_tools(&response)
+            .await
+            .expect("execute_tools must not error on a batch timeout");
 
         // 1:1 mapping in LLM call order is preserved.
         assert_eq!(messages.len(), 2, "one result message per tool call");
