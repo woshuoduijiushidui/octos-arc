@@ -35,9 +35,9 @@
 //! Native ARC input additionally uses `arc_task_invalid:` and
 //! `artifact_schema_invalid:`; see `docs/ARC_AGENT_TASK_MCP.md`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -47,13 +47,17 @@ use octos_agent::arc_task::{
     ARC_AGENT_TASK_SCHEMA_V1, parse_arc_agent_task_input, validate_arc_artifact_location,
     validate_arc_response,
 };
+use octos_agent::completion_gate::{
+    ArtifactCheckKind, ArtifactCheckOutcome, ArtifactReasonCode, ArtifactState, CheckOutcome,
+    CompletionCandidate, CompletionDecision, CompletionReceipt, classify,
+};
 use octos_agent::mcp_server::{
     McpServer, McpServerError, McpSessionCost, McpSessionDispatch, McpSessionOutcome,
     OCTOS_MCP_SERVER_TOKEN_ENV, SessionLifecycleObserver,
 };
 use octos_agent::task_supervisor::{TaskLifecycleState, TaskSupervisor};
 use octos_agent::validators::{
-    ValidatorInvocation, ValidatorOutcome, ValidatorPhase, ValidatorRunner,
+    ValidatorInvocation, ValidatorOutcome, ValidatorPhase, ValidatorRunner, ValidatorStatus,
     run_workspace_validators,
 };
 use octos_agent::{
@@ -767,148 +771,361 @@ impl McpSessionDispatch for RealSessionDispatch {
 
         observer.mark_state(TaskLifecycleState::Verifying);
 
-        // Run completion-phase workspace validators when a policy is
-        // defined. Results are surfaced via `validator_results` so MCP
-        // callers see the same typed outcomes the local spawn pipeline
-        // records in its ledger. Missing policy → empty vec (not an error).
-        let validator_results = run_completion_validators(
-            &self.config.cwd,
+        let gate = run_completion_gate(CompletionGateInput {
+            candidate: CompletionCandidate {
+                task_id: task.id.clone(),
+                working_dir: self.config.cwd.clone(),
+                proposed_output: task_result.output,
+                files_modified: task_result.files_modified,
+                files_to_send: task_result.files_to_send,
+                iteration: 0,
+                cumulative_usage: task_result.token_usage,
+                revision: 1,
+            },
             contract,
-            &tools,
-            &effective_sandbox_config,
-        )
-        .await;
-
-        // Resolve the contract artifact. Precedence:
-        //   1. Explicit `expected_artifact` from the MCP input.
-        //   2. Workspace contract artifact entry (`artifact_name`).
-        //   3. First file in `files_to_send`.
-        let artifact_path = resolve_artifact_path(
-            &self.config.cwd,
-            expected_artifact.as_deref(),
+            expected_artifact: expected_artifact.as_deref(),
             artifact_name,
-            &task_result.files_to_send,
-        );
+            native_arc: arc_request.is_some(),
+            response_schema: arc_request
+                .as_ref()
+                .and_then(|request| request.task.response_schema.as_ref()),
+            tools: &tools,
+            sandbox: &effective_sandbox_config,
+        })
+        .await;
+        let ready = matches!(gate.decision, CompletionDecision::Pass(_));
+        debug_assert_eq!(ready, gate.outcome.final_state == TaskLifecycleState::Ready);
+        observer.mark_state(gate.outcome.final_state);
+        Ok(gate.outcome)
+    }
+}
 
-        let cost = McpSessionCost::from(&task_result.token_usage);
+struct CompletionGateInput<'a> {
+    candidate: CompletionCandidate,
+    contract: &'a str,
+    expected_artifact: Option<&'a Path>,
+    artifact_name: &'a str,
+    native_arc: bool,
+    response_schema: Option<&'a Value>,
+    tools: &'a Arc<ToolRegistry>,
+    sandbox: &'a SandboxConfig,
+}
 
-        // Any required validator failure blocks terminal success — mirrors
-        // the local `enforce_spawn_task_contract` path.
-        let required_validator_failed = validator_results
-            .iter()
-            .any(|outcome| !outcome.required_gate_passed());
-        if required_validator_failed {
-            observer.mark_state(TaskLifecycleState::Failed);
-            return Ok(McpSessionOutcome {
-                final_state: TaskLifecycleState::Failed,
-                artifact_path: None,
-                artifact_content: None,
-                validator_results,
-                cost,
-                error: Some(
-                    "contract_failed: required completion-phase validator failed; hint: inspect the validator_results entries with status != pass before delivering the artifact".into(),
-                ),
-            });
+struct CompletionGateResult {
+    decision: CompletionDecision,
+    outcome: McpSessionOutcome,
+}
+
+struct GateArtifact {
+    state: ArtifactState,
+    content: Option<String>,
+    checks: Vec<CheckOutcome>,
+    error: Option<String>,
+}
+
+async fn run_completion_gate(input: CompletionGateInput<'_>) -> CompletionGateResult {
+    let candidate = &input.candidate;
+    let validators = run_completion_validators(
+        &candidate.working_dir,
+        input.contract,
+        input.tools,
+        input.sandbox,
+    )
+    .await;
+    let path = resolve_artifact_path(
+        &candidate.working_dir,
+        input.expected_artifact,
+        input.artifact_name,
+        &candidate.files_to_send,
+    );
+    complete_candidate_verification(
+        candidate,
+        validators,
+        path,
+        input.native_arc,
+        input.response_schema,
+    )
+}
+
+fn complete_candidate_verification(
+    candidate: &CompletionCandidate,
+    validators: Vec<ValidatorOutcome>,
+    path: Option<PathBuf>,
+    native_arc: bool,
+    response_schema: Option<&Value>,
+) -> CompletionGateResult {
+    let required_failure = validators
+        .iter()
+        .any(|outcome| !outcome.required_gate_passed());
+    let artifact = if required_failure {
+        GateArtifact {
+            state: ArtifactState::Unchecked,
+            content: None,
+            checks: Vec::new(),
+            error: Some("contract_failed: required completion-phase validator failed; hint: inspect the validator_results entries with status != pass before delivering the artifact".into()),
         }
+    } else {
+        inspect_artifact(
+            &candidate.working_dir,
+            path.as_deref(),
+            native_arc,
+            response_schema,
+        )
+    };
+    let checks = validators
+        .iter()
+        .cloned()
+        .map(CheckOutcome::Validator)
+        .chain(artifact.checks)
+        .collect();
+    let receipt = CompletionReceipt {
+        task_id: candidate.task_id.clone(),
+        candidate_revision: candidate.revision,
+        gate_policy_version: octos_agent::WORKSPACE_POLICY_SCHEMA_VERSION,
+        checks,
+        artifact_state: artifact.state,
+        artifact_path: path.clone(),
+        artifact_content: artifact.content.clone(),
+        validator_references: BTreeMap::new(),
+    };
+    let decision = classify(candidate, receipt, 1, 2);
+    let ready = artifact.error.is_none();
+    let outcome = McpSessionOutcome {
+        final_state: if ready {
+            TaskLifecycleState::Ready
+        } else {
+            TaskLifecycleState::Failed
+        },
+        artifact_path: if ready {
+            path.map(|p| p.display().to_string())
+        } else {
+            None
+        },
+        artifact_content: if ready { artifact.content } else { None },
+        validator_results: validators,
+        cost: McpSessionCost::from(&candidate.cumulative_usage),
+        error: artifact.error,
+    };
+    CompletionGateResult { decision, outcome }
+}
 
-        match artifact_path {
-            Some(path) if path.exists() => {
-                // Populate artifact_content only for small text-like files so
-                // we do not blow up the MCP response. Callers that need
-                // binary bytes should read `artifact_path` themselves.
-                if arc_request.is_some()
-                    && let Err(error) = validate_arc_artifact_location(&self.config.cwd, &path)
-                {
-                    observer.mark_state(TaskLifecycleState::Failed);
-                    return Ok(McpSessionOutcome {
-                        final_state: TaskLifecycleState::Failed,
-                        artifact_path: None,
-                        artifact_content: None,
-                        validator_results,
-                        cost,
-                        error: Some(error.to_string()),
-                    });
-                }
-                let artifact_content = read_small_text_artifact(&path);
-                if let Some(response_schema) = arc_request
-                    .as_ref()
-                    .and_then(|request| request.task.response_schema.as_ref())
-                {
-                    let validation = artifact_content
-                        .as_deref()
-                        .ok_or_else(|| {
-                            "artifact_schema_invalid: expected a UTF-8 JSON artifact no larger than 64 KiB"
-                                .to_string()
-                        })
-                        .and_then(|content| {
-                            serde_json::from_str::<Value>(content)
-                                .map_err(|error| {
-                                    format!(
-                                        "artifact_schema_invalid: artifact is not valid JSON: {error}"
-                                    )
-                                })
-                        })
-                        .and_then(|artifact| {
-                            validate_arc_response(response_schema, &artifact)
-                                .map_err(|error| error.to_string())
-                        });
-                    if let Err(error) = validation {
-                        observer.mark_state(TaskLifecycleState::Failed);
-                        return Ok(McpSessionOutcome {
-                            final_state: TaskLifecycleState::Failed,
-                            artifact_path: None,
-                            artifact_content: None,
-                            validator_results,
-                            cost,
-                            error: Some(error),
-                        });
-                    }
-                }
-                observer.mark_state(TaskLifecycleState::Ready);
-                Ok(McpSessionOutcome {
-                    final_state: TaskLifecycleState::Ready,
-                    artifact_path: Some(path.display().to_string()),
-                    artifact_content,
-                    validator_results,
-                    cost,
-                    error: None,
-                })
-            }
-            Some(path) => {
-                observer.mark_state(TaskLifecycleState::Failed);
-                Ok(McpSessionOutcome {
-                    final_state: TaskLifecycleState::Failed,
-                    artifact_path: None,
-                    artifact_content: None,
-                    validator_results,
-                    cost,
-                    error: Some(format!(
-                        "artifact_missing: expected artifact at '{}' but the file is not present; hint: ensure the agent writes the contract artifact before returning",
-                        path.display()
-                    )),
-                })
-            }
-            None => {
-                // No artifact path could be resolved. If the task itself
-                // succeeded we still treat this as a contract violation —
-                // MCP callers expect a concrete deliverable.
-                observer.mark_state(TaskLifecycleState::Failed);
-                let hint = if task_result.success {
-                    "contract_failed: agent finished without declaring an artifact_path; hint: pass `expected_artifact` in the MCP input or declare the contract artifact in the workspace policy"
-                } else {
-                    "session_failed: agent loop halted before producing an artifact; hint: check the agent max_iterations budget and LLM provider errors"
-                };
-                Ok(McpSessionOutcome {
-                    final_state: TaskLifecycleState::Failed,
-                    artifact_path: None,
-                    artifact_content: None,
-                    validator_results,
-                    cost,
-                    error: Some(hint.to_string()),
-                })
-            }
+fn inspect_artifact(
+    workspace: &Path,
+    path: Option<&Path>,
+    native_arc: bool,
+    response_schema: Option<&Value>,
+) -> GateArtifact {
+    let Some(path) = path else {
+        let error = "contract_failed: agent finished without declaring an artifact_path; hint: pass `expected_artifact` in the MCP input or declare the contract artifact in the workspace policy".to_string();
+        return rejected_artifact(
+            None,
+            ArtifactState::Missing,
+            ArtifactCheckKind::Exists,
+            ArtifactReasonCode::Other,
+            ValidatorStatus::Error,
+            false,
+            error,
+        );
+    };
+    if !path.exists() {
+        let error = format!(
+            "artifact_missing: expected artifact at '{}' but the file is not present; hint: ensure the agent writes the contract artifact before returning",
+            path.display()
+        );
+        return rejected_artifact(
+            Some(path),
+            ArtifactState::Missing,
+            ArtifactCheckKind::Exists,
+            ArtifactReasonCode::Missing,
+            ValidatorStatus::Fail,
+            true,
+            error,
+        );
+    }
+    let mut checks = vec![artifact_check(
+        path,
+        ArtifactCheckKind::Exists,
+        ValidatorStatus::Pass,
+        ArtifactReasonCode::Other,
+        "",
+        true,
+    )];
+    if native_arc {
+        if let Err(error) = validate_arc_artifact_location(workspace, path) {
+            let error = error.to_string();
+            checks.push(artifact_check(
+                path,
+                ArtifactCheckKind::Location,
+                ValidatorStatus::Fail,
+                ArtifactReasonCode::UnsafeLocation,
+                &error,
+                false,
+            ));
+            return GateArtifact {
+                state: ArtifactState::Rejected,
+                content: None,
+                checks,
+                error: Some(error),
+            };
+        }
+        checks.push(artifact_check(
+            path,
+            ArtifactCheckKind::Location,
+            ValidatorStatus::Pass,
+            ArtifactReasonCode::Other,
+            "",
+            true,
+        ));
+    }
+    let content = read_small_text_artifact(path);
+    if let Err(reason) = &content {
+        if response_schema.is_some() {
+            let error =
+                "artifact_schema_invalid: expected a UTF-8 JSON artifact no larger than 64 KiB"
+                    .to_string();
+            checks.push(artifact_check(
+                path,
+                ArtifactCheckKind::Text,
+                ValidatorStatus::Fail,
+                *reason,
+                &error,
+                true,
+            ));
+            return GateArtifact {
+                state: ArtifactState::Rejected,
+                content: None,
+                checks,
+                error: Some(error),
+            };
         }
     }
+    let content = content.ok();
+    if content.is_some() {
+        checks.push(artifact_check(
+            path,
+            ArtifactCheckKind::Text,
+            ValidatorStatus::Pass,
+            ArtifactReasonCode::Other,
+            "",
+            true,
+        ));
+    }
+    if let Some(schema) = response_schema {
+        let parsed = match serde_json::from_str::<Value>(
+            content.as_deref().expect("schema requires text"),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                let error = format!("artifact_schema_invalid: artifact is not valid JSON: {error}");
+                checks.push(artifact_check(
+                    path,
+                    ArtifactCheckKind::Json,
+                    ValidatorStatus::Fail,
+                    ArtifactReasonCode::InvalidJson,
+                    &error,
+                    true,
+                ));
+                return GateArtifact {
+                    state: ArtifactState::Rejected,
+                    content: None,
+                    checks,
+                    error: Some(error),
+                };
+            }
+        };
+        checks.push(artifact_check(
+            path,
+            ArtifactCheckKind::Json,
+            ValidatorStatus::Pass,
+            ArtifactReasonCode::Other,
+            "",
+            true,
+        ));
+        if let Err(error) = validate_arc_response(schema, &parsed) {
+            let error = error.to_string();
+            checks.push(artifact_check(
+                path,
+                ArtifactCheckKind::Schema,
+                ValidatorStatus::Fail,
+                ArtifactReasonCode::SchemaMismatch,
+                &error,
+                true,
+            ));
+            return GateArtifact {
+                state: ArtifactState::Rejected,
+                content: None,
+                checks,
+                error: Some(error),
+            };
+        }
+        checks.push(artifact_check(
+            path,
+            ArtifactCheckKind::Schema,
+            ValidatorStatus::Pass,
+            ArtifactReasonCode::Other,
+            "",
+            true,
+        ));
+    }
+    GateArtifact {
+        state: if content.is_some() {
+            ArtifactState::Ready
+        } else {
+            ArtifactState::ReadyWithoutInlineContent
+        },
+        content,
+        checks,
+        error: None,
+    }
+}
+
+fn rejected_artifact(
+    path: Option<&Path>,
+    state: ArtifactState,
+    kind: ArtifactCheckKind,
+    code: ArtifactReasonCode,
+    status: ValidatorStatus,
+    safe_target: bool,
+    error: String,
+) -> GateArtifact {
+    GateArtifact {
+        state,
+        content: None,
+        checks: vec![artifact_check(
+            path.unwrap_or(Path::new("")),
+            kind,
+            status,
+            code,
+            &error,
+            safe_target,
+        )],
+        error: Some(error),
+    }
+}
+
+fn artifact_check(
+    path: &Path,
+    kind: ArtifactCheckKind,
+    status: ValidatorStatus,
+    reason_code: ArtifactReasonCode,
+    reason: &str,
+    safe_target: bool,
+) -> CheckOutcome {
+    CheckOutcome::Artifact(ArtifactCheckOutcome {
+        gate_id: format!("artifact/{kind:?}").to_lowercase(),
+        kind,
+        status,
+        reason_code,
+        reason: reason.to_string(),
+        stderr: None,
+        expected_artifact: (!path.as_os_str().is_empty()).then(|| path.to_path_buf()),
+        observed_artifact: (!path.as_os_str().is_empty()
+            && (status == ValidatorStatus::Pass || kind != ArtifactCheckKind::Exists))
+            .then(|| path.to_path_buf()),
+        schema_pointer: None,
+        safe_target,
+        evidence_ref: None,
+    })
 }
 
 /// Run completion-phase workspace validators and return their typed outcomes.
@@ -982,18 +1199,266 @@ fn resolve_artifact_path(
     files_to_send.iter().find(|p| p.is_file()).cloned()
 }
 
-fn read_small_text_artifact(path: &std::path::Path) -> Option<String> {
+fn read_small_text_artifact(path: &std::path::Path) -> Result<String, ArtifactReasonCode> {
     const MAX_INLINE_BYTES: u64 = 64 * 1024;
-    let meta = std::fs::metadata(path).ok()?;
+    let meta = std::fs::metadata(path).map_err(|_| ArtifactReasonCode::Other)?;
     if meta.len() > MAX_INLINE_BYTES {
-        return None;
+        return Err(ArtifactReasonCode::TooLarge);
     }
-    std::fs::read_to_string(path).ok()
+    std::fs::read_to_string(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::InvalidData {
+            ArtifactReasonCode::InvalidUtf8
+        } else {
+            ArtifactReasonCode::Other
+        }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn gate_candidate(workspace: &Path) -> CompletionCandidate {
+        CompletionCandidate {
+            task_id: octos_core::TaskId::new(),
+            working_dir: workspace.to_path_buf(),
+            proposed_output: "done".into(),
+            files_modified: Vec::new(),
+            files_to_send: Vec::new(),
+            iteration: 0,
+            cumulative_usage: octos_core::TokenUsage::default(),
+            revision: 1,
+        }
+    }
+
+    fn gate_receipt(decision: &CompletionDecision) -> &CompletionReceipt {
+        match decision {
+            CompletionDecision::Pass(receipt)
+            | CompletionDecision::Repairable { receipt, .. }
+            | CompletionDecision::TerminalFailure { receipt, .. } => receipt,
+        }
+    }
+
+    fn validator(id: &str, required: bool) -> ValidatorOutcome {
+        ValidatorOutcome {
+            schema_version: 1,
+            validator_id: id.into(),
+            phase: ValidatorPhase::Completion,
+            kind: "file_exists".into(),
+            repo_label: "mcp-serve/test".into(),
+            required,
+            required_tier: if required { "hard" } else { "soft" }.into(),
+            status: ValidatorStatus::Fail,
+            reason: "missing file".into(),
+            duration_ms: 0,
+            evidence_path: None,
+            stderr: None,
+            started_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn gate_preserves_all_validator_outcomes_and_skips_artifact_after_required_failure() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join("existing.json");
+        std::fs::write(&path, "{}").unwrap();
+        let candidate = gate_candidate(workspace.path());
+        let gate = complete_candidate_verification(
+            &candidate,
+            vec![validator("required", true), validator("optional", false)],
+            Some(path.clone()),
+            true,
+            Some(&serde_json::json!({"type": "object"})),
+        );
+        assert_eq!(gate.outcome.final_state, TaskLifecycleState::Failed);
+        assert_eq!(gate.outcome.validator_results.len(), 2);
+        assert!(
+            gate.outcome
+                .error
+                .as_deref()
+                .unwrap()
+                .starts_with("contract_failed:")
+        );
+        let receipt = gate_receipt(&gate.decision);
+        assert_eq!(receipt.task_id, candidate.task_id);
+        assert_eq!(receipt.candidate_revision, candidate.revision);
+        assert_eq!(receipt.artifact_state, ArtifactState::Unchecked);
+        assert_eq!(receipt.artifact_path.as_deref(), Some(path.as_path()));
+        assert_eq!(receipt.checks.len(), 2);
+    }
+
+    #[test]
+    fn optional_validator_failure_still_checks_artifact_and_passes() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join("result.json");
+        std::fs::write(&path, "{}").unwrap();
+        let candidate = gate_candidate(workspace.path());
+        let gate = complete_candidate_verification(
+            &candidate,
+            vec![validator("optional", false)],
+            Some(path.clone()),
+            true,
+            Some(&serde_json::json!({"type": "object"})),
+        );
+        assert!(matches!(gate.decision, CompletionDecision::Pass(_)));
+        assert_eq!(gate.outcome.final_state, TaskLifecycleState::Ready);
+        assert_eq!(
+            gate.outcome.validator_results[0].status,
+            ValidatorStatus::Fail
+        );
+        let receipt = gate_receipt(&gate.decision);
+        assert_eq!(receipt.artifact_state, ArtifactState::Ready);
+        assert_eq!(receipt.checks.len(), 6);
+    }
+
+    #[test]
+    fn gate_artifact_failures_keep_external_errors_and_typed_reasons() {
+        let workspace = tempfile::tempdir().unwrap();
+        let candidate = gate_candidate(workspace.path());
+        let schema = serde_json::json!({"type": "object", "required": ["count"]});
+        let cases: &[(
+            &str,
+            Option<&[u8]>,
+            ArtifactCheckKind,
+            ArtifactReasonCode,
+            &str,
+        )] = &[
+            (
+                "missing.json",
+                None,
+                ArtifactCheckKind::Exists,
+                ArtifactReasonCode::Missing,
+                "artifact_missing:",
+            ),
+            (
+                "large.json",
+                Some(&[b'X'; 65_537]),
+                ArtifactCheckKind::Text,
+                ArtifactReasonCode::TooLarge,
+                "artifact_schema_invalid:",
+            ),
+            (
+                "utf8.json",
+                Some(&[0xff]),
+                ArtifactCheckKind::Text,
+                ArtifactReasonCode::InvalidUtf8,
+                "artifact_schema_invalid:",
+            ),
+            (
+                "json.json",
+                Some(b"{broken"),
+                ArtifactCheckKind::Json,
+                ArtifactReasonCode::InvalidJson,
+                "artifact_schema_invalid:",
+            ),
+            (
+                "schema.json",
+                Some(b"{}"),
+                ArtifactCheckKind::Schema,
+                ArtifactReasonCode::SchemaMismatch,
+                "artifact_schema_invalid:",
+            ),
+        ];
+        for (name, bytes, kind, reason, prefix) in cases {
+            let path = workspace.path().join(name);
+            if let Some(bytes) = bytes {
+                std::fs::write(&path, bytes).unwrap();
+            }
+            let gate = complete_candidate_verification(
+                &candidate,
+                Vec::new(),
+                Some(path),
+                true,
+                Some(&schema),
+            );
+            assert_eq!(
+                gate.outcome.final_state,
+                TaskLifecycleState::Failed,
+                "{name}"
+            );
+            assert!(
+                gate.outcome.error.as_deref().unwrap().starts_with(prefix),
+                "{name}"
+            );
+            let receipt = gate_receipt(&gate.decision);
+            assert!(matches!(
+                receipt.artifact_state,
+                ArtifactState::Missing | ArtifactState::Rejected
+            ));
+            assert!(receipt.checks.iter().any(|check| matches!(check, CheckOutcome::Artifact(a) if a.kind == *kind && a.reason_code == *reason && a.status == ValidatorStatus::Fail)), "{name}");
+        }
+        let gate = complete_candidate_verification(&candidate, Vec::new(), None, false, None);
+        assert!(
+            gate.outcome
+                .error
+                .as_deref()
+                .unwrap()
+                .starts_with("contract_failed:")
+        );
+        assert_eq!(
+            gate_receipt(&gate.decision).artifact_state,
+            ArtifactState::Missing
+        );
+        assert!(matches!(
+            gate.decision,
+            CompletionDecision::TerminalFailure { .. }
+        ));
+    }
+
+    #[test]
+    fn legacy_artifact_without_schema_keeps_non_json_and_binary_ready() {
+        let workspace = tempfile::tempdir().unwrap();
+        let candidate = gate_candidate(workspace.path());
+        let text = workspace.path().join("plain.txt");
+        std::fs::write(&text, "not JSON").unwrap();
+        let gate = complete_candidate_verification(&candidate, Vec::new(), Some(text), false, None);
+        assert!(matches!(gate.decision, CompletionDecision::Pass(_)));
+        assert_eq!(gate.outcome.artifact_content.as_deref(), Some("not JSON"));
+        let binary = workspace.path().join("binary.bin");
+        std::fs::write(&binary, [0xff]).unwrap();
+        let gate =
+            complete_candidate_verification(&candidate, Vec::new(), Some(binary), false, None);
+        assert!(matches!(gate.decision, CompletionDecision::Pass(_)));
+        assert_eq!(gate.outcome.artifact_content, None);
+        assert_eq!(
+            gate_receipt(&gate.decision).artifact_state,
+            ArtifactState::ReadyWithoutInlineContent
+        );
+        let native_text = workspace.path().join("native.txt");
+        std::fs::write(&native_text, "still not JSON").unwrap();
+        let gate =
+            complete_candidate_verification(&candidate, Vec::new(), Some(native_text), true, None);
+        assert!(matches!(gate.decision, CompletionDecision::Pass(_)));
+        assert_eq!(
+            gate.outcome.artifact_content.as_deref(),
+            Some("still not JSON")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_artifact_symlink_outside_workspace_is_rejected() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("result.json");
+        std::fs::write(&target, "{}").unwrap();
+        let link = workspace.path().join("result.json");
+        std::os::unix::fs::symlink(target, &link).unwrap();
+        let candidate = gate_candidate(workspace.path());
+        let gate = complete_candidate_verification(&candidate, Vec::new(), Some(link), true, None);
+        assert!(
+            gate.outcome
+                .error
+                .as_deref()
+                .unwrap()
+                .starts_with("artifact_schema_invalid:")
+        );
+        assert!(matches!(
+            gate.decision,
+            CompletionDecision::TerminalFailure { .. }
+        ));
+        assert!(gate_receipt(&gate.decision).checks.iter().any(|check| matches!(check, CheckOutcome::Artifact(a) if a.kind == ArtifactCheckKind::Location && a.reason_code == ArtifactReasonCode::UnsafeLocation && !a.safe_target)));
+    }
 
     #[test]
     fn http_transport_parses() {
@@ -1093,7 +1558,10 @@ mod tests {
         // Write 128 KiB — above the 64 KiB inline ceiling.
         let payload = vec![b'A'; 128 * 1024];
         std::fs::write(&path, payload).unwrap();
-        assert!(read_small_text_artifact(&path).is_none());
+        assert!(matches!(
+            read_small_text_artifact(&path),
+            Err(ArtifactReasonCode::TooLarge)
+        ));
     }
 
     #[test]
@@ -1101,7 +1569,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("small.txt");
         std::fs::write(&path, b"hello").unwrap();
-        assert_eq!(read_small_text_artifact(&path).as_deref(), Some("hello"));
+        assert_eq!(read_small_text_artifact(&path).as_deref(), Ok("hello"));
     }
 }
 

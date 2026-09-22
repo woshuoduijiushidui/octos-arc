@@ -60,6 +60,7 @@ fn receipt(candidate: &CompletionCandidate, checks: Vec<CheckOutcome>) -> Comple
         candidate_revision: candidate.revision,
         gate_policy_version: 1,
         checks,
+        artifact_state: ArtifactState::Unchecked,
         artifact_path: None,
         artifact_content: None,
         validator_references: BTreeMap::new(),

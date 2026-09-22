@@ -1,4 +1,4 @@
-//! Pure completion-gate decisions. M2-M4 supply checks from the real MCP gate.
+//! Pure completion-gate decisions over candidate-bound verification receipts.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -151,10 +151,20 @@ pub struct CompletionReceipt {
     pub candidate_revision: u64,
     pub gate_policy_version: u32,
     pub checks: Vec<CheckOutcome>,
+    pub artifact_state: ArtifactState,
     pub artifact_path: Option<PathBuf>,
     pub artifact_content: Option<String>,
     /// Validator evidence is attached only after H03 recall is verified.
     pub validator_references: BTreeMap<String, RecoveryReference>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArtifactState {
+    Unchecked,
+    Missing,
+    Rejected,
+    Ready,
+    ReadyWithoutInlineContent,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
