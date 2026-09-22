@@ -23,7 +23,9 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use octos_agent::mcp_server::{McpSessionDispatch, SessionLifecycleObserver};
+use octos_agent::mcp_server::{
+    McpServerError, McpSessionDispatch, McpSessionOutcome, SessionLifecycleObserver,
+};
 use octos_agent::task_supervisor::TaskLifecycleState;
 use octos_agent::validators::ValidatorStatus;
 use octos_agent::{SandboxConfig, SandboxMode};
@@ -338,6 +340,242 @@ fn sample_arc_input(
             "skills": ["/skills/leaf-full-design/"]
         }
     })
+}
+
+fn write_m0_completion_validator(
+    workspace: &std::path::Path,
+    spec: octos_agent::workspace_policy::ValidatorSpec,
+) {
+    use octos_agent::workspace_policy::{
+        Validator, ValidatorPhaseKind, WorkspacePolicy, WorkspacePolicyKind,
+        WorkspaceSnapshotTrigger, WorkspaceTrackingPolicy, WorkspaceVersionControlPolicy,
+        WorkspaceVersionControlProvider, write_workspace_policy,
+    };
+    use octos_agent::{
+        ValidationPolicy, WorkspaceArtifactsPolicy, workspace_policy::WorkspacePolicyWorkspace,
+    };
+
+    let policy = WorkspacePolicy {
+        schema_version: octos_agent::WORKSPACE_POLICY_SCHEMA_VERSION,
+        workspace: WorkspacePolicyWorkspace {
+            kind: WorkspacePolicyKind::Slides,
+        },
+        version_control: WorkspaceVersionControlPolicy {
+            provider: WorkspaceVersionControlProvider::Git,
+            auto_init: false,
+            trigger: WorkspaceSnapshotTrigger::TurnEnd,
+            fail_on_error: false,
+        },
+        tracking: WorkspaceTrackingPolicy { ignore: Vec::new() },
+        validation: ValidationPolicy {
+            on_turn_end: Vec::new(),
+            on_source_change: Vec::new(),
+            on_completion: Vec::new(),
+            validators: vec![Validator {
+                id: "m0-gate".into(),
+                required: true,
+                soft_fail: false,
+                timeout_ms: None,
+                phase: ValidatorPhaseKind::Completion,
+                spec,
+            }],
+        },
+        artifacts: WorkspaceArtifactsPolicy::default(),
+        spawn_tasks: std::collections::BTreeMap::new(),
+        compaction: None,
+    };
+    write_workspace_policy(workspace, &policy).unwrap();
+}
+
+fn assert_m0_terminal_failure(
+    outcome: &McpSessionOutcome,
+    observer: &RecordingObserver,
+    provider: &ScriptedLlmProvider,
+    prefix: &str,
+    validator_status: Option<ValidatorStatus>,
+) {
+    assert_eq!(provider.requests().len(), 1);
+    assert_eq!(
+        observer.snapshot(),
+        vec![
+            TaskLifecycleState::Running,
+            TaskLifecycleState::Verifying,
+            TaskLifecycleState::Failed,
+        ]
+    );
+    assert_eq!(outcome.final_state, TaskLifecycleState::Failed);
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with(prefix)
+    );
+    assert!(outcome.artifact_path.is_none());
+    assert!(outcome.artifact_content.is_none());
+    assert_eq!(outcome.cost.input_tokens, 42);
+    assert_eq!(outcome.cost.output_tokens, 17);
+    match validator_status {
+        Some(status) => {
+            assert_eq!(outcome.validator_results.len(), 1);
+            assert_eq!(outcome.validator_results[0].validator_id, "m0-gate");
+            assert_eq!(outcome.validator_results[0].status, status);
+        }
+        None => assert!(outcome.validator_results.is_empty()),
+    }
+}
+
+#[tokio::test]
+async fn h06_m0_required_validator_fail_is_terminal() {
+    use octos_agent::workspace_policy::ValidatorSpec;
+
+    let workspace = TempDir::new().unwrap();
+    std::fs::write(workspace.path().join("result.json"), "{}").unwrap();
+    write_m0_completion_validator(
+        workspace.path(),
+        ValidatorSpec::FileExists {
+            path: "missing-required.txt".into(),
+            min_bytes: None,
+        },
+    );
+    let provider = ScriptedLlmProvider::new(vec![end_turn("done")]);
+    let harness = DispatchHarness::build(provider.clone(), workspace);
+    let observer = RecordingObserver::new();
+    let outcome = harness
+        .dispatch
+        .run_session(
+            "coding",
+            &json!({"prompt": "deliver result", "expected_artifact": "result.json"}),
+            &observer,
+        )
+        .await
+        .unwrap();
+
+    assert_m0_terminal_failure(
+        &outcome,
+        &observer,
+        &provider,
+        "contract_failed:",
+        Some(ValidatorStatus::Fail),
+    );
+}
+
+#[tokio::test]
+async fn h06_m0_missing_arc_artifact_is_terminal() {
+    let workspace = TempDir::new().unwrap();
+    let provider = ScriptedLlmProvider::new(vec![end_turn("done")]);
+    let harness = DispatchHarness::build(provider.clone(), workspace);
+    let observer = RecordingObserver::new();
+    let outcome = harness
+        .dispatch
+        .run_session(
+            "coding",
+            &sample_arc_input(
+                harness._workspace.path(),
+                ".arc/delegated/missing.json",
+                Some(json!({"type": "object"})),
+            ),
+            &observer,
+        )
+        .await
+        .unwrap();
+
+    assert_m0_terminal_failure(&outcome, &observer, &provider, "artifact_missing:", None);
+}
+
+#[tokio::test]
+async fn h06_m0_invalid_arc_schema_is_terminal() {
+    let workspace = TempDir::new().unwrap();
+    let path = workspace.path().join(".arc/delegated/invalid.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, r#"{"count":"wrong"}"#).unwrap();
+    let provider = ScriptedLlmProvider::new(vec![end_turn("done")]);
+    let harness = DispatchHarness::build(provider.clone(), workspace);
+    let observer = RecordingObserver::new();
+    let outcome = harness
+        .dispatch
+        .run_session(
+            "coding",
+            &sample_arc_input(
+                harness._workspace.path(),
+                ".arc/delegated/invalid.json",
+                Some(json!({
+                    "type": "object", "required": ["count"],
+                    "properties": {"count": {"type": "integer"}}
+                })),
+            ),
+            &observer,
+        )
+        .await
+        .unwrap();
+
+    assert_m0_terminal_failure(
+        &outcome,
+        &observer,
+        &provider,
+        "artifact_schema_invalid:",
+        None,
+    );
+}
+
+#[tokio::test]
+async fn h06_m0_validator_error_is_terminal() {
+    use octos_agent::workspace_policy::ValidatorSpec;
+
+    let workspace = TempDir::new().unwrap();
+    std::fs::write(workspace.path().join("result.json"), "{}").unwrap();
+    write_m0_completion_validator(
+        workspace.path(),
+        ValidatorSpec::FileExists {
+            path: "${args.unavailable}".into(),
+            min_bytes: None,
+        },
+    );
+    let provider = ScriptedLlmProvider::new(vec![end_turn("done")]);
+    let harness = DispatchHarness::build(provider.clone(), workspace);
+    let observer = RecordingObserver::new();
+    let outcome = harness
+        .dispatch
+        .run_session(
+            "coding",
+            &json!({"prompt": "deliver result", "expected_artifact": "result.json"}),
+            &observer,
+        )
+        .await
+        .unwrap();
+
+    assert_m0_terminal_failure(
+        &outcome,
+        &observer,
+        &provider,
+        "contract_failed:",
+        Some(ValidatorStatus::Error),
+    );
+}
+
+#[tokio::test]
+async fn h06_m0_invalid_arc_input_never_calls_provider() {
+    let workspace = TempDir::new().unwrap();
+    let provider = ScriptedLlmProvider::new(vec![end_turn("must not run")]);
+    let harness = DispatchHarness::build(provider.clone(), workspace);
+    let mut input = sample_arc_input(
+        harness._workspace.path(),
+        ".arc/delegated/result.json",
+        Some(json!({"type": "object"})),
+    );
+    input["expected_artifact"] = json!("../outside.json");
+    let observer = RecordingObserver::new();
+    let result = harness
+        .dispatch
+        .run_session("coding", &input, &observer)
+        .await;
+
+    assert!(matches!(result, Err(McpServerError::InvalidParams(_))));
+    assert!(provider.requests().is_empty());
+    assert_eq!(
+        observer.snapshot(),
+        vec![TaskLifecycleState::Running, TaskLifecycleState::Failed]
+    );
 }
 
 #[tokio::test]

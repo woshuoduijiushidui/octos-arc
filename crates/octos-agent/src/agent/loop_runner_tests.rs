@@ -2504,6 +2504,69 @@ async fn run_task_collects_files_to_send_without_file_modified() {
 }
 
 #[tokio::test]
+async fn h06_m0_second_run_task_rebuilds_messages_and_usage() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut tools = ToolRegistry::with_builtins(dir.path());
+    tools.register(NamedEchoTool {
+        name: "alpha",
+        output: "M0_FIRST_RUN_TOOL_OUTPUT",
+    });
+    let requests: RecordedRequests = Arc::new(StdMutex::new(Vec::new()));
+    let provider: Arc<dyn LlmProvider> = Arc::new(RequestRecordingProvider::new(
+        vec![
+            tool_use(
+                vec![ToolCall {
+                    id: "m0-tool-call".into(),
+                    name: "alpha".into(),
+                    arguments: serde_json::json!({}),
+                    metadata: None,
+                }],
+                5,
+                7,
+            ),
+            end_turn("M0_FIRST_RUN_ANSWER", 11, 13),
+            end_turn("M0_SECOND_RUN_ANSWER", 17, 19),
+        ],
+        Arc::clone(&requests),
+    ));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent =
+        Agent::new(AgentId::new("m0-agent"), provider, tools, memory).with_config(AgentConfig {
+            save_episodes: false,
+            ..Default::default()
+        });
+    let task = Task::new(
+        TaskKind::Custom {
+            name: "m0-task".into(),
+            params: serde_json::json!({"goal": "deliver"}),
+        },
+        TaskContext {
+            working_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        },
+    );
+
+    let first = agent.run_task(&task).await.unwrap();
+    let second = agent.run_task(&task).await.unwrap();
+    assert_eq!(first.token_usage.input_tokens, 16);
+    assert_eq!(first.token_usage.output_tokens, 20);
+    assert_eq!(second.token_usage.input_tokens, 17);
+    assert_eq!(second.token_usage.output_tokens, 19);
+    let captured = requests.lock().unwrap_or_else(|error| error.into_inner());
+    assert_eq!(captured.len(), 3);
+    assert!(captured[1].0.iter().any(|message| {
+        message.role == MessageRole::Tool && message.content.contains("M0_FIRST_RUN_TOOL_OUTPUT")
+    }));
+    assert!(captured[2].0.iter().any(|message| {
+        message.role == MessageRole::User && message.content.contains("m0-task")
+    }));
+    assert!(!captured[2].0.iter().any(|message| {
+        message.content.contains("M0_FIRST_RUN_TOOL_OUTPUT")
+            || message.content.contains("M0_FIRST_RUN_ANSWER")
+    }));
+}
+
+#[tokio::test]
 async fn run_task_continues_after_max_tokens_in_same_loop() {
     let dir = tempfile::tempdir().unwrap();
     let tools = ToolRegistry::with_builtins(dir.path());
