@@ -149,12 +149,14 @@ impl LoopDetector {
             ProgressDecision::TerminalNonRetryable => "terminal_non_retryable",
         };
         let progress_class = match outcome.class {
+            ProgressClass::StateChanged => "state_changed",
             ProgressClass::NoProgress => "no_progress",
             ProgressClass::EvidenceChanged => "evidence_changed",
             ProgressClass::Unknown => "unknown",
         };
         let confidence = match observation.confidence {
             ObservationConfidence::Typed => "typed",
+            ObservationConfidence::TrustedAdapter => "trusted_adapter",
             ObservationConfidence::ExactTextFallback => "exact_text_fallback",
         };
         counter!(
@@ -270,6 +272,25 @@ impl LoopDetector {
             "\n\n[FILE CHURN] `{path}` has been modified {} times in this turn. Stop patching blindly: inspect the rendered/resulting state, identify the root cause, and choose one bounded next change.{escalation_note}",
             *edits
         ))
+    }
+
+    /// H07 counts churn only when trusted final-state evidence proves that a
+    /// file reached a new confirmed version. With H07 disabled, preserve the
+    /// legacy success-based behavior for A compatibility.
+    pub(crate) fn record_file_mutation_progress(
+        &mut self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        success: bool,
+        progress: Option<ProgressClass>,
+    ) -> Option<String> {
+        if !self.no_progress {
+            return self.record_file_mutation(tool_name, args, success);
+        }
+        if progress != Some(ProgressClass::StateChanged) {
+            return None;
+        }
+        self.record_file_mutation(tool_name, args, true)
     }
 
     pub fn take_file_churn_signal(&mut self) -> Option<FileChurnSignal> {
@@ -696,6 +717,35 @@ mod tests {
                 .record_file_mutation("edit_file", &args, no_change.success)
                 .is_some()
         );
+        assert_eq!(detector.take_file_churn_signal().unwrap().edits, 2);
+    }
+
+    #[test]
+    fn h07_m4_churn_counts_only_distinct_confirmed_final_versions() {
+        let mut detector = detector_with_churn_threshold(2).with_no_progress(true);
+        let args = json!({"path": "same.txt"});
+        for progress in [
+            ProgressClass::NoProgress,
+            ProgressClass::Unknown,
+            ProgressClass::StateChanged,
+            ProgressClass::NoProgress,
+        ] {
+            assert!(
+                detector
+                    .record_file_mutation_progress("edit_file", &args, true, Some(progress))
+                    .is_none()
+            );
+        }
+        assert!(detector.take_file_churn_signal().is_none());
+        let hint = detector
+            .record_file_mutation_progress(
+                "edit_file",
+                &args,
+                true,
+                Some(ProgressClass::StateChanged),
+            )
+            .expect("second distinct final version should reach churn threshold");
+        assert!(hint.contains("FILE CHURN"));
         assert_eq!(detector.take_file_churn_signal().unwrap().edits, 2);
     }
 

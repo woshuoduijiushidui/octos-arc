@@ -21,7 +21,7 @@ use super::loop_state::{LoopDecision, LoopRetryState, SHELL_SPIRAL_VARIANT};
 use super::message_repair::sanitize_tool_call_id;
 use super::progress_observation::{
     MutationOutcome, ObservationConfidence, ObservationDiagnostic, ObservationStatus,
-    OperationFamily, ProgressObservation,
+    OperationFamily, ProgressClass, ProgressObservation,
 };
 use super::turn_state::{LoopRetryReason, LoopTurnState, attach_partial_usage};
 use super::verifier::{TurnLedger, ledger_entry_from_tool_result};
@@ -3421,6 +3421,7 @@ impl Agent {
         // The H07 path shares exact-result history between both loops. The
         // legacy third-result hint remains unchanged when H07 is disabled.
         let mut detached_hint = None;
+        let mut progress_by_index = vec![None; merged.len()];
         {
             use std::collections::HashMap;
             let id_to_call: HashMap<&str, (&str, &serde_json::Value)> = response
@@ -3460,7 +3461,7 @@ impl Agent {
                 let trusted_read_key = ordered_observations.get(index).and_then(|observation| {
                     (observation.family == OperationFamily::Read
                         && observation.call_id == id
-                        && observation.confidence == ObservationConfidence::Typed
+                        && observation.confidence != ObservationConfidence::ExactTextFallback
                         && observation.state_digest.is_some())
                     .then_some(observation.evidence_key.as_str())
                 });
@@ -3474,14 +3475,18 @@ impl Agent {
                 // M3 records the typed terminal decision in the episode and
                 // metric. M5 will route it through task/spawn's non-retryable
                 // lifecycle; until then only the bounded hints affect output.
-                let semantic_hint = if loop_detector.no_progress_enabled() && synchronous_result {
+                let semantic_outcome = if loop_detector.no_progress_enabled() && synchronous_result
+                {
                     ordered_observations
                         .get(index)
                         .map(|observation| loop_detector.observe_semantic(observation))
-                        .and_then(|outcome| outcome.hint)
                 } else {
                     None
                 };
+                if let Some(outcome) = semantic_outcome.as_ref() {
+                    progress_by_index[index] = Some(outcome.class);
+                }
+                let semantic_hint = semantic_outcome.and_then(|outcome| outcome.hint);
                 let repeating = if let Some(hint) = semantic_hint.or(exact_hint) {
                     if loop_detector.no_progress_enabled()
                         && (self.output_state.policy.enabled
@@ -3497,10 +3502,11 @@ impl Agent {
                 } else {
                     false
                 };
-                if let Some(hint) = loop_detector.record_file_mutation(
+                if let Some(hint) = loop_detector.record_file_mutation_progress(
                     name,
                     args,
                     success_by_id.get(id).copied().unwrap_or(false),
+                    progress_by_index[index],
                 ) {
                     message.content.push_str(&hint);
                 }
@@ -3518,13 +3524,20 @@ impl Agent {
             }
         }
 
-        // M6.2: record a productive-tool-call signal per merged Tool message
-        // so the `LoopRetryState` grace-call path sees the loop making progress.
-        // A tool message counts as productive when it is neither an error
-        // ("Error:" prefix), a panic, a timeout, nor a hook/session-limit
-        // block — i.e. the tool produced output the LLM can act on.
-        for message in &merged {
-            if message.role == MessageRole::Tool && is_productive_tool_message(&message.content) {
+        // H07 authoritative observations own grace classification. This keeps
+        // no-change, repeated reads and typed failures from gaining grace via
+        // a long body, an exit-code marker, or an appended H07 hint. Tools
+        // without typed facts retain the legacy text heuristic.
+        for (index, message) in merged.iter().enumerate() {
+            let observation = ordered_observations.get(index);
+            if message.role == MessageRole::Tool
+                && should_record_productive_tool_call(
+                    loop_detector.no_progress_enabled(),
+                    observation,
+                    progress_by_index[index],
+                    &message.content,
+                )
+            {
                 retry_state.record_productive_tool_call();
             }
         }
@@ -3729,6 +3742,23 @@ fn is_productive_tool_message(content: &str) -> bool {
     // messages like "File too large..." or "Symlinks are not allowed" fall
     // under this bound so they never inflate the productive counter.
     trimmed.len() >= 128 && !trimmed.to_ascii_lowercase().contains("failed to")
+}
+
+fn should_record_productive_tool_call(
+    no_progress_enabled: bool,
+    observation: Option<&ProgressObservation>,
+    progress: Option<ProgressClass>,
+    content: &str,
+) -> bool {
+    if no_progress_enabled
+        && observation.is_some_and(ProgressObservation::has_authoritative_progress)
+    {
+        return matches!(
+            progress,
+            Some(ProgressClass::StateChanged | ProgressClass::EvidenceChanged)
+        );
+    }
+    is_productive_tool_message(content)
 }
 
 fn check_per_tool_limit(

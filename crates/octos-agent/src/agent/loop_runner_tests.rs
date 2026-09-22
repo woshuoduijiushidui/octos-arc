@@ -4422,6 +4422,61 @@ fn productive_message_rejects_failed_to_prefix_in_long_body() {
     assert!(!is_productive_tool_message(&body));
 }
 
+#[test]
+fn h07_m4_typed_progress_overrides_legacy_productive_text_heuristic() {
+    let call = ToolCall {
+        id: "typed".into(),
+        name: "edit_file".into(),
+        arguments: serde_json::json!({"path": "a.rs"}),
+        metadata: None,
+    };
+    let mut typed =
+        ProgressObservation::placeholder(&call, ObservationStatus::Success, "typed mutation");
+    typed.confidence = ObservationConfidence::Typed;
+    typed.outcome = Some(MutationOutcome::NoChange);
+    typed.semantic_eligible = true;
+    let misleading = format!(
+        "{}\nExit code: 0{}",
+        "unchanged output ".repeat(20),
+        crate::loop_detect::H07_EXACT_HINT
+    );
+    assert!(!should_record_productive_tool_call(
+        true,
+        Some(&typed),
+        Some(ProgressClass::NoProgress),
+        &misleading,
+    ));
+    assert!(!should_record_productive_tool_call(
+        true,
+        Some(&typed),
+        Some(ProgressClass::Unknown),
+        &misleading,
+    ));
+    assert!(should_record_productive_tool_call(
+        true,
+        Some(&typed),
+        Some(ProgressClass::StateChanged),
+        "ok",
+    ));
+
+    let untyped = ProgressObservation::placeholder(
+        &ToolCall {
+            id: "legacy".into(),
+            name: "legacy_tool".into(),
+            arguments: serde_json::json!({}),
+            metadata: None,
+        },
+        ObservationStatus::Success,
+        "legacy",
+    );
+    assert!(should_record_productive_tool_call(
+        true,
+        Some(&untyped),
+        Some(ProgressClass::Unknown),
+        &misleading,
+    ));
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Review A F-001 — dispatch_loop_error wiring.
 // ─────────────────────────────────────────────────────────────────────
@@ -5659,6 +5714,136 @@ async fn h07_m3_task_uses_the_same_semantic_episode() {
     );
 }
 
+#[derive(Clone, Copy)]
+enum H07M4MutationMode {
+    NoChange,
+    Changing,
+}
+
+struct H07M4MutationTool {
+    mode: H07M4MutationMode,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for H07M4MutationTool {
+    fn name(&self) -> &str {
+        "edit_file"
+    }
+    fn description(&self) -> &str {
+        "typed mutation progress fixture"
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+    async fn execute(&self, _args: &serde_json::Value) -> Result<ToolResult> {
+        let n = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+        let (outcome, modified, final_char) = match self.mode {
+            H07M4MutationMode::NoChange => ("no_change", false, 'a'),
+            H07M4MutationMode::Changing => (
+                "modified",
+                true,
+                char::from_digit((n + 10) as u32, 16).unwrap(),
+            ),
+        };
+        Ok(ToolResult {
+            output: format!(
+                "{}\nExit code: 0",
+                "substantive but unchanged output ".repeat(8)
+            ),
+            success: true,
+            file_modified: modified.then(|| "a.rs".into()),
+            structured_metadata: Some(serde_json::json!({
+                "outcome": outcome,
+                "file_modified": modified,
+                "final_state": "confirmed",
+                "write_version": {"content_sha256": format!("sha256:{}", "f".repeat(64))},
+                "final_version": {"content_sha256": format!("sha256:{}", final_char.to_string().repeat(64))},
+                "changed_range": {"before": {"start": 1, "count": n + 1}},
+            })),
+            ..Default::default()
+        })
+    }
+}
+
+fn h07_m4_budget_responses() -> Vec<ChatResponse> {
+    (0..2)
+        .map(|n| {
+            tool_use(
+                vec![ToolCall {
+                    id: format!("mutation_{n}"),
+                    name: "edit_file".into(),
+                    arguments: serde_json::json!({
+                        "path": "a.rs", "old_string": format!("attempt-{n}")
+                    }),
+                    metadata: None,
+                }],
+                1,
+                1,
+            )
+        })
+        .chain(std::iter::once(end_turn("done", 1, 1)))
+        .collect()
+}
+
+#[tokio::test]
+async fn h07_m4_no_change_long_success_gets_no_budget_grace() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(ScriptedProvider::new(h07_m4_budget_responses()));
+    let mut tools = ToolRegistry::new();
+    tools.register(H07M4MutationTool {
+        mode: H07M4MutationMode::NoChange,
+        calls: calls.clone(),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("h07-m4-no-change"),
+        provider.clone(),
+        tools,
+        memory,
+    )
+    .with_config(AgentConfig {
+        no_progress: true,
+        max_iterations: 2,
+        save_episodes: false,
+        ..Default::default()
+    });
+    let result = agent.process_message("edit", &[], vec![]).await.unwrap();
+    assert_ne!(result.content, "done");
+    assert_eq!(calls.load(AtomicOrdering::SeqCst), 2);
+    assert_eq!(provider.prompts.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn h07_m4_distinct_final_versions_remain_productive() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(ScriptedProvider::new(h07_m4_budget_responses()));
+    let mut tools = ToolRegistry::new();
+    tools.register(H07M4MutationTool {
+        mode: H07M4MutationMode::Changing,
+        calls: calls.clone(),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("h07-m4-changing"),
+        provider.clone(),
+        tools,
+        memory,
+    )
+    .with_config(AgentConfig {
+        no_progress: true,
+        max_iterations: 2,
+        save_episodes: false,
+        ..Default::default()
+    });
+    let result = agent.process_message("edit", &[], vec![]).await.unwrap();
+    assert_eq!(result.content, "done");
+    assert_eq!(calls.load(AtomicOrdering::SeqCst), 2);
+    assert_eq!(provider.prompts.lock().unwrap().len(), 3);
+}
+
 #[tokio::test]
 async fn h07_m2_conversation_hints_then_rejects_whole_batch_before_execution() {
     let dir = tempfile::tempdir().unwrap();
@@ -5856,10 +6041,7 @@ async fn h07_m2_read_hint_preserves_h03_view_and_recovery_fields() {
     assert_eq!(prompts.len(), 3);
     let prompt = &prompts[2];
     assert!(prompt.iter().any(|message| {
-        message.role == MessageRole::System
-            && message
-                .content
-                .contains(crate::loop_detect::H07_EXACT_HINT.trim())
+        message.role == MessageRole::System && message.content.contains("[NO PROGRESS]")
     }));
     let tool = prompt
         .iter()

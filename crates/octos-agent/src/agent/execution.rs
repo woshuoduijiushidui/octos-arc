@@ -4081,7 +4081,7 @@ mod tests {
         );
         assert_eq!(
             observations[0].confidence,
-            super::super::progress_observation::ObservationConfidence::Typed
+            super::super::progress_observation::ObservationConfidence::TrustedAdapter
         );
         assert!(messages[0].content.contains("alpha"));
     }

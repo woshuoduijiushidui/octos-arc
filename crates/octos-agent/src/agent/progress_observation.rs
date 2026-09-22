@@ -38,6 +38,7 @@ pub(crate) enum MutationOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ObservationConfidence {
     Typed,
+    TrustedAdapter,
     ExactTextFallback,
 }
 
@@ -122,7 +123,13 @@ impl ObservationFacts {
                 observation.diagnostic = Some(ObservationDiagnostic::ConflictingMutationFields);
             } else {
                 observation.outcome = outcome.or_else(|| {
-                    (result.success && path_modified).then_some(MutationOutcome::Modified)
+                    if result.success && path_modified {
+                        Some(MutationOutcome::Modified)
+                    } else if result.success && meta_modified == Some(false) {
+                        Some(MutationOutcome::NoChange)
+                    } else {
+                        None
+                    }
                 });
                 if observation.outcome.is_some() {
                     observation.confidence = ObservationConfidence::Typed;
@@ -140,8 +147,69 @@ impl ObservationFacts {
                         .and_then(Value::as_str)
                         .filter(|value| valid_sha256(value))
                         .map(str::to_owned);
+                    if let Some(state_digest) = observation.state_digest.as_deref() {
+                        // The final confirmed version is authoritative. Do not
+                        // use write_version or changed_range: a formatter may
+                        // change both after the tool write, and a range alone
+                        // does not prove a distinct final state.
+                        let outcome = match observation.outcome {
+                            Some(MutationOutcome::Modified) => "modified",
+                            Some(MutationOutcome::NoChange) => "no_change",
+                            _ => "unknown",
+                        };
+                        observation.evidence_key = digest(
+                            &serde_json::to_vec(&(outcome, state_digest)).unwrap_or_default(),
+                        );
+                        observation.semantic_eligible = true;
+                    }
                 }
             }
+        }
+
+        if call.name == "recall"
+            && (call.arguments.get("query").is_some()
+                || call.arguments.get("max_matches").is_some())
+            && result.success
+            && let Ok(search) = serde_json::from_str::<Value>(&result.output)
+            && let (Some(output_id), Some(stream), Some(query)) = (
+                search.get("output_id").and_then(Value::as_str),
+                search.get("stream").and_then(Value::as_str),
+                call.arguments.get("query").and_then(Value::as_str),
+            )
+        {
+            // H03 recall-search adapter allowlist. Match coordinates and the
+            // bounded search window are stable evidence; snippets, limits,
+            // timing and recovery IDs are presentation/control fields.
+            let matches: Vec<_> = search
+                .get("matches")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(|entry| (entry.get("start").cloned(), entry.get("end").cloned()))
+                .collect();
+            observation.family = OperationFamily::Search;
+            observation.target_key = digest(
+                &serde_json::to_vec(&(
+                    "recall_search",
+                    output_id,
+                    stream,
+                    digest(query.as_bytes()),
+                ))
+                .unwrap_or_default(),
+            );
+            observation.target_label = "saved output search".to_owned();
+            observation.evidence_key = digest(
+                &serde_json::to_vec(&(
+                    search.get("searched_range"),
+                    matches,
+                    search.get("search_complete"),
+                    search.get("artifact_complete"),
+                    search.get("next_offset"),
+                ))
+                .unwrap_or_default(),
+            );
+            observation.confidence = ObservationConfidence::TrustedAdapter;
+            observation.semantic_eligible = true;
         }
 
         if let Some(code) = metadata
@@ -260,14 +328,23 @@ impl ObservationFacts {
     ) -> ProgressObservation {
         if self.0.evidence_key.is_empty() {
             if let Some((source, ranges, transformed)) = source
-                && let OutputSource::File { sha256, .. } = source
+                && let OutputSource::File { target, sha256 } = source
                 && valid_sha256(sha256)
                 && !transformed
             {
+                self.0.target_key = digest(
+                    &serde_json::to_vec(&(OperationFamily::Read as u8, target)).unwrap_or_default(),
+                );
+                self.0.target_label = target
+                    .rsplit(['/', '\\'])
+                    .find(|part| !part.is_empty())
+                    .map(|part| bounded(part, 96))
+                    .unwrap_or_else(|| "file".to_owned());
                 self.0.state_digest = Some(sha256.clone());
                 self.0.evidence_key =
                     digest(&serde_json::to_vec(&(source, ranges)).unwrap_or_default());
-                self.0.confidence = ObservationConfidence::Typed;
+                self.0.confidence = ObservationConfidence::TrustedAdapter;
+                self.0.semantic_eligible = true;
             } else {
                 self.0.evidence_key = digest(visible.as_bytes());
             }
@@ -282,11 +359,19 @@ impl ProgressObservation {
             self.state_digest = None;
             self.evidence_key = digest(visible.as_bytes());
             self.confidence = ObservationConfidence::ExactTextFallback;
+            self.semantic_eligible = false;
         }
     }
 
     fn base(call: &ToolCall) -> Self {
-        let operation_family = family(&call.name);
+        let operation_family = if call.name == "recall"
+            && (call.arguments.get("query").is_some()
+                || call.arguments.get("max_matches").is_some())
+        {
+            OperationFamily::Search
+        } else {
+            family(&call.name)
+        };
         let path = call
             .arguments
             .get("path")
@@ -324,6 +409,10 @@ impl ProgressObservation {
         observation.status = status;
         observation.evidence_key = digest(visible.as_bytes());
         observation
+    }
+
+    pub fn has_authoritative_progress(&self) -> bool {
+        self.confidence != ObservationConfidence::ExactTextFallback || self.diagnostic.is_some()
     }
 }
 
@@ -366,6 +455,7 @@ const MAX_HINT_BYTES: usize = 320;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ProgressClass {
+    StateChanged,
     NoProgress,
     EvidenceChanged,
     Unknown,
@@ -444,7 +534,7 @@ impl EpisodeTracker {
             }
         }
         if !observation.semantic_eligible
-            || observation.confidence != ObservationConfidence::Typed
+            || observation.confidence == ObservationConfidence::ExactTextFallback
             || observation.evidence_key.is_empty()
         {
             return EpisodeOutcome {
@@ -496,14 +586,18 @@ impl EpisodeTracker {
                 hint,
             };
         }
-        let class = if self
+        let known_scope = self
             .episodes
             .iter()
-            .any(|episode| episode.key.same_scope(&key))
-        {
-            ProgressClass::EvidenceChanged
-        } else {
-            ProgressClass::Unknown
+            .any(|episode| episode.key.same_scope(&key));
+        let class = match (observation.family, observation.outcome) {
+            (OperationFamily::Mutate, Some(MutationOutcome::Modified)) => {
+                ProgressClass::StateChanged
+            }
+            (OperationFamily::Mutate, Some(MutationOutcome::NoChange)) => ProgressClass::NoProgress,
+            (OperationFamily::Read | OperationFamily::Search, _) => ProgressClass::EvidenceChanged,
+            _ if known_scope => ProgressClass::EvidenceChanged,
+            _ => ProgressClass::Unknown,
         };
         if self.episodes.len() == MAX_EPISODES {
             self.episodes.pop_front();
@@ -535,6 +629,220 @@ mod tests {
     use super::*;
     use crate::output_recovery::{OutputRange, OutputStream};
     use serde_json::json;
+
+    fn h07_m4_mutation(
+        call: &ToolCall,
+        outcome: &str,
+        file_modified: bool,
+        final_state: &str,
+        final_digest_char: char,
+        write_digest_char: char,
+    ) -> ProgressObservation {
+        ObservationFacts::from_result(
+            call,
+            &ToolResult {
+                output: "long mutation report\nExit code: 0".repeat(8),
+                success: true,
+                file_modified: file_modified.then(|| "a.rs".into()),
+                structured_metadata: Some(json!({
+                    "outcome": outcome,
+                    "file_modified": file_modified,
+                    "final_state": final_state,
+                    "write_version": {"content_sha256": format!("sha256:{}", write_digest_char.to_string().repeat(64))},
+                    "final_version": {"content_sha256": format!("sha256:{}", final_digest_char.to_string().repeat(64))},
+                    "changed_range": {"before": {"start": 1, "count": 200}},
+                })),
+                ..Default::default()
+            },
+        )
+        .finish("long mutation report\nExit code: 0", None)
+    }
+
+    #[test]
+    fn h07_m4_final_version_owns_mutation_progress_and_no_change_stalls() {
+        let edit = call("edit_file", json!({"path": "a.rs", "old_string": "x"}));
+        let first = h07_m4_mutation(&edit, "modified", true, "confirmed", 'b', 'a');
+        let same_final_different_write =
+            h07_m4_mutation(&edit, "modified", true, "confirmed", 'b', 'c');
+        let next_final = h07_m4_mutation(&edit, "modified", true, "confirmed", 'd', 'c');
+        assert_eq!(first.evidence_key, same_final_different_write.evidence_key);
+        let mut tracker = EpisodeTracker::default();
+        assert_eq!(tracker.observe(&first).class, ProgressClass::StateChanged);
+        let repeated = tracker.observe(&same_final_different_write);
+        assert_eq!(repeated.class, ProgressClass::NoProgress);
+        assert_eq!(repeated.decision, ProgressDecision::Hint);
+        assert_eq!(
+            tracker.observe(&next_final).class,
+            ProgressClass::StateChanged
+        );
+
+        let no_change = h07_m4_mutation(&edit, "no_change", false, "confirmed", 'd', 'e');
+        let mut tracker = EpisodeTracker::default();
+        assert_eq!(tracker.observe(&no_change).class, ProgressClass::NoProgress);
+        assert_eq!(tracker.observe(&no_change).decision, ProgressDecision::Hint);
+    }
+
+    #[test]
+    fn h07_m4_unconfirmed_and_conflicting_mutations_stay_unknown() {
+        let edit = call("edit_file", json!({"path": "a.rs"}));
+        let unconfirmed = h07_m4_mutation(&edit, "modified", true, "unconfirmed", 'b', 'a');
+        assert!(!unconfirmed.semantic_eligible);
+        assert!(unconfirmed.has_authoritative_progress());
+        let mut tracker = EpisodeTracker::default();
+        assert_eq!(tracker.observe(&unconfirmed).class, ProgressClass::Unknown);
+        assert_eq!(tracker.len(), 0);
+
+        let conflicting = ObservationFacts::from_result(
+            &edit,
+            &ToolResult {
+                success: true,
+                structured_metadata: Some(json!({
+                    "outcome": "modified", "file_modified": true,
+                    "final_state": "confirmed",
+                    "final_version": {"content_sha256": format!("sha256:{}", "b".repeat(64))}
+                })),
+                ..Default::default()
+            },
+        )
+        .finish("claimed success", None);
+        assert_eq!(
+            conflicting.diagnostic,
+            Some(ObservationDiagnostic::ConflictingMutationFields)
+        );
+        assert!(!conflicting.semantic_eligible);
+        assert!(conflicting.has_authoritative_progress());
+        assert_eq!(tracker.observe(&conflicting).class, ProgressClass::Unknown);
+    }
+
+    #[test]
+    fn h07_m4_read_pages_use_source_range_and_version_evidence() {
+        let read = call("read_file", json!({"path": "alias/a.rs"}));
+        let recall = call("recall", json!({"output_id": "random", "offset": 10}));
+        let source = OutputSource::File {
+            target: "/workspace/a.rs".into(),
+            sha256: format!("sha256:{}", "a".repeat(64)),
+        };
+        let first = [OutputRange {
+            stream: OutputStream::File,
+            start: 0,
+            end: 10,
+            lines: Some((1, 2)),
+        }];
+        let next = [OutputRange {
+            stream: OutputStream::File,
+            start: 10,
+            end: 20,
+            lines: Some((3, 4)),
+        }];
+        let observe = |call: &ToolCall, source: &OutputSource, ranges: &[OutputRange]| {
+            ObservationFacts::from_result(
+                call,
+                &ToolResult {
+                    success: true,
+                    ..Default::default()
+                },
+            )
+            .finish_with_source("same visible text", Some((source, ranges, false)))
+        };
+        let first_read = observe(&read, &source, &first);
+        let recalled_same = observe(&recall, &source, &first);
+        assert_eq!(first_read.target_key, recalled_same.target_key);
+        assert_eq!(first_read.evidence_key, recalled_same.evidence_key);
+        let mut tracker = EpisodeTracker::default();
+        assert_eq!(
+            tracker.observe(&first_read).class,
+            ProgressClass::EvidenceChanged
+        );
+        assert_eq!(
+            tracker.observe(&recalled_same).decision,
+            ProgressDecision::Hint
+        );
+        assert_eq!(
+            tracker.observe(&observe(&recall, &source, &next)).class,
+            ProgressClass::EvidenceChanged
+        );
+        let changed_source = OutputSource::File {
+            target: "/workspace/a.rs".into(),
+            sha256: format!("sha256:{}", "b".repeat(64)),
+        };
+        assert_eq!(
+            tracker
+                .observe(&observe(&read, &changed_source, &first))
+                .class,
+            ProgressClass::EvidenceChanged
+        );
+    }
+
+    #[test]
+    fn h07_m4_recall_search_uses_bounded_match_coordinates() {
+        let search_call = call(
+            "recall",
+            json!({"output_id": "artifact", "stream": "file", "query": "needle"}),
+        );
+        let observed = |start: u64, snippet: &str| {
+            let output = json!({
+                "output_id": "artifact", "stream": "file",
+                "searched_range": [0, 4096],
+                "matches": [{"start": start, "end": start + 6, "snippet": snippet}],
+                "search_complete": true, "artifact_complete": true,
+                "next_offset": null, "scan_limit_bytes": 4096,
+            })
+            .to_string();
+            ObservationFacts::from_result(
+                &search_call,
+                &ToolResult {
+                    output: output.clone(),
+                    success: true,
+                    ..Default::default()
+                },
+            )
+            .finish(&output, None)
+        };
+        let first = observed(12, "volatile snippet one");
+        let same_coordinates = observed(12, "volatile snippet two");
+        let new_hit = observed(24, "new hit");
+        assert_eq!(first.family, OperationFamily::Search);
+        assert_eq!(first.confidence, ObservationConfidence::TrustedAdapter);
+        assert_eq!(first.evidence_key, same_coordinates.evidence_key);
+        let mut tracker = EpisodeTracker::default();
+        assert_eq!(
+            tracker.observe(&first).class,
+            ProgressClass::EvidenceChanged
+        );
+        assert_eq!(
+            tracker.observe(&same_coordinates).decision,
+            ProgressDecision::Hint
+        );
+        assert_eq!(
+            tracker.observe(&new_hit).class,
+            ProgressClass::EvidenceChanged
+        );
+    }
+
+    #[test]
+    fn h07_m4_typed_file_modified_false_infers_no_change() {
+        let edit = call("edit_file", json!({"path": "a.rs"}));
+        let observation = ObservationFacts::from_result(
+            &edit,
+            &ToolResult {
+                success: true,
+                structured_metadata: Some(json!({
+                    "file_modified": false,
+                    "final_state": "confirmed",
+                    "final_version": {
+                        "content_sha256": format!("sha256:{}", "a".repeat(64))
+                    }
+                })),
+                ..Default::default()
+            },
+        )
+        .finish("unchanged", None);
+        assert_eq!(observation.outcome, Some(MutationOutcome::NoChange));
+        assert_eq!(
+            EpisodeTracker::default().observe(&observation).class,
+            ProgressClass::NoProgress
+        );
+    }
 
     fn h07_m3_rejection(call: &ToolCall, volatile: u64, expected_line: u64) -> ProgressObservation {
         ObservationFacts::from_result(
@@ -882,7 +1190,7 @@ mod tests {
         );
         let observed = facts.finish_with_source("same", Some((&source, &first, false)));
         assert_eq!(observed.state_digest.as_deref(), Some(source_sha(&source)));
-        assert_eq!(observed.confidence, ObservationConfidence::Typed);
+        assert_eq!(observed.confidence, ObservationConfidence::TrustedAdapter);
         let changed_range = ObservationFacts::from_result(
             &call,
             &ToolResult {
