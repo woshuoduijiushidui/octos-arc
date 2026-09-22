@@ -2413,7 +2413,14 @@ impl Agent {
                         false,
                         None,
                         cascades,
-                        ObservationFacts::from_error(&observation_call, classified.variant_name()),
+                        ObservationFacts::from_harness_error(
+                            &observation_call,
+                            &classified,
+                            e.chain()
+                                .find_map(|source| source.downcast_ref::<std::io::Error>())
+                                .map(|error| format!("{:?}", error.kind()))
+                                .as_deref(),
+                        ),
                     )
                 }
             };

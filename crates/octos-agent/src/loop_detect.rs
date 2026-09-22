@@ -4,9 +4,15 @@
 //! repeating patterns in the last N calls. When a cycle is detected,
 //! returns a warning message that should be injected as a system message.
 
+use metrics::counter;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+
+use crate::agent::progress_observation::{
+    EpisodeOutcome, EpisodeTracker, ObservationConfidence, OperationFamily, ProgressClass,
+    ProgressDecision, ProgressObservation,
+};
 
 /// Legacy soft "no-progress" hint, used when H07 is disabled. It fires
 /// after the third identical (name, args, result) triple and does not
@@ -61,6 +67,7 @@ pub struct FileChurnSignal {
 /// Tracks tool call patterns and detects loops.
 pub struct LoopDetector {
     no_progress: bool,
+    episodes: EpisodeTracker,
     exact_last_call: Option<u64>,
     exact_last_result: Option<u64>,
     exact_result_streak: usize,
@@ -95,6 +102,7 @@ impl LoopDetector {
     pub fn new(window: usize) -> Self {
         Self {
             no_progress: false,
+            episodes: EpisodeTracker::default(),
             exact_last_call: None,
             exact_last_result: None,
             exact_result_streak: 0,
@@ -121,6 +129,43 @@ impl LoopDetector {
 
     pub fn no_progress_enabled(&self) -> bool {
         self.no_progress
+    }
+
+    pub(crate) fn observe_semantic(&mut self, observation: &ProgressObservation) -> EpisodeOutcome {
+        let outcome = self.episodes.observe(observation);
+        let family = match observation.family {
+            OperationFamily::Read => "read",
+            OperationFamily::Search => "search",
+            OperationFamily::Mutate => "mutate",
+            OperationFamily::Validate => "validate",
+            OperationFamily::Execute => "execute",
+            OperationFamily::Wait => "wait",
+            OperationFamily::Other => "other",
+        };
+        let decision = match outcome.decision {
+            ProgressDecision::Continue => "continue",
+            ProgressDecision::Hint => "hint",
+            ProgressDecision::SwitchRequired => "switch_required",
+            ProgressDecision::TerminalNonRetryable => "terminal_non_retryable",
+        };
+        let progress_class = match outcome.class {
+            ProgressClass::NoProgress => "no_progress",
+            ProgressClass::EvidenceChanged => "evidence_changed",
+            ProgressClass::Unknown => "unknown",
+        };
+        let confidence = match observation.confidence {
+            ObservationConfidence::Typed => "typed",
+            ObservationConfidence::ExactTextFallback => "exact_text_fallback",
+        };
+        counter!(
+            "octos_no_progress_observation_total",
+            "family" => family,
+            "progress_class" => progress_class,
+            "decision" => decision,
+            "confidence" => confidence,
+        )
+        .increment(1);
+        outcome
     }
 
     /// Shared pre-call exact guard for conversation and task loops.

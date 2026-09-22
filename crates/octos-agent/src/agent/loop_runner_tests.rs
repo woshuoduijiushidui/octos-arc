@@ -5532,6 +5532,133 @@ fn h07_m2_repeated_calls(last_batch: bool) -> Vec<ChatResponse> {
         .collect()
 }
 
+struct H07M3NoMatchTool {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for H07M3NoMatchTool {
+    fn name(&self) -> &str {
+        "diff_edit"
+    }
+    fn description(&self) -> &str {
+        "typed no-match fixture"
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+    async fn execute(&self, _args: &serde_json::Value) -> Result<ToolResult> {
+        let n = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+        Ok(ToolResult {
+            output: format!("same failure, duration={n}ms request_id={n}"),
+            success: false,
+            structured_metadata: Some(serde_json::json!({
+                "error_code": "diff_context_no_match",
+                "file_modified": false,
+                "matcher": "context",
+                "reason": "no_match",
+                "hunk_index": 0,
+                "expected_line": 4,
+                "occurrence_count": 0,
+                "current_version": {"content_sha256": format!("sha256:{}", "a".repeat(64))},
+                "duration_ms": n,
+                "request_id": format!("volatile-{n}")
+            })),
+            ..Default::default()
+        })
+    }
+}
+
+fn h07_m3_changed_attempts() -> Vec<ChatResponse> {
+    (0..3).map(|n| tool_use(vec![ToolCall {
+        id: format!("attempt_{n}"),
+        name: "diff_edit".into(),
+        arguments: serde_json::json!({"path": "a.rs", "diff": format!("@@ -4 +4 @@\n-{n}\n+{n}")}),
+        metadata: None,
+    }], 1, 1)).chain(std::iter::once(end_turn("diagnosed", 1, 1))).collect()
+}
+
+#[tokio::test]
+async fn h07_m3_conversation_semantic_hints_without_extra_model_requests() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(ScriptedProvider::new(h07_m3_changed_attempts()));
+    let mut tools = ToolRegistry::new();
+    tools.register(H07M3NoMatchTool {
+        calls: calls.clone(),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("h07-m3-conversation"),
+        provider.clone(),
+        tools,
+        memory,
+    )
+    .with_config(AgentConfig {
+        no_progress: true,
+        max_iterations: 10,
+        save_episodes: false,
+        ..Default::default()
+    });
+    let result = agent
+        .process_message("diagnose", &[], vec![])
+        .await
+        .unwrap();
+    assert_eq!(result.content, "diagnosed");
+    assert_eq!(calls.load(AtomicOrdering::SeqCst), 3);
+    assert_eq!(result.token_usage.input_tokens, 4);
+    let prompts = provider.prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 4);
+    assert!(
+        prompts[2]
+            .iter()
+            .any(|m| m.content.contains("[NO PROGRESS] The same Mutate failure"))
+    );
+    assert!(
+        prompts[3]
+            .iter()
+            .any(|m| m.content.contains("[SWITCH REQUIRED]"))
+    );
+}
+
+#[tokio::test]
+async fn h07_m3_task_uses_the_same_semantic_episode() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(ScriptedProvider::new(h07_m3_changed_attempts()));
+    let mut tools = ToolRegistry::new();
+    tools.register(H07M3NoMatchTool {
+        calls: calls.clone(),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("h07-m3-task"), provider.clone(), tools, memory)
+        .with_config(AgentConfig {
+            no_progress: true,
+            max_iterations: 10,
+            save_episodes: false,
+            ..Default::default()
+        });
+    let result = agent
+        .run_task(&task_for("diagnose", dir.path()))
+        .await
+        .unwrap();
+    assert!(result.success);
+    assert_eq!(calls.load(AtomicOrdering::SeqCst), 3);
+    assert_eq!(result.token_usage.input_tokens, 4);
+    let prompts = provider.prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 4);
+    assert!(
+        prompts[2]
+            .iter()
+            .any(|m| m.content.contains("[NO PROGRESS] The same Mutate failure"))
+    );
+    assert!(
+        prompts[3]
+            .iter()
+            .any(|m| m.content.contains("[SWITCH REQUIRED]"))
+    );
+}
+
 #[tokio::test]
 async fn h07_m2_conversation_hints_then_rejects_whole_batch_before_execution() {
     let dir = tempfile::tempdir().unwrap();

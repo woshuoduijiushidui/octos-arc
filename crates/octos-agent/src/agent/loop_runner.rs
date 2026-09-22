@@ -3464,13 +3464,25 @@ impl Agent {
                         && observation.state_digest.is_some())
                     .then_some(observation.evidence_key.as_str())
                 });
-                let repeating = if let Some(hint) = loop_detector.after_result(
+                let exact_hint = loop_detector.after_result(
                     name,
                     args,
                     &result_before_hint,
                     trusted_read_key,
                     synchronous_result,
-                ) {
+                );
+                // M3 records the typed terminal decision in the episode and
+                // metric. M5 will route it through task/spawn's non-retryable
+                // lifecycle; until then only the bounded hints affect output.
+                let semantic_hint = if loop_detector.no_progress_enabled() && synchronous_result {
+                    ordered_observations
+                        .get(index)
+                        .map(|observation| loop_detector.observe_semantic(observation))
+                        .and_then(|outcome| outcome.hint)
+                } else {
+                    None
+                };
+                let repeating = if let Some(hint) = semantic_hint.or(exact_hint) {
                     if loop_detector.no_progress_enabled()
                         && (self.output_state.policy.enabled
                             && self.output_state.lookup(id, &result_before_hint).is_some()

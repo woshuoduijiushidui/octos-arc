@@ -1,12 +1,14 @@
 use octos_core::ToolCall;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::VecDeque;
 
+use crate::harness_errors::HarnessError;
 use crate::output_recovery::{ExecutionStatus, OutputSource, OutputView};
 use crate::tools::ToolResult;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum OperationFamily {
+pub(crate) enum OperationFamily {
     Read,
     Search,
     Mutate,
@@ -17,7 +19,7 @@ pub(super) enum OperationFamily {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ObservationStatus {
+pub(crate) enum ObservationStatus {
     Success,
     Failed,
     Blocked,
@@ -26,7 +28,7 @@ pub(super) enum ObservationStatus {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum MutationOutcome {
+pub(crate) enum MutationOutcome {
     Modified,
     NoChange,
     NoMatch,
@@ -34,18 +36,18 @@ pub(super) enum MutationOutcome {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ObservationConfidence {
+pub(crate) enum ObservationConfidence {
     Typed,
     ExactTextFallback,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ObservationDiagnostic {
+pub(crate) enum ObservationDiagnostic {
     ConflictingMutationFields,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct ProgressObservation {
+pub(crate) struct ProgressObservation {
     pub call_id: String,
     pub family: OperationFamily,
     pub target_key: String,
@@ -59,6 +61,7 @@ pub(super) struct ProgressObservation {
     pub error_kind: Option<String>,
     pub confidence: ObservationConfidence,
     pub diagnostic: Option<ObservationDiagnostic>,
+    pub semantic_eligible: bool,
 }
 
 pub(super) struct ObservationFacts(ProgressObservation);
@@ -149,14 +152,60 @@ impl ObservationFacts {
             })
         {
             observation.error_kind = Some(bounded(code, 128));
-            let evidence = (
+            // H05 producer allowlist: path is taken from the call, while the
+            // error code, matcher, reason, location/count, candidates' line
+            // locations, and current file version are stable failure facts.
+            // Deliberately ignore attempted text/context digests, candidate
+            // score/excerpt, limits, timing and request IDs. Those are not
+            // evidence that the failure location or file changed.
+            if matches!(
                 code,
-                metadata.and_then(|m| m.get("current_version")),
-                metadata.and_then(|m| m.get("searched_context_digest")),
-                metadata.and_then(|m| m.get("expected_line")),
-                metadata.and_then(|m| m.get("occurrence_count")),
-            );
-            observation.evidence_key = digest(&serde_json::to_vec(&evidence).unwrap_or_default());
+                "edit_no_match"
+                    | "edit_ambiguous"
+                    | "diff_context_no_match"
+                    | "diff_context_ambiguous"
+            ) {
+                let mut candidates: Vec<_> = metadata
+                    .and_then(|m| m.get("candidates"))
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .take(8)
+                    .map(|candidate| {
+                        (
+                            candidate.get("line_range").cloned(),
+                            candidate.get("matcher").cloned(),
+                        )
+                    })
+                    .collect();
+                // Ranking/score may reorder otherwise identical locations.
+                candidates
+                    .sort_by_key(|candidate| serde_json::to_string(candidate).unwrap_or_default());
+                let m = metadata.expect("typed error has metadata");
+                let evidence = (
+                    code,
+                    m.get("matcher"),
+                    m.get("reason"),
+                    m.get("hunk_index"),
+                    m.get("expected_line"),
+                    m.get("actual_line"),
+                    m.get("expected"),
+                    m.get("actual"),
+                    m.get("occurrence_count"),
+                    m.pointer("/current_version/content_sha256"),
+                    candidates,
+                );
+                observation.evidence_key =
+                    digest(&serde_json::to_vec(&evidence).unwrap_or_default());
+                observation.semantic_eligible =
+                    matches!(
+                        observation.outcome,
+                        Some(MutationOutcome::NoMatch | MutationOutcome::Ambiguous)
+                    ) && m.get("matcher").and_then(Value::as_str).is_some()
+                        && m.pointer("/current_version/content_sha256")
+                            .and_then(Value::as_str)
+                            .is_some_and(valid_sha256);
+            }
             observation.confidence = ObservationConfidence::Typed;
         }
         Self(observation)
@@ -167,6 +216,27 @@ impl ObservationFacts {
         observation.status = ObservationStatus::Failed;
         observation.error_kind = Some(bounded(error_kind, 128));
         Self(observation)
+    }
+
+    pub fn from_harness_error(
+        call: &ToolCall,
+        error: &HarnessError,
+        stable_reason: Option<&str>,
+    ) -> Self {
+        let mut facts = Self::from_error(call, error.variant_name());
+        if let Some(reason) = stable_reason {
+            facts.0.evidence_key = digest(
+                &serde_json::to_vec(&(
+                    error.variant_name(),
+                    error.recovery_hint().as_str(),
+                    reason,
+                ))
+                .unwrap_or_default(),
+            );
+            facts.0.confidence = ObservationConfidence::Typed;
+            facts.0.semantic_eligible = true;
+        }
+        facts
     }
 
     pub fn finish(self, visible: &str, view: Option<&OutputView>) -> ProgressObservation {
@@ -216,13 +286,14 @@ impl ProgressObservation {
     }
 
     fn base(call: &ToolCall) -> Self {
+        let operation_family = family(&call.name);
         let path = call
             .arguments
             .get("path")
             .or_else(|| call.arguments.get("file_path"))
             .and_then(Value::as_str);
         let target_key = if let Some(path) = path {
-            digest(&serde_json::to_vec(&(call.name.as_str(), path)).unwrap_or_default())
+            digest(&serde_json::to_vec(&(operation_family as u8, path)).unwrap_or_default())
         } else {
             digest(&serde_json::to_vec(&(call.name.as_str(), &call.arguments)).unwrap_or_default())
         };
@@ -232,7 +303,7 @@ impl ProgressObservation {
             .unwrap_or_else(|| bounded(&call.name, 96));
         Self {
             call_id: call.id.clone(),
-            family: family(&call.name),
+            family: operation_family,
             target_key,
             target_label,
             status: ObservationStatus::Unknown,
@@ -244,6 +315,7 @@ impl ProgressObservation {
             error_kind: None,
             confidence: ObservationConfidence::ExactTextFallback,
             diagnostic: None,
+            semantic_eligible: false,
         }
     }
 
@@ -288,11 +360,399 @@ fn bounded(value: &str, max_bytes: usize) -> String {
     value[..end].to_owned()
 }
 
+const MAX_EPISODES: usize = 32;
+const MAX_SAMPLES: usize = 4;
+const MAX_HINT_BYTES: usize = 320;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProgressClass {
+    NoProgress,
+    EvidenceChanged,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProgressDecision {
+    Continue,
+    Hint,
+    SwitchRequired,
+    TerminalNonRetryable,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct EpisodeOutcome {
+    pub class: ProgressClass,
+    pub decision: ProgressDecision,
+    pub hint: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EpisodeKey {
+    family: OperationFamily,
+    target_key: String,
+    status: ObservationStatus,
+    outcome: Option<MutationOutcome>,
+    error_kind: Option<String>,
+    evidence_key: String,
+}
+
+impl EpisodeKey {
+    fn from_observation(observation: &ProgressObservation) -> Self {
+        Self {
+            family: observation.family,
+            target_key: observation.target_key.clone(),
+            status: observation.status,
+            outcome: observation.outcome,
+            error_kind: observation.error_kind.clone(),
+            evidence_key: observation.evidence_key.clone(),
+        }
+    }
+
+    fn same_scope(&self, other: &Self) -> bool {
+        self.family == other.family
+            && self.target_key == other.target_key
+            && self.status == other.status
+            && self.outcome == other.outcome
+            && self.error_kind == other.error_kind
+    }
+}
+
+#[derive(Debug)]
+struct Episode {
+    key: EpisodeKey,
+    samples: VecDeque<String>,
+    observations: u8,
+    hinted: bool,
+    switch_required: bool,
+    post_switch_probe: bool,
+    terminal: bool,
+}
+
+/// Local to one LoopDetector, with LRU eviction. The full 256-bit digests
+/// participate in equality; labels and short prefixes never do.
+#[derive(Default)]
+pub(crate) struct EpisodeTracker {
+    episodes: VecDeque<Episode>,
+}
+
+impl EpisodeTracker {
+    pub fn observe(&mut self, observation: &ProgressObservation) -> EpisodeOutcome {
+        let key = EpisodeKey::from_observation(observation);
+        for episode in &mut self.episodes {
+            if episode.switch_required && episode.key != key {
+                episode.post_switch_probe = true;
+            }
+        }
+        if !observation.semantic_eligible
+            || observation.confidence != ObservationConfidence::Typed
+            || observation.evidence_key.is_empty()
+        {
+            return EpisodeOutcome {
+                class: ProgressClass::Unknown,
+                decision: ProgressDecision::Continue,
+                hint: None,
+            };
+        }
+        if let Some(index) = self.episodes.iter().position(|episode| episode.key == key) {
+            let mut episode = self.episodes.remove(index).expect("existing episode");
+            episode.observations = episode.observations.saturating_add(1);
+            if episode.samples.len() == MAX_SAMPLES {
+                episode.samples.pop_front();
+            }
+            episode.samples.push_back(key.evidence_key.clone());
+            let decision = if episode.terminal || episode.switch_required {
+                episode.terminal = true;
+                ProgressDecision::TerminalNonRetryable
+            } else if episode.observations >= 3 {
+                episode.switch_required = true;
+                ProgressDecision::SwitchRequired
+            } else if episode.observations == 2 && !episode.hinted {
+                episode.hinted = true;
+                ProgressDecision::Hint
+            } else {
+                ProgressDecision::Continue
+            };
+            self.episodes.push_back(episode);
+            let hint = match decision {
+                ProgressDecision::Hint => Some(bounded(
+                    &format!(
+                        "\n\n[NO PROGRESS] The same {:?} failure at {} returned the same evidence. Inspect the current location or choose a different diagnostic action.",
+                        observation.family, observation.target_label
+                    ),
+                    MAX_HINT_BYTES,
+                )),
+                ProgressDecision::SwitchRequired => Some(bounded(
+                    &format!(
+                        "\n\n[SWITCH REQUIRED] Repeated {:?} failure at {} has unchanged evidence despite changed attempts. Use a different diagnostic action before retrying.",
+                        observation.family, observation.target_label
+                    ),
+                    MAX_HINT_BYTES,
+                )),
+                _ => None,
+            };
+            return EpisodeOutcome {
+                class: ProgressClass::NoProgress,
+                decision,
+                hint,
+            };
+        }
+        let class = if self
+            .episodes
+            .iter()
+            .any(|episode| episode.key.same_scope(&key))
+        {
+            ProgressClass::EvidenceChanged
+        } else {
+            ProgressClass::Unknown
+        };
+        if self.episodes.len() == MAX_EPISODES {
+            self.episodes.pop_front();
+        }
+        self.episodes.push_back(Episode {
+            key: key.clone(),
+            samples: VecDeque::from([key.evidence_key]),
+            observations: 1,
+            hinted: false,
+            switch_required: false,
+            post_switch_probe: false,
+            terminal: false,
+        });
+        EpisodeOutcome {
+            class,
+            decision: ProgressDecision::Continue,
+            hint: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.episodes.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::output_recovery::{OutputRange, OutputStream};
     use serde_json::json;
+
+    fn h07_m3_rejection(call: &ToolCall, volatile: u64, expected_line: u64) -> ProgressObservation {
+        ObservationFacts::from_result(
+            call,
+            &ToolResult {
+                success: false,
+                output: format!("request_id={volatile} duration={volatile}ms"),
+                structured_metadata: Some(json!({
+                    "error_code": "diff_context_no_match",
+                    "file_modified": false,
+                    "matcher": "context",
+                    "reason": "no_match",
+                    "hunk_index": 0,
+                    "expected_line": expected_line,
+                    "occurrence_count": 1,
+                    "current_version": {"content_sha256": format!("sha256:{}", "a".repeat(64))},
+                    "searched_context_digest": format!("sha256:{volatile}"),
+                    "duration_ms": volatile,
+                    "request_id": format!("random-{volatile}"),
+                    "candidates": [{
+                        "line_range": {"start": 10, "end": 12},
+                        "matcher": "context",
+                        "score": volatile,
+                        "excerpt": format!("volatile-{volatile}")
+                    }]
+                })),
+                ..Default::default()
+            },
+        )
+        .finish(&format!("request_id={volatile}"), None)
+    }
+
+    #[test]
+    fn h07_m3_typed_episode_ignores_volatile_attempts_and_switches_once() {
+        let mut tracker = EpisodeTracker::default();
+        let mut observed = Vec::new();
+        for n in 0..3 {
+            let call = call(
+                "diff_edit",
+                json!({
+                    "path": "/workspace/目标.rs", "diff": format!("attempt {n}"),
+                    "limit": n, "request_id": n
+                }),
+            );
+            observed.push(tracker.observe(&h07_m3_rejection(&call, n, 9)));
+        }
+        assert_eq!(observed[0].decision, ProgressDecision::Continue);
+        assert_eq!(observed[1].decision, ProgressDecision::Hint);
+        assert_eq!(observed[2].decision, ProgressDecision::SwitchRequired);
+        assert!(observed[1].hint.as_ref().unwrap().len() <= MAX_HINT_BYTES);
+        assert!(observed[2].hint.as_ref().unwrap().len() <= MAX_HINT_BYTES);
+        assert_eq!(tracker.len(), 1);
+        let different = h07_m3_rejection(
+            &call("diff_edit", json!({"path": "/workspace/目标.rs"})),
+            10,
+            10,
+        );
+        assert_eq!(
+            tracker.observe(&different).class,
+            ProgressClass::EvidenceChanged
+        );
+        assert!(tracker.episodes[0].post_switch_probe);
+        let repeated = h07_m3_rejection(
+            &call(
+                "diff_edit",
+                json!({"path": "/workspace/目标.rs", "diff": "new"}),
+            ),
+            11,
+            9,
+        );
+        assert_eq!(
+            tracker.observe(&repeated).decision,
+            ProgressDecision::TerminalNonRetryable
+        );
+    }
+
+    #[test]
+    fn h07_m3_fallback_and_harness_error_keep_their_confidence_boundary() {
+        let call = call("shell", json!({"command": "x"}));
+        let first = ObservationFacts::from_error(&call, "tool_execution").finish("id=1", None);
+        let second = ObservationFacts::from_error(&call, "tool_execution").finish("id=2", None);
+        assert_ne!(first.evidence_key, second.evidence_key);
+        let mut tracker = EpisodeTracker::default();
+        assert_eq!(tracker.observe(&first).class, ProgressClass::Unknown);
+        assert_eq!(
+            tracker.observe(&second).decision,
+            ProgressDecision::Continue
+        );
+        assert_eq!(tracker.len(), 0);
+
+        let error = HarnessError::ToolExecution {
+            tool_name: "shell".into(),
+            message: "provider request id=1".into(),
+        };
+        let typed = ObservationFacts::from_harness_error(&call, &error, Some("NotFound"))
+            .finish("id=1", None);
+        let changed_id = ObservationFacts::from_harness_error(&call, &error, Some("NotFound"))
+            .finish("id=2", None);
+        assert_eq!(typed.evidence_key, changed_id.evidence_key);
+        assert_eq!(tracker.observe(&typed).decision, ProgressDecision::Continue);
+        assert_eq!(
+            tracker.observe(&changed_id).decision,
+            ProgressDecision::Hint
+        );
+        let other_reason =
+            ObservationFacts::from_harness_error(&call, &error, Some("PermissionDenied"))
+                .finish("id=3", None);
+        assert_eq!(
+            tracker.observe(&other_reason).class,
+            ProgressClass::EvidenceChanged
+        );
+    }
+
+    #[test]
+    fn h07_m3_expected_actual_change_is_new_evidence_at_same_location() {
+        let call = call(
+            "edit_file",
+            json!({"path": "a.rs", "old_string": "attempt"}),
+        );
+        let observed = |expected: &str, actual: &str| {
+            ObservationFacts::from_result(
+                &call,
+                &ToolResult {
+                    success: false,
+                    structured_metadata: Some(json!({
+                        "error_code": "edit_no_match",
+                        "file_modified": false,
+                        "matcher": "exact",
+                        "reason": "no_match",
+                        "occurrence_count": 0,
+                        "current_version": {"content_sha256": format!("sha256:{}", "a".repeat(64))},
+                        "expected": expected,
+                        "actual": actual,
+                    })),
+                    ..Default::default()
+                },
+            )
+            .finish("visible", None)
+        };
+        let mut tracker = EpisodeTracker::default();
+        tracker.observe(&observed("left", "right"));
+        assert_eq!(
+            tracker.observe(&observed("left", "changed")).class,
+            ProgressClass::EvidenceChanged
+        );
+        assert_eq!(tracker.len(), 2);
+    }
+
+    #[test]
+    fn h07_m3_candidate_ranking_does_not_change_stable_locations() {
+        let tool_call = call("edit_file", json!({"path": "a.rs"}));
+        let candidate = |line: u64, score: u64| {
+            json!({
+                "line_range": {"start": line, "end": line + 1},
+                "matcher": "exact", "score": score,
+                "excerpt": format!("request-{score}")
+            })
+        };
+        let observed = |candidates: Vec<Value>| {
+            ObservationFacts::from_result(
+                &tool_call,
+                &ToolResult {
+                    success: false,
+                    structured_metadata: Some(json!({
+                        "error_code": "edit_ambiguous", "file_modified": false,
+                        "matcher": "exact", "reason": "multiple_matches",
+                        "occurrence_count": 2, "candidates": candidates,
+                        "current_version": {"content_sha256": format!("sha256:{}", "a".repeat(64))}
+                    })),
+                    ..Default::default()
+                },
+            )
+            .finish("different visible output", None)
+        };
+        let first = observed(vec![candidate(10, 1), candidate(20, 2)]);
+        let reordered = observed(vec![candidate(20, 9), candidate(10, 8)]);
+        assert_eq!(first.evidence_key, reordered.evidence_key);
+        assert_eq!(
+            ProgressObservation::base(&call("edit_file", json!({"path": "a.rs"}))).target_key,
+            ProgressObservation::base(&call("diff_edit", json!({"path": "a.rs"}))).target_key
+        );
+    }
+
+    #[test]
+    fn h07_m3_lru_eviction_full_digest_and_very_long_run_are_bounded() {
+        let mut tracker = EpisodeTracker::default();
+        let mut seed = h07_m3_rejection(&call("diff_edit", json!({"path": "a.rs"})), 0, 1);
+        seed.target_key = format!("sha256:{}", "a".repeat(64));
+        tracker.observe(&seed);
+        let mut collision = seed.clone();
+        collision.target_key = format!("sha256:{}", "a".repeat(63) + "b");
+        assert_eq!(
+            tracker.observe(&collision).decision,
+            ProgressDecision::Continue
+        );
+        assert_eq!(tracker.len(), 2);
+        for n in 0..50_000u32 {
+            let mut observation = seed.clone();
+            observation.target_key = format!("sha256:{n:064x}");
+            tracker.observe(&observation);
+        }
+        assert_eq!(tracker.len(), MAX_EPISODES);
+        assert_eq!(tracker.observe(&seed).decision, ProgressDecision::Continue);
+        assert!(
+            tracker
+                .episodes
+                .iter()
+                .all(|episode| episode.samples.len() <= MAX_SAMPLES)
+        );
+        let mut saturating = EpisodeTracker::default();
+        saturating.observe(&seed);
+        saturating.episodes[0].observations = u8::MAX;
+        assert_eq!(
+            saturating.observe(&seed).decision,
+            ProgressDecision::SwitchRequired
+        );
+        assert_eq!(saturating.episodes[0].observations, u8::MAX);
+    }
 
     fn call(name: &str, args: Value) -> ToolCall {
         ToolCall {
@@ -380,6 +840,7 @@ mod tests {
             Some("diff_context_no_match")
         );
         assert_eq!(observation.confidence, ObservationConfidence::Typed);
+        assert!(!observation.semantic_eligible);
         let plain = ObservationFacts::from_result(
             &call,
             &ToolResult {
