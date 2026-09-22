@@ -19,7 +19,10 @@ use super::convergence::{
 use super::loop_compaction::{prepare_conversation_messages, prepare_task_messages};
 use super::loop_state::{LoopDecision, LoopRetryState, SHELL_SPIRAL_VARIANT};
 use super::message_repair::sanitize_tool_call_id;
-use super::progress_observation::{ObservationDiagnostic, ObservationStatus, ProgressObservation};
+use super::progress_observation::{
+    MutationOutcome, ObservationConfidence, ObservationDiagnostic, ObservationStatus,
+    OperationFamily, ProgressObservation,
+};
 use super::turn_state::{LoopRetryReason, LoopTurnState, attach_partial_usage};
 use super::verifier::{TurnLedger, ledger_entry_from_tool_result};
 use super::{Agent, AssistantSegmentProvenance, ConversationResponse, TASK_REPORTER, TokenTracker};
@@ -1093,7 +1096,7 @@ impl Agent {
                 // so bucket counters carry across turns for the same session.
                 let mut retry_state =
                     PersistentRetryStateGuard::new(self.persistent_retry_state.clone());
-                let mut loop_detector = LoopDetector::new(12);
+                let mut loop_detector = LoopDetector::new(12).with_no_progress(self.config.no_progress);
                 // #27d — turn-local malformed-tool-call feedback counter.
                 let mut malformed_feedback_used: u32 = 0;
                 // Tools may report that they have already exhausted all
@@ -1814,18 +1817,12 @@ impl Agent {
                                         pending_approval: None,
                                     });
                                 }
-                                // #1765 doom-loop guard: 3+ CONSECUTIVE
-                                // identical tool calls (same name + identical
-                                // arguments JSON) abort the turn before the
-                                // next LLM call. Checked ahead of the cycle
-                                // detector so the tighter threshold owns pure
-                                // identical streaks; the cycle detector keeps
-                                // owning alternating (cycle 2/3) patterns,
-                                // which never build a doom streak. When the
-                                // guard fires, the shell-spiral recovery is
-                                // still consulted first — extracting real
-                                // shell output from a retry spiral is a
-                                // strictly better outcome than a doom abort.
+                                // The legacy guard rejects the third identical
+                                // call. With H07 enabled, the same pre-call
+                                // slot requires two identical actual results.
+                                // Length-two/three cycles retain their own
+                                // two-stage recovery. A shell spiral is still
+                                // offered recovery before this guard returns.
                                 //
                                 // Verifier-configured agents are exempt: the
                                 // verifier lane classifies each repeated
@@ -1836,13 +1833,15 @@ impl Agent {
                                 // (see `verifier_repeating_note_changes_
                                 // next_planner_action`). The cycle detector
                                 // below still terminates true thrash there.
-                                let doom_streak = if self.verifier_config.is_some() {
-                                    None
-                                } else {
-                                    loop_detector.record_doom(&tc.name, &tc.arguments)
-                                };
+                                let doom_streak = loop_detector.before_call(
+                                    &tc.name,
+                                    &tc.arguments,
+                                    self.verifier_config.is_none(),
+                                );
                                 let cycle_warning = if doom_streak.is_some() {
                                     None
+                                } else if loop_detector.no_progress_enabled() {
+                                    loop_detector.record_non_exact_cycles(&tc.name, &tc.arguments)
                                 } else {
                                     loop_detector.record(&tc.name, &tc.arguments)
                                 };
@@ -1958,9 +1957,11 @@ impl Agent {
                                             "doom loop detected — aborting turn before the next LLM call (#1765)"
                                         );
                                         return Ok(ConversationResponse {
-                                            content: doom_loop_terminal_message(
-                                                &tc.name, streak,
-                                            ),
+                                            content: if loop_detector.no_progress_enabled() {
+                                                exact_repeat_terminal_message()
+                                            } else {
+                                                doom_loop_terminal_message(&tc.name, streak)
+                                            },
                                             reasoning_content: None,
                                             provider_metadata: None,
                                             token_usage: turn.total_usage().clone(),
@@ -2597,7 +2598,7 @@ impl Agent {
             // PR #1363: task-loop gets its own detector so handle_tool_use
             // can run the no-progress soft check on tool results here too.
             // Matches the conversation-loop's window of 12.
-            let mut loop_detector = LoopDetector::new(12);
+            let mut loop_detector = LoopDetector::new(12).with_no_progress(self.config.no_progress);
             let mut turn_ledger = self.new_turn_ledger();
             let config = self.chat_config();
 
@@ -2890,6 +2891,31 @@ impl Agent {
                         return Ok(result);
                     }
                     StopReason::ToolUse => {
+                        if self.config.no_progress {
+                            for tc in &response.tool_calls {
+                                if loop_detector.before_call(
+                                    &tc.name,
+                                    &tc.arguments,
+                                    self.verifier_config.is_none(),
+                                ).is_some() {
+                                    self.emit_cost_update(&turn, &response, attributed_cost);
+                                    self.reporter().report(ProgressEvent::TaskCompleted {
+                                        success: false,
+                                        iterations: iteration,
+                                        duration: task_start.elapsed(),
+                                    });
+                                    return Ok(TaskResult {
+                                        schema_version: octos_core::TASK_RESULT_SCHEMA_VERSION,
+                                        success: false,
+                                        output: exact_repeat_terminal_message(),
+                                        files_modified,
+                                        files_to_send,
+                                        subtasks: Vec::new(),
+                                        token_usage: turn.total_usage().clone(),
+                                    });
+                                }
+                            }
+                        }
                         // Task loop never emits the synth-ack so the per-call
                         // success-bit sink is unused here — pass `None`. (The
                         // conversation loop wires this up to the spawn_only
@@ -3367,13 +3393,13 @@ impl Agent {
                 observation.downgrade_ambiguous_read(&message.content);
             }
         }
-        let _ordered_observations = order_progress_observations(
+        let ordered_observations = order_progress_observations(
             &response,
             &limited_response,
             tool_observations,
             &blocked_messages,
         );
-        let conflict_count = _ordered_observations
+        let conflict_count = ordered_observations
             .iter()
             .filter(|observation| {
                 observation.diagnostic == Some(ObservationDiagnostic::ConflictingMutationFields)
@@ -3392,14 +3418,9 @@ impl Agent {
             blocked_messages,
         );
 
-        // PR #1363: OpenClaw-style no-progress check. For each Tool
-        // message we just produced, record `(tool_name, args, result)`
-        // in the result-aware ring. If the last 3 records match, append
-        // a soft NO_PROGRESS hint to that tool message's content so the
-        // LLM sees it on its next iteration. Distinguishes a stuck loop
-        // (identical (args, result) repeated) from a legitimate poll
-        // (same args, evolving result). Non-terminating — the hard
-        // cycle detector at the caller's pre-call site is the backstop.
+        // The H07 path shares exact-result history between both loops. The
+        // legacy third-result hint remains unchanged when H07 is disabled.
+        let mut detached_hint = None;
         {
             use std::collections::HashMap;
             let id_to_call: HashMap<&str, (&str, &serde_json::Value)> = response
@@ -3413,7 +3434,7 @@ impl Agent {
                 .collect();
             let stated_intent = response.content.as_deref();
             let mut turn_ledger = turn_ledger;
-            for message in merged.iter_mut() {
+            for (index, message) in merged.iter_mut().enumerate() {
                 if message.role != MessageRole::Tool {
                     continue;
                 }
@@ -3424,10 +3445,42 @@ impl Agent {
                     continue;
                 };
                 let result_before_hint = message.content.clone();
-                let repeating = if let Some(hint) =
-                    loop_detector.record_result(name, args, &result_before_hint)
-                {
-                    message.content.push_str(&hint);
+                let synchronous_result =
+                    ordered_observations.get(index).is_some_and(|observation| {
+                        (observation.status == ObservationStatus::Success
+                            || observation.status == ObservationStatus::Failed
+                                && matches!(
+                                    observation.outcome,
+                                    Some(MutationOutcome::NoMatch | MutationOutcome::Ambiguous)
+                                ))
+                            && observation.call_id == id
+                            && observation.family != OperationFamily::Wait
+                            && !duplicate_ids.contains(id)
+                    });
+                let trusted_read_key = ordered_observations.get(index).and_then(|observation| {
+                    (observation.family == OperationFamily::Read
+                        && observation.call_id == id
+                        && observation.confidence == ObservationConfidence::Typed
+                        && observation.state_digest.is_some())
+                    .then_some(observation.evidence_key.as_str())
+                });
+                let repeating = if let Some(hint) = loop_detector.after_result(
+                    name,
+                    args,
+                    &result_before_hint,
+                    trusted_read_key,
+                    synchronous_result,
+                ) {
+                    if loop_detector.no_progress_enabled()
+                        && (self.output_state.policy.enabled
+                            && self.output_state.lookup(id, &result_before_hint).is_some()
+                            || message.content.len() + hint.len()
+                                > octos_core::tool_output_limit(name))
+                    {
+                        detached_hint.get_or_insert(hint);
+                    } else {
+                        message.content.push_str(&hint);
+                    }
                     true
                 } else {
                     false
@@ -3476,6 +3529,11 @@ impl Agent {
             log.extend(merged.iter().cloned());
         }
         messages.extend(merged);
+        if let Some(hint) = detached_hint {
+            // A separate prompt row is counted by H03's final input budget.
+            // The trusted read/recall envelope stays byte-for-byte intact.
+            messages.push(Message::system(hint));
+        }
         files_modified.extend(tool_files);
         if let Some(files_to_send) = files_to_send {
             files_to_send.extend(tool_send_files);
@@ -4176,6 +4234,10 @@ fn doom_loop_terminal_message(tool_name: &str, streak: usize) -> String {
          different approach — vary the arguments, use a different tool, or rephrase the \
          request."
     )
+}
+
+fn exact_repeat_terminal_message() -> String {
+    "[NO PROGRESS] Two executions with identical arguments returned the same result. The third identical request was skipped before execution. Choose a different diagnostic action or finish with the evidence already available.".to_owned()
 }
 
 /// A tool that has already exhausted its own retries can mark the failure as

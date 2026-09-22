@@ -66,6 +66,8 @@ pub const DEFAULT_WORKER_PROMPT: &str = include_str!("../prompts/worker.txt");
 /// Configuration for agent execution.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
+    /// Enable H07 exact-result progress checks. Parsed once when the config is built.
+    pub no_progress: bool,
     /// Maximum number of LLM-loop iterations before stopping. `0` means
     /// unlimited, which is the default for an interactive Codex-style turn.
     /// Unattended entry points (spawn, MCP, pipelines) set an explicit cap.
@@ -228,7 +230,16 @@ pub const DEFAULT_SESSION_TIMEOUT_SECS: u64 = 1800;
 
 impl Default for AgentConfig {
     fn default() -> Self {
+        let no_progress = match std::env::var("OCTOS_NO_PROGRESS").ok().as_deref() {
+            Some("1" | "true") => true,
+            None | Some("0" | "false") => false,
+            Some(_) => {
+                tracing::warn!("unknown OCTOS_NO_PROGRESS value; H07 remains off");
+                false
+            }
+        };
         Self {
+            no_progress,
             max_iterations: 0,
             max_tokens: None,
             max_timeout: Some(std::time::Duration::from_secs(1800)),
