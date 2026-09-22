@@ -7,7 +7,7 @@ use std::{collections::HashMap, collections::HashSet, collections::VecDeque};
 
 use eyre::Result;
 use octos_core::{Message, MessageRole, Task, TaskFailure, TaskResult, TokenUsage};
-use octos_llm::{ChatConfig, ChatResponse, StopReason};
+use octos_llm::{ChatConfig, ChatResponse, StopReason, ToolSpec};
 use octos_memory::{Episode, EpisodeOutcome};
 use tracing::{Instrument, info, info_span, warn};
 
@@ -52,6 +52,22 @@ const MAX_TOKENS_EMPTY_RECOVERY_PROMPT: &str = "Your previous response reached t
 /// instead of an empty success so the turn never silently dead-ends (#2174).
 const MAX_TOKENS_EMPTY_EXHAUSTED_MESSAGE: &str = "[The model repeatedly reached the output token limit without producing any text or tool call — a degenerate or looping generation. Try a stronger model, reduce the context size, or configure an anti-repetition sampler (a non-zero temperature or a repeat penalty).]";
 const SHELL_RETRY_RECOVERY_THRESHOLD: usize = 4;
+
+fn usage_delta(before: &TokenUsage, after: &TokenUsage) -> TokenUsage {
+    TokenUsage {
+        input_tokens: after.input_tokens.saturating_sub(before.input_tokens),
+        output_tokens: after.output_tokens.saturating_sub(before.output_tokens),
+        reasoning_tokens: after
+            .reasoning_tokens
+            .saturating_sub(before.reasoning_tokens),
+        cache_read_tokens: after
+            .cache_read_tokens
+            .saturating_sub(before.cache_read_tokens),
+        cache_write_tokens: after
+            .cache_write_tokens
+            .saturating_sub(before.cache_write_tokens),
+    }
+}
 
 /// Keep projection provenance beside the immutable output log, not in prompt
 /// messages: compaction, voice rewrites and skipped user rows cannot shift it.
@@ -379,6 +395,117 @@ impl Drop for PersistentRetryStateGuard {
 }
 
 impl Agent {
+    fn reflection_budget_available(&self, iteration: u32, usage: &TokenUsage) -> bool {
+        let iteration_room = self.config.max_iterations == 0
+            || iteration.saturating_mul(5) < self.config.max_iterations.saturating_mul(4);
+        let used = usage
+            .input_tokens
+            .saturating_add(usage.output_tokens)
+            .saturating_add(usage.cache_read_tokens)
+            .saturating_add(usage.cache_write_tokens);
+        let token_room = self
+            .config
+            .max_tokens
+            .is_none_or(|limit| used.saturating_mul(5) < limit.saturating_mul(4));
+        iteration_room && token_room
+    }
+
+    /// Shared tools-disabled checkpoint path for conversation and task mode.
+    /// H07 semantic requests use a minimal prompt containing only the stable
+    /// system row plus bounded typed evidence; ordinary periodic checkpoints
+    /// keep the action request prefix for provider-cache reuse.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_convergence_checkpoint(
+        &self,
+        convergence: &mut ConvergenceController,
+        reason: &CheckpointReason,
+        user_goal: &str,
+        messages: &[Message],
+        tools_spec: &[ToolSpec],
+        call_config: &ChatConfig,
+        iteration: u32,
+        turn: &mut LoopTurnState,
+        tracker: Option<&TokenTracker>,
+    ) -> bool {
+        let total_usage = turn.total_usage().clone();
+        let prompt = ConvergenceController::prompt(reason, user_goal);
+        let mut checkpoint_messages = if reason.contains_semantic_no_progress() {
+            messages
+                .iter()
+                .find(|message| message.role == MessageRole::System)
+                .cloned()
+                .into_iter()
+                .collect::<Vec<_>>()
+        } else {
+            messages.to_vec()
+        };
+        checkpoint_messages.push(Message::user(prompt));
+
+        let mut checkpoint_config = call_config.clone();
+        checkpoint_config.tool_choice = octos_llm::ToolChoice::None;
+        if checkpoint_config.reasoning_effort.is_none() {
+            checkpoint_config.max_tokens =
+                Some(checkpoint_config.max_tokens.unwrap_or(1_024).min(1_024));
+        }
+
+        let before = turn.total_usage().clone();
+        match self
+            .call_llm_with_hooks_silent(
+                &checkpoint_messages,
+                tools_spec,
+                &checkpoint_config,
+                iteration,
+                &total_usage,
+                turn,
+            )
+            .await
+        {
+            Ok((reflection, _streamed, attributed_cost)) => {
+                turn.record_llm_usage(&reflection.usage, tracker, attributed_cost);
+                let usage = TokenUsage {
+                    input_tokens: reflection.usage.input_tokens,
+                    output_tokens: reflection.usage.output_tokens,
+                    reasoning_tokens: reflection.usage.reasoning_tokens,
+                    cache_read_tokens: reflection.usage.cache_read_tokens,
+                    cache_write_tokens: reflection.usage.cache_write_tokens,
+                };
+                let content = reflection.content.unwrap_or_default();
+                let usable = !content.trim().is_empty();
+                convergence.complete(turn.total_usage(), Some(&usage), content);
+                if usable {
+                    tracing::info!(
+                        iteration,
+                        checkpoint = convergence.checkpoints(),
+                        "convergence checkpoint completed; continuing turn"
+                    );
+                } else {
+                    warn!(
+                        iteration,
+                        checkpoint = convergence.checkpoints(),
+                        "convergence checkpoint returned no text; falling back to the existing strategy hint"
+                    );
+                }
+                usable
+            }
+            Err(error) => {
+                // Rejected empty responses still carry usage into `turn` in
+                // llm_call.rs. Exclude that delta from action-token thresholds
+                // while charging it to the turn's actual budget.
+                let reflection_usage = usage_delta(&before, turn.total_usage());
+                let reflection_usage =
+                    (active_tokens(&reflection_usage) > 0).then_some(&reflection_usage);
+                convergence.complete(turn.total_usage(), reflection_usage, String::new());
+                warn!(
+                    %error,
+                    iteration,
+                    checkpoint = convergence.checkpoints(),
+                    "convergence checkpoint failed once; falling back to the existing strategy hint"
+                );
+                false
+            }
+        }
+    }
+
     /// Classify a raw error escaping the agent loop into a `HarnessError`,
     /// increment the `octos_loop_error_total{variant, recovery}` counter, and
     /// emit a structured error event via the local harness event sink (if
@@ -1414,7 +1541,10 @@ impl Agent {
                     // then continue the same user turn with normal tools. A
                     // budget-grace iteration is exempt: its single remaining
                     // call belongs to the model's deliverable.
-                    let checkpoint_due = if grace_iteration {
+                    let checkpoint_due = if grace_iteration
+                        || convergence.semantic_reflection_pending()
+                            && !self.reflection_budget_available(iteration, &total_usage)
+                    {
                         None
                     } else {
                         convergence.due(&total_usage)
@@ -1427,94 +1557,24 @@ impl Agent {
                             checkpoints: convergence.checkpoints(),
                             reflecting: true,
                         });
-                        // The instruction is the final User row and the call
-                        // carries the SAME tool slice as the action call, so
-                        // the checkpoint request is the action request plus
-                        // appended rows: byte-identical stable prefix, same
-                        // epoch, a cache hit instead of a full re-prefill.
-                        // `tool_choice = None` still forbids tool use; a
-                        // provider that ignores it contributes only its text
-                        // (tool calls on the reflection are dropped below).
-                        let mut checkpoint_messages = messages.clone();
-                        checkpoint_messages.push(Message::user(ConvergenceController::prompt(
-                            &reason,
-                        )));
-                        // Derived from `call_config`, not the bare `config`:
-                        // the `context_management` payload is a stable cache
-                        // segment on Anthropic, so the checkpoint must carry
-                        // it exactly like the action call. The output cap
-                        // bounds reflection spend only when no reasoning
-                        // effort is configured — Anthropic derives the
-                        // `thinking` budget from `max_tokens`, and a changed
-                        // thinking config invalidates the message cache.
-                        let mut checkpoint_config = call_config.clone();
-                        checkpoint_config.tool_choice = octos_llm::ToolChoice::None;
-                        if checkpoint_config.reasoning_effort.is_none() {
-                            checkpoint_config.max_tokens = Some(
-                                checkpoint_config
-                                    .max_tokens
-                                    .unwrap_or(1_024)
-                                    .min(1_024),
-                            );
-                        }
-                        match self
-                            .call_llm_with_hooks_silent(
-                                &checkpoint_messages,
+                        if self
+                            .run_convergence_checkpoint(
+                                &mut convergence,
+                                &reason,
+                                user_content,
+                                &messages,
                                 &tools_spec,
-                                &checkpoint_config,
+                                &call_config,
                                 iteration,
-                                &total_usage,
                                 &mut turn,
+                                tracker,
                             )
                             .await
                         {
-                            Ok((reflection, _streamed, attributed_cost)) => {
-                                turn.record_llm_usage(
-                                    &reflection.usage,
-                                    tracker,
-                                    attributed_cost,
-                                );
-                                let content = reflection.content.unwrap_or_else(|| {
-                                    "Checkpoint returned no text; continue with one bounded next action."
-                                        .to_string()
-                                });
-                                let usage_after_checkpoint = turn.total_usage().clone();
-                                // The reflection's own usage is real spend for
-                                // the turn (recorded above) but is excluded
-                                // from the convergence thresholds.
-                                let reflection_usage = TokenUsage {
-                                    input_tokens: reflection.usage.input_tokens,
-                                    output_tokens: reflection.usage.output_tokens,
-                                    cache_read_tokens: reflection.usage.cache_read_tokens,
-                                    cache_write_tokens: reflection.usage.cache_write_tokens,
-                                    ..Default::default()
-                                };
-                                convergence.complete(
-                                    &usage_after_checkpoint,
-                                    Some(&reflection_usage),
-                                    content,
-                                );
-                                tracing::info!(
-                                    iteration,
-                                    checkpoint = convergence.checkpoints(),
-                                    "convergence checkpoint completed; continuing user turn"
-                                );
-                                continue 'agent_loop;
-                            }
-                            Err(error) => {
-                                // Reflection is a guardrail, not a new failure
-                                // mode. Rearm it and proceed with the normal
-                                // call when the checkpoint provider fails.
-                                warn!(%error, iteration, "convergence checkpoint failed open");
-                                convergence.complete(
-                                    turn.total_usage(),
-                                    None,
-                                    "Checkpoint failed; continue with one bounded, evidence-driven action."
-                                        .to_string(),
-                                );
-                            }
+                            continue 'agent_loop;
                         }
                     }
+                    let total_usage = turn.total_usage().clone();
 
                     if iteration == 1 && tools_spec.len() > 25 {
                         tracing::warn!(
@@ -2150,6 +2210,18 @@ impl Agent {
                                 });
                             }
 
+                            if let Some(request) =
+                                loop_detector.take_semantic_reflection_signal()
+                                && self.config.no_progress_reflection
+                                && self.verifier_config.is_none()
+                            {
+                                convergence.force(CheckpointReason::SemanticNoProgress {
+                                    category: request.category,
+                                    target: request.target,
+                                    evidence: request.evidence,
+                                });
+                            }
+
                             if let Some(tool_name) = loop_detector.take_peer_polling_signal() {
                                 convergence.force(CheckpointReason::PeerPolling { tool_name });
                             }
@@ -2632,9 +2704,16 @@ impl Agent {
             });
 
             let mut messages = self.build_initial_messages(task).await;
+            let reflection_goal = messages
+                .iter()
+                .rev()
+                .find(|message| message.role == MessageRole::User)
+                .map(|message| message.content.clone())
+                .unwrap_or_default();
             let mut files_modified = Vec::new();
             let mut files_to_send = Vec::new();
             let mut turn = LoopTurnState::new(task_start);
+            let mut convergence = ConvergenceController::semantic_only(task_start);
             let mut max_token_continuations = 0usize;
             let mut max_token_fragments = Vec::new();
             // M6.2: per-run retry-bucket state machine. Same instance lives
@@ -2654,6 +2733,11 @@ impl Agent {
             let config = self.chat_config();
 
             loop {
+                messages.retain(|message| {
+                    !(message.role == MessageRole::User
+                        && is_checkpoint_context(&message.content))
+                });
+                let mut grace_iteration = false;
                 if let Some(stop) = turn.check_budget(self, activity.as_ref()) {
                     let stop_iteration = turn.iteration();
                     if !self.try_budget_grace_call(
@@ -2692,6 +2776,7 @@ impl Agent {
                             token_usage: turn.total_usage().clone(),
                         });
                     }
+                    grace_iteration = true;
                 }
 
                 let iteration = turn.advance_iteration();
@@ -2726,10 +2811,42 @@ impl Agent {
                     },
                     iteration,
                 );
+                if let Some(context) = convergence.context_message() {
+                    messages.push(Message::user(context));
+                }
                 let total_usage = turn.total_usage().clone();
 
                 // M8.5 tier 2: decorate the config with the Anthropic header.
                 let call_config = with_tier2_context_management(&config, self);
+                // Task mode has no periodic checkpoint schedule. Only an H07
+                // `switch_required` signal can make this due, and a final
+                // budget-grace iteration always belongs to the deliverable.
+                let checkpoint_due = if grace_iteration
+                    || convergence.semantic_reflection_pending()
+                        && !self.reflection_budget_available(iteration, &total_usage)
+                {
+                    None
+                } else {
+                    convergence.due(&total_usage)
+                };
+                if let Some(reason) = checkpoint_due
+                    && self
+                        .run_convergence_checkpoint(
+                            &mut convergence,
+                            &reason,
+                            &reflection_goal,
+                            &messages,
+                            &tools_spec,
+                            &call_config,
+                            iteration,
+                            &mut turn,
+                            tracker,
+                        )
+                        .await
+                {
+                    continue;
+                }
+                let total_usage = turn.total_usage().clone();
                 let (mut response, _streamed, attributed_cost) = match self
                     .call_llm_with_hooks(
                         &messages,
@@ -3033,6 +3150,16 @@ impl Agent {
                                 files_to_send,
                                 subtasks: Vec::new(),
                                 token_usage: turn.total_usage().clone(),
+                            });
+                        }
+                        if let Some(request) = loop_detector.take_semantic_reflection_signal()
+                            && self.config.no_progress_reflection
+                            && self.verifier_config.is_none()
+                        {
+                            convergence.force(CheckpointReason::SemanticNoProgress {
+                                category: request.category,
+                                target: request.target,
+                                evidence: request.evidence,
                             });
                         }
                         if let Err(e) = self

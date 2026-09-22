@@ -5799,6 +5799,401 @@ async fn h07_m3_task_uses_the_same_semantic_episode() {
     );
 }
 
+fn h07_m6_strategy_responses(reflection: ChatResponse) -> Vec<ChatResponse> {
+    let mut responses = h07_m3_changed_attempts();
+    responses.pop();
+    responses.push(reflection);
+    responses.push(tool_use(
+        vec![ToolCall {
+            id: "different_diagnostic".into(),
+            name: "check".into(),
+            arguments: serde_json::json!({"scope": "fresh"}),
+            metadata: None,
+        }],
+        1,
+        1,
+    ));
+    responses.push(end_turn("diagnosed after a different action", 1, 1));
+    responses
+}
+
+fn h07_m6_tools(diff_calls: Arc<AtomicUsize>, diagnostic_calls: Arc<AtomicUsize>) -> ToolRegistry {
+    let mut tools = ToolRegistry::new();
+    tools.register(H07M3NoMatchTool { calls: diff_calls });
+    tools.register(StaticResultTool {
+        name: "check",
+        output: "fresh diagnostic evidence",
+        success: true,
+        calls: diagnostic_calls,
+    });
+    tools
+}
+
+#[tokio::test]
+async fn h07_m6_b_policy_keeps_the_ladder_without_an_extra_model_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let mut responses = h07_m3_changed_attempts();
+    responses.pop();
+    responses.push(tool_use(
+        vec![ToolCall {
+            id: "different_diagnostic".into(),
+            name: "check".into(),
+            arguments: serde_json::json!({"scope": "fresh"}),
+            metadata: None,
+        }],
+        1,
+        1,
+    ));
+    responses.push(end_turn("diagnosed after a different action", 1, 1));
+    let provider = Arc::new(ConfigRecordingProvider::new(responses, requests.clone()));
+    let diff_calls = Arc::new(AtomicUsize::new(0));
+    let diagnostic_calls = Arc::new(AtomicUsize::new(0));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("h07-m6-b"),
+        provider,
+        h07_m6_tools(diff_calls.clone(), diagnostic_calls.clone()),
+        memory,
+    )
+    .with_config(AgentConfig {
+        no_progress: true,
+        no_progress_reflection: false,
+        max_iterations: 10,
+        save_episodes: false,
+        ..Default::default()
+    });
+
+    let result = agent
+        .process_message("diagnose parser", &[], vec![])
+        .await
+        .unwrap();
+    assert_eq!(result.content, "diagnosed after a different action");
+    assert_eq!(diff_calls.load(AtomicOrdering::SeqCst), 3);
+    assert_eq!(diagnostic_calls.load(AtomicOrdering::SeqCst), 1);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 5);
+    assert!(
+        requests
+            .iter()
+            .all(|(_, _, config)| !matches!(config.tool_choice, ToolChoice::None))
+    );
+    assert!(
+        requests[3]
+            .0
+            .iter()
+            .any(|message| message.content.contains("[SWITCH REQUIRED]"))
+    );
+}
+
+#[tokio::test]
+async fn h07_m6_c_policy_reflects_once_then_gives_the_next_action_a_strategy_chance() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let mut reflection = end_turn("PRIVATE-H07-REFLECTION", 7, 3);
+    reflection.usage.reasoning_tokens = 2;
+    reflection.usage.cache_read_tokens = 3;
+    reflection.usage.cache_write_tokens = 4;
+    let provider = Arc::new(ConfigRecordingProvider::new(
+        h07_m6_strategy_responses(reflection),
+        requests.clone(),
+    ));
+    let diff_calls = Arc::new(AtomicUsize::new(0));
+    let diagnostic_calls = Arc::new(AtomicUsize::new(0));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("h07-m6-c"),
+        provider,
+        h07_m6_tools(diff_calls.clone(), diagnostic_calls.clone()),
+        memory,
+    )
+    .with_config(AgentConfig {
+        no_progress: true,
+        no_progress_reflection: true,
+        max_iterations: 10,
+        save_episodes: false,
+        ..Default::default()
+    })
+    .with_convergence_intervals(3, 100_000_000, std::time::Duration::from_secs(86_400));
+
+    let result = agent
+        .process_message("diagnose parser", &[], vec![])
+        .await
+        .unwrap();
+    assert_eq!(result.content, "diagnosed after a different action");
+    assert_eq!(diff_calls.load(AtomicOrdering::SeqCst), 3);
+    assert_eq!(diagnostic_calls.load(AtomicOrdering::SeqCst), 1);
+    assert_eq!(result.token_usage.input_tokens, 12);
+    assert_eq!(result.token_usage.output_tokens, 8);
+    assert_eq!(result.token_usage.reasoning_tokens, 2);
+    assert_eq!(result.token_usage.cache_read_tokens, 3);
+    assert_eq!(result.token_usage.cache_write_tokens, 4);
+    assert!(
+        result
+            .messages
+            .iter()
+            .all(|message| !message.content.contains("PRIVATE-H07-REFLECTION"))
+    );
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 6);
+    let reflections: Vec<_> = requests
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, _, config))| matches!(config.tool_choice, ToolChoice::None))
+        .collect();
+    assert_eq!(reflections.len(), 1);
+    assert_eq!(reflections[0].0, 3);
+    let reflection_messages = &reflections[0].1.0;
+    assert_eq!(reflection_messages.len(), 2);
+    let prompt = &reflection_messages.last().unwrap().content;
+    assert!(prompt.contains("User goal: diagnose parser"));
+    assert!(prompt.contains("Episode category: mutate/no_progress"));
+    assert!(prompt.contains("diff_context_no_match"));
+    assert!(prompt.contains("Related trigger: 3 LLM action calls"));
+    assert!(!prompt.contains("same failure, duration="));
+    assert!(
+        requests[4]
+            .0
+            .iter()
+            .any(|message| message.content.contains("PRIVATE-H07-REFLECTION"))
+    );
+    assert!(matches!(requests[4].2.tool_choice, ToolChoice::Auto));
+}
+
+#[tokio::test]
+async fn h07_m6_same_episode_is_terminal_after_its_single_reflection() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let mut responses = h07_m5_terminal_attempts();
+    responses.insert(3, end_turn("PRIVATE-H07-REFLECTION", 1, 1));
+    let provider = Arc::new(ConfigRecordingProvider::new(responses, requests.clone()));
+    let diff_calls = Arc::new(AtomicUsize::new(0));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("h07-m6-reflected-terminal"),
+        provider,
+        h07_m6_tools(diff_calls.clone(), Arc::new(AtomicUsize::new(0))),
+        memory,
+    )
+    .with_config(AgentConfig {
+        no_progress: true,
+        no_progress_reflection: true,
+        max_iterations: 10,
+        save_episodes: false,
+        ..Default::default()
+    });
+
+    let result = agent
+        .process_message("diagnose parser", &[], vec![])
+        .await
+        .unwrap();
+    assert!(result.content.contains("Stopped after repeated mutation"));
+    assert_eq!(diff_calls.load(AtomicOrdering::SeqCst), 4);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 5);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|(_, _, config)| matches!(config.tool_choice, ToolChoice::None))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn h07_m6_task_reuses_the_tools_disabled_reflection_without_periodic_checkpoints() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let provider = Arc::new(ConfigRecordingProvider::new(
+        h07_m6_strategy_responses(end_turn("PRIVATE-TASK-REFLECTION", 2, 2)),
+        requests.clone(),
+    ));
+    let diff_calls = Arc::new(AtomicUsize::new(0));
+    let diagnostic_calls = Arc::new(AtomicUsize::new(0));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("h07-m6-task-c"),
+        provider,
+        h07_m6_tools(diff_calls.clone(), diagnostic_calls.clone()),
+        memory,
+    )
+    .with_config(AgentConfig {
+        no_progress: true,
+        no_progress_reflection: true,
+        max_iterations: 10,
+        save_episodes: false,
+        ..Default::default()
+    })
+    .with_convergence_intervals(2, 1_000, std::time::Duration::from_secs(10));
+
+    let result = agent
+        .run_task(&task_for("diagnose parser", dir.path()))
+        .await
+        .unwrap();
+    assert!(result.success);
+    assert_eq!(result.output, "diagnosed after a different action");
+    assert!(!result.output.contains("PRIVATE-TASK-REFLECTION"));
+    assert_eq!(diff_calls.load(AtomicOrdering::SeqCst), 3);
+    assert_eq!(diagnostic_calls.load(AtomicOrdering::SeqCst), 1);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 6);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|(_, _, config)| matches!(config.tool_choice, ToolChoice::None))
+            .count(),
+        1
+    );
+    assert!(
+        requests[4]
+            .0
+            .iter()
+            .any(|message| message.content.contains("PRIVATE-TASK-REFLECTION"))
+    );
+}
+
+#[tokio::test]
+async fn h07_m6_empty_reflection_is_not_retried_and_falls_back_to_b() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let provider = Arc::new(ConfigRecordingProvider::new(
+        h07_m6_strategy_responses(end_turn("", 5, 1)),
+        requests.clone(),
+    ));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("h07-m6-empty-reflection"),
+        provider,
+        h07_m6_tools(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))),
+        memory,
+    )
+    .with_config(AgentConfig {
+        no_progress: true,
+        no_progress_reflection: true,
+        max_iterations: 10,
+        save_episodes: false,
+        ..Default::default()
+    });
+
+    let result = agent
+        .process_message("diagnose parser", &[], vec![])
+        .await
+        .unwrap();
+    assert_eq!(result.content, "diagnosed after a different action");
+    assert_eq!(result.token_usage.input_tokens, 10);
+    assert_eq!(result.token_usage.output_tokens, 6);
+    let requests = requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        6,
+        "the empty reflection must consume one request only"
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|(_, _, config)| matches!(config.tool_choice, ToolChoice::None))
+            .count(),
+        1
+    );
+    assert!(
+        requests[4]
+            .0
+            .iter()
+            .any(|message| message.content.contains("[SWITCH REQUIRED]"))
+    );
+    assert!(
+        requests[4]
+            .0
+            .iter()
+            .all(|message| !message.content.contains("PRIVATE-H07"))
+    );
+}
+
+#[tokio::test]
+async fn h07_m6_near_iteration_limit_uses_b_instead_of_spending_the_last_call_on_reflection() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let provider = Arc::new(ConfigRecordingProvider::new(
+        h07_m3_changed_attempts(),
+        requests.clone(),
+    ));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("h07-m6-budget-b"),
+        provider,
+        h07_m6_tools(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))),
+        memory,
+    )
+    .with_config(AgentConfig {
+        no_progress: true,
+        no_progress_reflection: true,
+        max_iterations: 4,
+        save_episodes: false,
+        ..Default::default()
+    });
+
+    let result = agent
+        .process_message("diagnose parser", &[], vec![])
+        .await
+        .unwrap();
+    assert_eq!(result.content, "diagnosed");
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 4);
+    assert!(
+        requests
+            .iter()
+            .all(|(_, _, config)| !matches!(config.tool_choice, ToolChoice::None))
+    );
+}
+
+#[tokio::test]
+async fn h07_m6_verifier_owner_suppresses_the_h07_reflection_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let planner = Arc::new(ConfigRecordingProvider::new(
+        h07_m3_changed_attempts(),
+        requests.clone(),
+    ));
+    let verifier = Arc::new(ScriptedProvider::new(
+        (0..4)
+            .map(|_| end_turn(r#"{"verdict":"ReadyToAnswer"}"#, 1, 1))
+            .collect(),
+    ));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("h07-m6-verifier-owner"),
+        planner,
+        h07_m6_tools(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))),
+        memory,
+    )
+    .with_config(AgentConfig {
+        no_progress: true,
+        no_progress_reflection: true,
+        max_iterations: 10,
+        save_episodes: false,
+        ..Default::default()
+    })
+    .with_verifier_config(AgentVerifierConfig::with_provider(
+        verifier.clone(),
+        "haiku-test",
+    ));
+
+    let result = agent
+        .process_message("diagnose parser", &[], vec![])
+        .await
+        .unwrap();
+    assert_eq!(result.content, "diagnosed");
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 4);
+    assert!(
+        requests
+            .iter()
+            .all(|(_, _, config)| !matches!(config.tool_choice, ToolChoice::None))
+    );
+    assert_eq!(verifier.prompts.lock().unwrap().len(), 3);
+}
+
 fn h07_m5_terminal_attempts() -> Vec<ChatResponse> {
     (0..4)
         .map(|n| {

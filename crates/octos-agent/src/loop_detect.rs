@@ -11,7 +11,7 @@ use std::hash::{Hash, Hasher};
 
 use crate::agent::progress_observation::{
     EpisodeOutcome, EpisodeTracker, ObservationConfidence, OperationFamily, ProgressClass,
-    ProgressDecision, ProgressObservation,
+    ProgressDecision, ProgressObservation, SemanticReflectionRequest,
 };
 
 /// Legacy soft "no-progress" hint, used when H07 is disabled. It fires
@@ -101,6 +101,11 @@ pub struct LoopDetector {
     /// bounded reflection while preserving the running task.
     verified_wait_signatures: Vec<u64>,
     pending_verified_wait: Option<String>,
+    /// H07 policy signal. The episode state emits it at `switch_required`;
+    /// this turn-local latch bounds strategy reflection to one request even
+    /// when a tool batch contains several stalled episodes.
+    semantic_reflection_requested: bool,
+    pending_semantic_reflection: Option<SemanticReflectionRequest>,
 }
 
 impl LoopDetector {
@@ -127,6 +132,8 @@ impl LoopDetector {
             pending_peer_polling: None,
             verified_wait_signatures: Vec::with_capacity(window * 2),
             pending_verified_wait: None,
+            semantic_reflection_requested: false,
+            pending_semantic_reflection: None,
         }
     }
 
@@ -141,6 +148,12 @@ impl LoopDetector {
 
     pub(crate) fn observe_semantic(&mut self, observation: &ProgressObservation) -> EpisodeOutcome {
         let outcome = self.episodes.observe(observation);
+        if !self.semantic_reflection_requested
+            && let Some(request) = outcome.request_reflection.clone()
+        {
+            self.semantic_reflection_requested = true;
+            self.pending_semantic_reflection = Some(request);
+        }
         let family = match observation.family {
             OperationFamily::Read => "read",
             OperationFamily::Search => "search",
@@ -177,6 +190,10 @@ impl LoopDetector {
         )
         .increment(1);
         outcome
+    }
+
+    pub(crate) fn take_semantic_reflection_signal(&mut self) -> Option<SemanticReflectionRequest> {
+        self.pending_semantic_reflection.take()
     }
 
     /// Shared pre-call exact guard for conversation and task loops.
@@ -541,7 +558,45 @@ fn mutation_path(tool_name: &str, args: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::progress_observation::{
+        MutationOutcome, ObservationStatus, ProgressObservation,
+    };
     use serde_json::json;
+
+    fn stalled_episode(target: &str) -> ProgressObservation {
+        ProgressObservation {
+            call_id: format!("call-{target}"),
+            family: OperationFamily::Mutate,
+            target_key: format!("target-{target}"),
+            target_label: target.to_owned(),
+            status: ObservationStatus::Failed,
+            outcome: Some(MutationOutcome::NoMatch),
+            state_digest: None,
+            evidence_key: format!("sha256:{:0>64}", target.len()),
+            validation_key: None,
+            wait_key: None,
+            error_kind: Some("diff_context_no_match".into()),
+            confidence: ObservationConfidence::Typed,
+            diagnostic: None,
+            semantic_eligible: true,
+        }
+    }
+
+    #[test]
+    fn h07_m6_bounds_semantic_reflection_to_once_per_turn() {
+        let mut detector = LoopDetector::new(12).with_no_progress(true);
+        for target in ["a.rs", "b.rs"] {
+            let observation = stalled_episode(target);
+            for _ in 0..3 {
+                detector.observe_semantic(&observation);
+            }
+        }
+        let request = detector
+            .take_semantic_reflection_signal()
+            .expect("the first stalled episode should request reflection");
+        assert_eq!(request.target, "a.rs");
+        assert!(detector.take_semantic_reflection_signal().is_none());
+    }
 
     #[test]
     fn h07_m2_exact_result_hints_on_second_and_rejects_third() {

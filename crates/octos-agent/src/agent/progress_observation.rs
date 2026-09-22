@@ -568,6 +568,33 @@ pub(crate) struct EpisodeOutcome {
     pub class: ProgressClass,
     pub decision: ProgressDecision,
     pub hint: Option<String>,
+    pub request_reflection: Option<SemanticReflectionRequest>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SemanticReflectionRequest {
+    pub category: String,
+    pub target: String,
+    pub evidence: String,
+}
+
+impl SemanticReflectionRequest {
+    fn from_observation(observation: &ProgressObservation) -> Self {
+        Self {
+            category: format!("{:?}/no_progress", observation.family).to_lowercase(),
+            target: bounded(&observation.target_label, 96),
+            evidence: bounded(
+                &format!(
+                    "status={:?}; outcome={:?}; error={}; evidence={}",
+                    observation.status,
+                    observation.outcome,
+                    observation.error_kind.as_deref().unwrap_or("none"),
+                    observation.evidence_key,
+                ),
+                MAX_HINT_BYTES,
+            ),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -608,6 +635,7 @@ struct Episode {
     observations: u8,
     hinted: bool,
     switch_required: bool,
+    reflection_requested: bool,
     post_switch_probe: bool,
     terminal: bool,
 }
@@ -635,6 +663,7 @@ impl EpisodeTracker {
                 class: ProgressClass::Unknown,
                 decision: ProgressDecision::Continue,
                 hint: None,
+                request_reflection: None,
             };
         }
         if observation.family == OperationFamily::Wait && observation.wait_key.is_some() {
@@ -645,6 +674,7 @@ impl EpisodeTracker {
                     class: ProgressClass::VerifiedWait,
                     decision: ProgressDecision::Continue,
                     hint: None,
+                    request_reflection: None,
                 };
             }
             let known_scope = self
@@ -660,6 +690,7 @@ impl EpisodeTracker {
                 observations: 1,
                 hinted: false,
                 switch_required: false,
+                reflection_requested: false,
                 post_switch_probe: false,
                 terminal: false,
             });
@@ -671,6 +702,7 @@ impl EpisodeTracker {
                 },
                 decision: ProgressDecision::Continue,
                 hint: None,
+                request_reflection: None,
             };
         }
         if let Some(index) = self.episodes.iter().position(|episode| episode.key == key) {
@@ -692,6 +724,13 @@ impl EpisodeTracker {
             } else {
                 ProgressDecision::Continue
             };
+            let request_reflection =
+                if decision == ProgressDecision::SwitchRequired && !episode.reflection_requested {
+                    episode.reflection_requested = true;
+                    Some(SemanticReflectionRequest::from_observation(observation))
+                } else {
+                    None
+                };
             self.episodes.push_back(episode);
             let hint = match decision {
                 ProgressDecision::Hint => Some(bounded(
@@ -714,6 +753,7 @@ impl EpisodeTracker {
                 class: ProgressClass::NoProgress,
                 decision,
                 hint,
+                request_reflection,
             };
         }
         let known_scope = self
@@ -738,6 +778,7 @@ impl EpisodeTracker {
             observations: 1,
             hinted: false,
             switch_required: false,
+            reflection_requested: false,
             post_switch_probe: false,
             terminal: false,
         });
@@ -745,6 +786,7 @@ impl EpisodeTracker {
             class,
             decision: ProgressDecision::Continue,
             hint: None,
+            request_reflection: None,
         }
     }
 
@@ -831,6 +873,7 @@ mod tests {
             class: ProgressClass::NoProgress,
             decision: ProgressDecision::TerminalNonRetryable,
             hint: None,
+            request_reflection: None,
         };
         let terminal = EpisodeTracker::terminal_for(&observation, &outcome).unwrap();
         assert!(terminal.message.contains("mutation"));
@@ -1100,7 +1143,23 @@ mod tests {
         assert_eq!(observed[0].decision, ProgressDecision::Continue);
         assert_eq!(observed[1].decision, ProgressDecision::Hint);
         assert_eq!(observed[2].decision, ProgressDecision::SwitchRequired);
+        assert!(observed[0].request_reflection.is_none());
+        assert!(observed[1].request_reflection.is_none());
+        let reflection = observed[2]
+            .request_reflection
+            .as_ref()
+            .expect("switch_required should request one strategy reflection");
+        assert_eq!(reflection.category, "mutate/no_progress");
+        assert!(reflection.target.contains("目标.rs"));
+        assert!(reflection.evidence.contains("diff_context_no_match"));
         assert!(observed[1].hint.as_ref().unwrap().len() <= MAX_HINT_BYTES);
+        let fourth = call(
+            "diff_edit",
+            json!({"path": "/workspace/目标.rs", "diff": "fourth attempt"}),
+        );
+        let terminal = tracker.observe(&h07_m3_rejection(&fourth, 4, 9));
+        assert_eq!(terminal.decision, ProgressDecision::TerminalNonRetryable);
+        assert!(terminal.request_reflection.is_none());
         assert!(observed[2].hint.as_ref().unwrap().len() <= MAX_HINT_BYTES);
         assert_eq!(tracker.len(), 1);
         let different = h07_m3_rejection(

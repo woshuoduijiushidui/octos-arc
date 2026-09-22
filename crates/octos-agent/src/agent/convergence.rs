@@ -11,6 +11,9 @@ use octos_core::TokenUsage;
 const DEFAULT_LLM_CALL_INTERVAL: u32 = 20;
 const DEFAULT_ACTIVE_TOKEN_INTERVAL: u64 = 100_000;
 const DEFAULT_ELAPSED_INTERVAL_SECS: u64 = 300;
+const MAX_PENDING_REASONS: usize = 8;
+const MAX_REFLECTION_GOAL_BYTES: usize = 800;
+const MAX_RELATED_REASON_BYTES: usize = 320;
 
 /// Typed tail envelope for the transient reflection. It is re-injected as a
 /// USER-role context event, never as a System row: Anthropic hoists every
@@ -46,6 +49,15 @@ pub(super) enum CheckpointReason {
     VerifiedWait {
         tool_name: String,
     },
+    /// H07 strategy reflection after an episode reaches `switch_required`.
+    /// The payload is deliberately typed and bounded; raw tool output never
+    /// enters the private reflection request.
+    SemanticNoProgress {
+        category: String,
+        target: String,
+        evidence: String,
+    },
+    Combined(Vec<CheckpointReason>),
 }
 
 impl CheckpointReason {
@@ -66,6 +78,16 @@ impl CheckpointReason {
             Self::VerifiedWait { tool_name } => {
                 format!("{tool_name} returned unchanged output for the same live task three times")
             }
+            Self::SemanticNoProgress {
+                category,
+                target,
+                evidence,
+            } => format!("H07 {category} episode at {target} reached switch_required ({evidence})"),
+            Self::Combined(reasons) => reasons
+                .iter()
+                .map(Self::describe)
+                .collect::<Vec<_>>()
+                .join("; "),
             Self::FileChurn {
                 path,
                 edits,
@@ -78,6 +100,60 @@ impl CheckpointReason {
                 };
                 format!("{path} was modified {edits} times{escalation_note}")
             }
+        }
+    }
+
+    fn priority(&self) -> u8 {
+        match self {
+            Self::SemanticNoProgress { .. } => 0,
+            Self::FileChurn { .. } => 1,
+            Self::VerifiedWait { .. } => 2,
+            Self::PeerPolling { .. } => 3,
+            Self::LlmCalls { .. } | Self::ActiveTokens { .. } | Self::Elapsed { .. } => 4,
+            Self::Combined(_) => 5,
+        }
+    }
+
+    pub(super) fn contains_semantic_no_progress(&self) -> bool {
+        matches!(self, Self::SemanticNoProgress { .. })
+            || matches!(self, Self::Combined(reasons) if reasons.iter().any(Self::contains_semantic_no_progress))
+    }
+
+    fn contains_peer_polling(&self) -> bool {
+        matches!(self, Self::PeerPolling { .. })
+            || matches!(self, Self::Combined(reasons) if reasons.iter().any(Self::contains_peer_polling))
+    }
+
+    fn contains_verified_wait(&self) -> bool {
+        matches!(self, Self::VerifiedWait { .. })
+            || matches!(self, Self::Combined(reasons) if reasons.iter().any(Self::contains_verified_wait))
+    }
+
+    fn contains_escalated_file_churn(&self) -> bool {
+        matches!(
+            self,
+            Self::FileChurn {
+                escalation: true,
+                ..
+            }
+        ) || matches!(self, Self::Combined(reasons) if reasons.iter().any(Self::contains_escalated_file_churn))
+    }
+
+    fn into_reasons(self) -> Vec<Self> {
+        match self {
+            Self::Combined(reasons) => reasons,
+            reason => vec![reason],
+        }
+    }
+
+    fn from_reasons(mut reasons: Vec<Self>) -> Option<Self> {
+        reasons.sort_by_key(Self::priority);
+        reasons.dedup();
+        reasons.truncate(MAX_PENDING_REASONS);
+        match reasons.len() {
+            0 => None,
+            1 => reasons.pop(),
+            _ => Some(Self::Combined(reasons)),
         }
     }
 }
@@ -155,10 +231,29 @@ impl ConvergenceController {
         }
     }
 
-    /// Queue an early checkpoint. File churn has priority over periodic
-    /// thresholds because it carries the most concrete evidence of drift.
+    /// Task mode only enables H07-forced reflection. It intentionally has no
+    /// periodic call/token/time schedule of its own.
+    pub(super) fn semantic_only(started_at: Instant) -> Self {
+        Self::new(started_at, u32::MAX, u64::MAX, Duration::MAX)
+    }
+
+    /// Queue an early checkpoint without overwriting another typed trigger.
+    /// Multiple causes observed before the next loop boundary are merged into
+    /// one tools-disabled request, with typed H07 evidence kept first.
     pub(super) fn force(&mut self, reason: CheckpointReason) {
-        self.pending_reason = Some(reason);
+        let mut reasons = self
+            .pending_reason
+            .take()
+            .map(CheckpointReason::into_reasons)
+            .unwrap_or_default();
+        reasons.extend(reason.into_reasons());
+        self.pending_reason = CheckpointReason::from_reasons(reasons);
+    }
+
+    pub(super) fn semantic_reflection_pending(&self) -> bool {
+        self.pending_reason
+            .as_ref()
+            .is_some_and(CheckpointReason::contains_semantic_no_progress)
     }
 
     /// Record one COMPLETED action call. Call this after a successful action
@@ -173,9 +268,11 @@ impl ConvergenceController {
     /// an N-call checkpoint fires only once N action calls have finished and
     /// the reflection runs before action call N+1.
     pub(super) fn due(&mut self, usage: &TokenUsage) -> Option<CheckpointReason> {
-        if let Some(reason) = self.pending_reason.take() {
-            return Some(reason);
-        }
+        let mut reasons = self
+            .pending_reason
+            .take()
+            .map(CheckpointReason::into_reasons)
+            .unwrap_or_default();
 
         // Thresholds count completed ACTION calls and ACTION tokens only: a
         // checkpoint's own reflection call is real spend for the turn but is
@@ -185,37 +282,32 @@ impl ConvergenceController {
             .saturating_sub(self.action_calls_at_checkpoint);
         let action_tokens = self.action_active_tokens(usage);
         if calls_since_checkpoint >= self.llm_call_interval {
-            return Some(CheckpointReason::LlmCalls {
+            reasons.push(CheckpointReason::LlmCalls {
                 calls: calls_since_checkpoint,
             });
-        }
-        if action_tokens.saturating_sub(self.active_tokens_at_checkpoint)
+        } else if action_tokens.saturating_sub(self.active_tokens_at_checkpoint)
             >= self.active_token_interval
         {
-            return Some(CheckpointReason::ActiveTokens {
+            reasons.push(CheckpointReason::ActiveTokens {
                 tokens: action_tokens,
             });
-        }
-        if self.last_checkpoint_at.elapsed() >= self.elapsed_interval {
-            return Some(CheckpointReason::Elapsed {
+        } else if self.last_checkpoint_at.elapsed() >= self.elapsed_interval {
+            reasons.push(CheckpointReason::Elapsed {
                 elapsed: self.started_at.elapsed(),
             });
         }
-        None
+        CheckpointReason::from_reasons(reasons)
     }
 
-    pub(super) fn prompt(reason: &CheckpointReason) -> String {
-        let escalation_instruction = if matches!(reason, CheckpointReason::PeerPolling { .. }) {
+    pub(super) fn prompt(reason: &CheckpointReason, user_goal: &str) -> String {
+        if reason.contains_semantic_no_progress() {
+            return Self::semantic_prompt(reason, user_goal);
+        }
+        let escalation_instruction = if reason.contains_peer_polling() {
             "\nThis is asynchronous peer polling, not proof the tool cannot change. Identify whether peers are still running, awaiting input, completed, or failed from the actual tool evidence. Do not busy-wait or invent a completed result: choose independent work, address a peer's input request, or use an available bounded wait before gathering again. Only claim completion after seeing the required result."
-        } else if matches!(reason, CheckpointReason::VerifiedWait { .. }) {
+        } else if reason.contains_verified_wait() {
             "\nThis is a runtime-confirmed live task wait, not proof the task failed or cannot change. Do not busy-wait, invent a completed result, or start a replacement task from this observation alone: choose independent work or use an available bounded wait before reading the same handle again. Only claim completion after observing its actual completed or failed state."
-        } else if matches!(
-            reason,
-            CheckpointReason::FileChurn {
-                escalation: true,
-                ..
-            }
-        ) {
+        } else if reason.contains_escalated_file_churn() {
             "\nThis is a repeated churn breach. If you cannot identify a substantially different, root-cause-driven approach, the next action must be to pause and ask the user for direction instead of editing again."
         } else {
             ""
@@ -231,6 +323,45 @@ impl ConvergenceController {
              Be concise and factual. Do not address the user and do not call tools.{}",
             reason.describe(),
             escalation_instruction,
+        )
+    }
+
+    fn semantic_prompt(reason: &CheckpointReason, user_goal: &str) -> String {
+        let goal = bounded(user_goal.trim(), MAX_REFLECTION_GOAL_BYTES);
+        let evidence = match reason {
+            CheckpointReason::SemanticNoProgress {
+                category,
+                target,
+                evidence,
+            } => format!(
+                "Episode category: {category}\nTarget: {target}\nBounded evidence: {evidence}"
+            ),
+            CheckpointReason::Combined(reasons) => reasons
+                .iter()
+                .map(|item| match item {
+                    CheckpointReason::SemanticNoProgress {
+                        category,
+                        target,
+                        evidence,
+                    } => format!(
+                        "Episode category: {category}\nTarget: {target}\nBounded evidence: {evidence}"
+                    ),
+                    other => format!(
+                        "Related trigger: {}",
+                        bounded(&other.describe(), MAX_RELATED_REASON_BYTES)
+                    ),
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            other => format!("Related trigger: {}", other.describe()),
+        };
+        format!(
+            "[H07 STRATEGY REFLECTION — private working step]\n\
+             User goal: {goal}\n\
+             {evidence}\n\
+             Tools are disabled. Choose one substantially different, verifiable next action. \
+             State what fresh observation would demonstrate progress. Be concise; do not address \
+             the user, claim completion, or repeat tool output."
         )
     }
 
@@ -313,6 +444,17 @@ fn env_u64(name: &str, default: u64, min: u64, max: u64) -> u64 {
         .and_then(|value| value.parse::<u64>().ok())
         .map(|value| value.clamp(min, max))
         .unwrap_or(default)
+}
+
+fn bounded(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &value[..end])
 }
 
 #[cfg(test)]
@@ -532,6 +674,70 @@ mod tests {
         assert!(matches!(
             controller.due(&TokenUsage::default()),
             Some(CheckpointReason::FileChurn { path, .. }) if path == "app.css"
+        ));
+    }
+
+    #[test]
+    fn h07_m6_merges_typed_and_periodic_triggers_into_one_checkpoint() {
+        let mut controller = new_controller(3, 10_000);
+        controller.force(CheckpointReason::PeerPolling {
+            tool_name: "peer_gather".into(),
+        });
+        controller.force(CheckpointReason::FileChurn {
+            path: "src/app.rs".into(),
+            edits: 5,
+            escalation: false,
+        });
+        controller.force(CheckpointReason::SemanticNoProgress {
+            category: "mutate/no_progress".into(),
+            target: "app.rs".into(),
+            evidence: "status=Failed; evidence=sha256:abc".into(),
+        });
+        record_action_calls(&mut controller, 3);
+
+        let reason = controller
+            .due(&TokenUsage::default())
+            .expect("all due causes should merge");
+        let CheckpointReason::Combined(reasons) = &reason else {
+            panic!("expected one combined checkpoint, got {reason:?}");
+        };
+        assert_eq!(reasons.len(), 4);
+        assert!(matches!(
+            reasons.first(),
+            Some(CheckpointReason::SemanticNoProgress { .. })
+        ));
+        assert!(
+            reasons
+                .iter()
+                .any(|item| matches!(item, CheckpointReason::LlmCalls { calls: 3 }))
+        );
+
+        let prompt = ConvergenceController::prompt(&reason, "Fix the parser without looping");
+        assert!(prompt.contains("User goal: Fix the parser without looping"));
+        assert!(prompt.contains("Episode category: mutate/no_progress"));
+        assert!(prompt.contains("Bounded evidence: status=Failed"));
+        assert!(prompt.contains("Related trigger: peer_gather"));
+        assert!(prompt.contains("different, verifiable next action"));
+    }
+
+    #[test]
+    fn h07_m6_task_controller_has_no_periodic_schedule() {
+        let mut controller = ConvergenceController::semantic_only(Instant::now());
+        record_action_calls(&mut controller, 100);
+        let usage = TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            ..Default::default()
+        };
+        assert!(controller.due(&usage).is_none());
+        controller.force(CheckpointReason::SemanticNoProgress {
+            category: "validate/no_progress".into(),
+            target: "contract".into(),
+            evidence: "status=Failed; evidence=sha256:def".into(),
+        });
+        assert!(matches!(
+            controller.due(&usage),
+            Some(CheckpointReason::SemanticNoProgress { .. })
         ));
     }
 

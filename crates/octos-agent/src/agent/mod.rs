@@ -68,6 +68,10 @@ pub const DEFAULT_WORKER_PROMPT: &str = include_str!("../prompts/worker.txt");
 pub struct AgentConfig {
     /// Enable H07 exact-result progress checks. Parsed once when the config is built.
     pub no_progress: bool,
+    /// Enable the M6 C policy: when an H07 semantic episode requests a
+    /// strategy switch, run one private tools-disabled reflection. The B
+    /// policy leaves this false and uses the same state machine and hint.
+    pub no_progress_reflection: bool,
     /// Maximum number of LLM-loop iterations before stopping. `0` means
     /// unlimited, which is the default for an interactive Codex-style turn.
     /// Unattended entry points (spawn, MCP, pipelines) set an explicit cap.
@@ -238,8 +242,22 @@ impl Default for AgentConfig {
                 false
             }
         };
+        let no_progress_reflection = match std::env::var("OCTOS_NO_PROGRESS_REFLECTION")
+            .ok()
+            .as_deref()
+        {
+            Some("1" | "true") => true,
+            None | Some("0" | "false") => false,
+            Some(_) => {
+                tracing::warn!(
+                    "unknown OCTOS_NO_PROGRESS_REFLECTION value; H07 strategy reflection remains off"
+                );
+                false
+            }
+        };
         Self {
             no_progress,
+            no_progress_reflection,
             max_iterations: 0,
             max_tokens: None,
             max_timeout: Some(std::time::Duration::from_secs(1800)),
