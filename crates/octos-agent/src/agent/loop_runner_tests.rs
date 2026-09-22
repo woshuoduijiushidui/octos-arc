@@ -66,8 +66,15 @@ use octos_llm::{
 };
 use octos_memory::EpisodeStore;
 
+use crate::completion_gate::{
+    ArtifactCheckKind, ArtifactCheckOutcome, ArtifactReasonCode, ArtifactState, CheckOutcome,
+    CompletionCandidate, CompletionDecision, CompletionGate, CompletionReceipt, TICKET_BYTES,
+    TerminalReason, classify,
+};
 #[cfg(unix)]
 use crate::plugins::PluginTool;
+use crate::progress::{ProgressEvent, ProgressReporter};
+use crate::validators::ValidatorStatus;
 use crate::{AgentConfig, AgentVerifierConfig};
 
 fn tool_use(tool_calls: Vec<ToolCall>, input_tokens: u32, output_tokens: u32) -> ChatResponse {
@@ -2564,6 +2571,429 @@ async fn h06_m0_second_run_task_rebuilds_messages_and_usage() {
         message.content.contains("M0_FIRST_RUN_TOOL_OUTPUT")
             || message.content.contains("M0_FIRST_RUN_ANSWER")
     }));
+}
+
+#[derive(Clone, Copy)]
+enum H06GateStep {
+    Repair,
+    Pass,
+    Terminal,
+}
+
+struct H06FakeGate {
+    steps: StdMutex<Vec<H06GateStep>>,
+    seen: StdMutex<Vec<(u64, u32, u8, u32)>>,
+    shutdown_on_repair: Option<Arc<AtomicBool>>,
+}
+
+impl H06FakeGate {
+    fn new(steps: Vec<H06GateStep>) -> Self {
+        Self {
+            steps: StdMutex::new(steps),
+            seen: StdMutex::new(Vec::new()),
+            shutdown_on_repair: None,
+        }
+    }
+}
+
+#[async_trait]
+impl CompletionGate for H06FakeGate {
+    async fn verify(
+        &self,
+        candidate: &CompletionCandidate,
+        core_contract_failure: Option<&str>,
+        repair_rounds_sent: u8,
+    ) -> CompletionDecision {
+        assert!(core_contract_failure.is_none());
+        self.seen.lock().unwrap().push((
+            candidate.revision,
+            candidate.iteration,
+            repair_rounds_sent,
+            candidate.cumulative_usage.input_tokens,
+        ));
+        let step = self.steps.lock().unwrap().remove(0);
+        let mut receipt = CompletionReceipt {
+            task_id: candidate.task_id.clone(),
+            candidate_revision: candidate.revision,
+            gate_policy_version: 1,
+            checks: Vec::new(),
+            artifact_state: ArtifactState::Ready,
+            artifact_path: None,
+            artifact_content: None,
+            validator_references: std::collections::BTreeMap::new(),
+        };
+        match step {
+            H06GateStep::Repair => {
+                if let Some(signal) = &self.shutdown_on_repair {
+                    signal.store(true, AtomicOrdering::Release);
+                }
+                receipt.artifact_state = ArtifactState::Missing;
+                receipt
+                    .checks
+                    .push(CheckOutcome::Artifact(ArtifactCheckOutcome {
+                        gate_id: "artifact/exists".into(),
+                        kind: ArtifactCheckKind::Exists,
+                        status: ValidatorStatus::Fail,
+                        reason_code: ArtifactReasonCode::Missing,
+                        reason: "missing result.json".into(),
+                        stderr: None,
+                        expected_artifact: Some(PathBuf::from("result.json")),
+                        observed_artifact: None,
+                        schema_pointer: None,
+                        safe_target: true,
+                        evidence_ref: None,
+                    }));
+                classify(candidate, receipt, repair_rounds_sent + 1, 2)
+            }
+            H06GateStep::Pass => CompletionDecision::Pass(receipt),
+            H06GateStep::Terminal => CompletionDecision::TerminalFailure {
+                reason: TerminalReason::GateError,
+                receipt,
+            },
+        }
+    }
+}
+
+#[derive(Default)]
+struct H06EventRecorder(StdMutex<Vec<ProgressEvent>>);
+
+impl ProgressReporter for H06EventRecorder {
+    fn report(&self, event: ProgressEvent) {
+        self.0.lock().unwrap().push(event);
+    }
+}
+
+#[tokio::test]
+async fn h06_m3_repair_continues_same_task_history_and_usage() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests: RecordedRequests = Arc::new(StdMutex::new(Vec::new()));
+    let provider: Arc<dyn LlmProvider> = Arc::new(RequestRecordingProvider::new(
+        vec![end_turn("H06_DRAFT", 5, 7), end_turn("H06_FINAL", 11, 13)],
+        requests.clone(),
+    ));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let reporter = Arc::new(H06EventRecorder::default());
+    let agent = Agent::new(
+        AgentId::new("h06-m3-agent"),
+        provider,
+        ToolRegistry::with_builtins(dir.path()),
+        memory,
+    )
+    .with_config(AgentConfig {
+        save_episodes: false,
+        max_iterations: 3,
+        ..Default::default()
+    })
+    .with_reporter(reporter.clone());
+    let task = Task::new(
+        TaskKind::Code {
+            instruction: "H06_ORIGINAL_GOAL".into(),
+            files: vec![],
+        },
+        TaskContext {
+            working_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        },
+    );
+    let gate = H06FakeGate::new(vec![H06GateStep::Repair, H06GateStep::Pass]);
+    let result = agent
+        .run_task_with_completion_gate(&task, &gate)
+        .await
+        .unwrap();
+    assert!(result.task_result.success);
+    assert_eq!(result.task_result.output, "H06_FINAL");
+    assert_eq!(result.task_result.token_usage.input_tokens, 16);
+    assert_eq!(result.task_result.token_usage.output_tokens, 20);
+    assert!(matches!(result.decision, Some(CompletionDecision::Pass(_))));
+    assert_eq!(
+        *gate.seen.lock().unwrap(),
+        vec![(1, 1, 0, 5), (2, 2, 1, 16)]
+    );
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    let second = &requests[1].0;
+    let draft = second
+        .iter()
+        .position(|m| m.role == MessageRole::Assistant && m.content == "H06_DRAFT")
+        .unwrap();
+    let ticket = second
+        .iter()
+        .position(|m| m.role == MessageRole::User && m.content.starts_with("H06 repair ticket v1"))
+        .unwrap();
+    assert!(draft < ticket);
+    assert_eq!(
+        second
+            .iter()
+            .filter(|m| m.content.contains("H06_ORIGINAL_GOAL"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        second
+            .iter()
+            .filter(|m| m.content.starts_with("H06 repair ticket v1"))
+            .count(),
+        1
+    );
+    let text = &second[ticket].content;
+    assert!(text.len() <= TICKET_BYTES);
+    assert!(text.contains("round=1/2"));
+    assert!(text.contains("gate=\"artifact/exists\""));
+    assert!(text.contains("recoverable=false"));
+    assert!(!text.contains("H06_ORIGINAL_GOAL"));
+    let events = reporter.0.lock().unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, ProgressEvent::TaskStarted { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, ProgressEvent::TaskCompleted { success: true, .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, ProgressEvent::TaskCompleted { .. }))
+            .count(),
+        1
+    );
+}
+
+struct H06TicketDroppingProjection;
+
+impl PromptContextManager for H06TicketDroppingProjection {
+    fn prepare_prompt(
+        &self,
+        request: PromptContextRequest,
+        messages: &mut Vec<Message>,
+    ) -> std::result::Result<PromptContextReport, String> {
+        let before = messages.len();
+        if request.iteration > 1 {
+            for message in messages.iter_mut() {
+                if message.content.starts_with("H06 repair ticket v1") {
+                    message.content.truncate(60);
+                }
+            }
+        }
+        Ok(PromptContextReport {
+            prompt_replaced: true,
+            compaction_performed: request.iteration > 1,
+            messages_before: before,
+            messages_after: messages.len(),
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn h06_m3_ticket_survives_final_prompt_projection() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests: RecordedRequests = Arc::new(StdMutex::new(Vec::new()));
+    let provider: Arc<dyn LlmProvider> = Arc::new(RequestRecordingProvider::new(
+        vec![end_turn("draft", 5, 7), end_turn("final", 11, 13)],
+        requests.clone(),
+    ));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("h06-projection"),
+        provider,
+        ToolRegistry::with_builtins(dir.path()),
+        memory,
+    )
+    .with_config(AgentConfig {
+        save_episodes: false,
+        max_iterations: 3,
+        ..Default::default()
+    })
+    .with_prompt_context_manager(Arc::new(H06TicketDroppingProjection));
+    let task = Task::new(
+        TaskKind::Code {
+            instruction: "H06_GOAL".into(),
+            files: vec![],
+        },
+        TaskContext {
+            working_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        },
+    );
+    let gate = H06FakeGate::new(vec![H06GateStep::Repair, H06GateStep::Pass]);
+    let result = agent
+        .run_task_with_completion_gate(&task, &gate)
+        .await
+        .unwrap();
+    assert!(result.task_result.success);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    let tickets: Vec<_> = requests[1]
+        .0
+        .iter()
+        .filter(|message| message.content.starts_with("H06 repair ticket v1"))
+        .collect();
+    assert_eq!(tickets.len(), 1);
+    assert!(tickets[0].content.contains("round=1/2"));
+    assert!(tickets[0].content.contains("gate=\"artifact/exists\""));
+    assert!(tickets[0].content.contains("Allowed action:"));
+    assert!(tickets[0].content.len() <= TICKET_BYTES);
+}
+
+#[tokio::test]
+async fn h06_m3_new_candidate_does_not_inherit_old_max_token_fragments() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut fragment = end_turn("old fragment", 2, 3);
+    fragment.stop_reason = StopReason::MaxTokens;
+    let requests: RecordedRequests = Arc::new(StdMutex::new(Vec::new()));
+    let provider: Arc<dyn LlmProvider> = Arc::new(RequestRecordingProvider::new(
+        vec![fragment, end_turn("draft", 5, 7), end_turn("final", 11, 13)],
+        requests.clone(),
+    ));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("h06-fragments"),
+        provider,
+        ToolRegistry::with_builtins(dir.path()),
+        memory,
+    )
+    .with_config(AgentConfig {
+        save_episodes: false,
+        max_iterations: 4,
+        ..Default::default()
+    });
+    let task = Task::new(
+        TaskKind::Code {
+            instruction: "finish".into(),
+            files: vec![],
+        },
+        TaskContext {
+            working_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        },
+    );
+    let gate = H06FakeGate::new(vec![H06GateStep::Repair, H06GateStep::Pass]);
+    let result = agent
+        .run_task_with_completion_gate(&task, &gate)
+        .await
+        .unwrap();
+    assert_eq!(result.task_result.output, "final");
+    assert_eq!(result.task_result.token_usage.input_tokens, 18);
+    assert_eq!(requests.lock().unwrap().len(), 3);
+    assert_eq!(
+        *gate.seen.lock().unwrap(),
+        vec![(1, 2, 0, 7), (2, 3, 1, 18)]
+    );
+}
+
+#[tokio::test]
+async fn h06_m3_terminal_gate_does_not_request_another_response() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests: RecordedRequests = Arc::new(StdMutex::new(Vec::new()));
+    let provider: Arc<dyn LlmProvider> = Arc::new(RequestRecordingProvider::new(
+        vec![end_turn("draft", 5, 7)],
+        requests.clone(),
+    ));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let reporter = Arc::new(H06EventRecorder::default());
+    let agent = Agent::new(
+        AgentId::new("h06-terminal"),
+        provider,
+        ToolRegistry::with_builtins(dir.path()),
+        memory,
+    )
+    .with_config(AgentConfig {
+        save_episodes: false,
+        ..Default::default()
+    })
+    .with_reporter(reporter.clone());
+    let task = Task::new(
+        TaskKind::Code {
+            instruction: "finish".into(),
+            files: vec![],
+        },
+        TaskContext {
+            working_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        },
+    );
+    let gate = H06FakeGate::new(vec![H06GateStep::Terminal]);
+    let result = agent
+        .run_task_with_completion_gate(&task, &gate)
+        .await
+        .unwrap();
+    assert!(!result.task_result.success);
+    assert!(matches!(
+        result.decision,
+        Some(CompletionDecision::TerminalFailure {
+            reason: TerminalReason::GateError,
+            ..
+        })
+    ));
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    assert_eq!(
+        reporter
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e, ProgressEvent::TaskCompleted { success: false, .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn h06_m3_budget_and_cancellation_precede_repair_request() {
+    for cancel in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let requests: RecordedRequests = Arc::new(StdMutex::new(Vec::new()));
+        let provider: Arc<dyn LlmProvider> = Arc::new(RequestRecordingProvider::new(
+            vec![end_turn("draft", 5, 7)],
+            requests.clone(),
+        ));
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let signal = Arc::new(AtomicBool::new(false));
+        let agent = Agent::new(
+            AgentId::new("h06-budget"),
+            provider,
+            ToolRegistry::with_builtins(dir.path()),
+            memory,
+        )
+        .with_config(AgentConfig {
+            save_episodes: false,
+            max_iterations: if cancel { 3 } else { 1 },
+            ..Default::default()
+        })
+        .with_shutdown(signal.clone());
+        let task = Task::new(
+            TaskKind::Code {
+                instruction: "finish".into(),
+                files: vec![],
+            },
+            TaskContext {
+                working_dir: dir.path().to_path_buf(),
+                ..Default::default()
+            },
+        );
+        let mut gate = H06FakeGate::new(vec![H06GateStep::Repair]);
+        if cancel {
+            gate.shutdown_on_repair = Some(signal);
+        }
+        let result = agent
+            .run_task_with_completion_gate(&task, &gate)
+            .await
+            .unwrap();
+        assert!(!result.task_result.success);
+        assert!(
+            matches!(result.decision, Some(CompletionDecision::TerminalFailure { reason, .. }) if reason == if cancel { TerminalReason::Cancelled } else { TerminalReason::TaskBudgetExhausted })
+        );
+        assert_eq!(result.task_result.token_usage.input_tokens, 5);
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert_eq!(gate.seen.lock().unwrap().len(), 1);
+    }
 }
 
 #[tokio::test]

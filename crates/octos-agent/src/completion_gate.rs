@@ -3,7 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
-use octos_core::{TaskId, TokenUsage};
+use async_trait::async_trait;
+use octos_core::{TaskId, TaskResult, TokenUsage};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -191,6 +192,31 @@ pub enum CompletionDecision {
         reason: TerminalReason,
         receipt: CompletionReceipt,
     },
+}
+
+impl CompletionDecision {
+    pub fn receipt(&self) -> &CompletionReceipt {
+        match self {
+            Self::Pass(receipt)
+            | Self::Repairable { receipt, .. }
+            | Self::TerminalFailure { receipt, .. } => receipt,
+        }
+    }
+}
+
+#[async_trait]
+pub trait CompletionGate: Send + Sync {
+    async fn verify(
+        &self,
+        candidate: &CompletionCandidate,
+        core_contract_failure: Option<&str>,
+        repair_rounds_sent: u8,
+    ) -> CompletionDecision;
+}
+
+pub struct GatedTaskResult {
+    pub task_result: TaskResult,
+    pub decision: Option<CompletionDecision>,
 }
 
 #[derive(Clone, Debug)]

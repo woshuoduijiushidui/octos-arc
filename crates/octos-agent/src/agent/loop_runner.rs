@@ -22,6 +22,10 @@ use super::message_repair::sanitize_tool_call_id;
 use super::turn_state::{LoopRetryReason, LoopTurnState, attach_partial_usage};
 use super::verifier::{TurnLedger, ledger_entry_from_tool_result};
 use super::{Agent, AssistantSegmentProvenance, ConversationResponse, TASK_REPORTER, TokenTracker};
+use crate::completion_gate::{
+    CompletionCandidate, CompletionDecision, CompletionGate, CompletionReceipt, GatedTaskResult,
+    RepairTicket, TICKET_BYTES, TerminalReason,
+};
 use crate::harness_errors::HarnessError;
 use crate::harness_events::write_event_to_sink;
 use crate::hooks::{HookEvent, HookPayload, HookResult};
@@ -2535,7 +2539,7 @@ impl Agent {
     }
     /// Run a task to completion (used by spawn tool).
     pub async fn run_task(&self, task: &Task) -> Result<TaskResult> {
-        self.run_task_inner(task, None).await
+        Ok(self.run_task_inner(task, None, None).await?.task_result)
     }
 
     /// Like [`Agent::run_task`], but stores the turn-cumulative token counts
@@ -2550,14 +2554,27 @@ impl Agent {
         task: &Task,
         tracker: &TokenTracker,
     ) -> Result<TaskResult> {
-        self.run_task_inner(task, Some(tracker)).await
+        Ok(self
+            .run_task_inner(task, Some(tracker), None)
+            .await?
+            .task_result)
+    }
+
+    /// Run one task with an invocation-local completion gate.
+    pub async fn run_task_with_completion_gate(
+        &self,
+        task: &Task,
+        gate: &dyn CompletionGate,
+    ) -> Result<GatedTaskResult> {
+        self.run_task_inner(task, None, Some(gate)).await
     }
 
     async fn run_task_inner(
         &self,
         task: &Task,
         tracker: Option<&TokenTracker>,
-    ) -> Result<TaskResult> {
+        completion_gate: Option<&dyn CompletionGate>,
+    ) -> Result<GatedTaskResult> {
         let task_start = Instant::now();
         let span = info_span!(
             "task",
@@ -2599,11 +2616,14 @@ impl Agent {
             let mut loop_detector = LoopDetector::new(12);
             let mut turn_ledger = self.new_turn_ledger();
             let config = self.chat_config();
+            let mut candidate_revision = 0u64;
+            let mut repair_rounds_sent = 0u8;
+            let mut pending_repair: Option<(RepairTicket, CompletionReceipt)> = None;
 
             loop {
                 if let Some(stop) = turn.check_budget(self, activity.as_ref()) {
                     let stop_iteration = turn.iteration();
-                    if !self.try_budget_grace_call(
+                    if pending_repair.is_some() || !self.try_budget_grace_call(
                         &stop,
                         &mut retry_state,
                         stop_iteration,
@@ -2628,7 +2648,20 @@ impl Agent {
                             Some(m) => format!("{}\n{}", stop.message(), m),
                             None => stop.message(),
                         };
-                        return Ok(TaskResult {
+                        let decision = pending_repair.take().map(|(_, receipt)| {
+                            let reason = if matches!(stop, BudgetStop::Shutdown) {
+                                TerminalReason::Cancelled
+                            } else {
+                                TerminalReason::TaskBudgetExhausted
+                            };
+                            self.reporter().report(ProgressEvent::TaskCompleted {
+                                success: false,
+                                iterations: stop_iteration,
+                                duration: task_start.elapsed(),
+                            });
+                            CompletionDecision::TerminalFailure { reason, receipt }
+                        });
+                        return Ok(GatedTaskResult { task_result: TaskResult {
                             schema_version: octos_core::TASK_RESULT_SCHEMA_VERSION,
                             success: false,
                             output,
@@ -2636,9 +2669,19 @@ impl Agent {
                             files_to_send,
                             subtasks: Vec::new(),
                             token_usage: turn.total_usage().clone(),
-                        });
+                        }, decision });
                     }
                 }
+
+                let ticket_text = pending_repair.take().map(|(ticket, _)| {
+                    let text = ticket.render(TICKET_BYTES);
+                    let marker = format!(
+                        "ticket={}",
+                        ticket.ticket_id.get(..16).unwrap_or(&ticket.ticket_id)
+                    );
+                    messages.push(Message::user(text.clone()));
+                    (marker, text)
+                });
 
                 let iteration = turn.advance_iteration();
                 let iter_start = Instant::now();
@@ -2672,6 +2715,19 @@ impl Agent {
                     },
                     iteration,
                 );
+                if let Some((marker, ticket_text)) = ticket_text {
+                    if !messages.iter().any(|message| {
+                        message.role == MessageRole::User && message.content == ticket_text
+                    }) {
+                        messages.retain(|message| {
+                            !(message.role == MessageRole::User
+                                && message.content.starts_with("H06 repair ticket v1")
+                                && message.content.contains(&marker))
+                        });
+                        messages.push(Message::user(ticket_text));
+                    }
+                    repair_rounds_sent = repair_rounds_sent.saturating_add(1);
+                }
                 let total_usage = turn.total_usage().clone();
 
                 // M8.5 tier 2: decorate the config with the Anthropic header.
@@ -2762,52 +2818,8 @@ impl Agent {
                         {
                             continue;
                         }
-                        if self.config.save_episodes {
-                            let summary = final_response.content.clone().unwrap_or_default();
-                            let summary_truncated =
-                                octos_core::truncated_utf8(&summary, 500, "...");
-
-                            let mut episode = Episode::new(
-                                task.id.clone(),
-                                self.id.clone(),
-                                task.context.working_dir.clone(),
-                                summary_truncated.clone(),
-                                EpisodeOutcome::Success,
-                            );
-                            episode.files_modified = files_modified.clone();
-                            let ep_id = episode.id.clone();
-
-                            if let Err(e) = self.memory.store(episode).await {
-                                warn!(error = %e, "failed to save episode to memory");
-                            }
-
-                            // Fire-and-forget: embed summary and store embedding
-                            if let Some(ref embedder) = self.embedder {
-                                let embedder = embedder.clone();
-                                let memory = self.memory.clone();
-                                let summary_text = summary_truncated;
-                                let episode_id = ep_id;
-                                tokio::spawn(async move {
-                                    match embedder.embed(&[&summary_text]).await {
-                                        Ok(vecs) => {
-                                            if let Some(vec) = vecs.into_iter().next() {
-                                                if let Err(e) =
-                                                    memory.store_embedding(&episode_id, vec).await
-                                                {
-                                                    warn!(error = %e, "failed to store embedding");
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            warn!(
-                                                error = %e,
-                                                episode_id = %episode_id,
-                                                "failed to generate embedding for episode"
-                                            );
-                                        }
-                                    }
-                                });
-                            }
+                        if self.config.save_episodes && completion_gate.is_none() {
+                            self.save_task_episode(task, &final_response, &files_modified).await;
                         }
 
                         self.emit_cost_update(&turn, &final_response, attributed_cost);
@@ -2853,8 +2865,54 @@ impl Agent {
                         let contract_failures =
                             inspect_workspace_contract_failures(&task.context.working_dir);
 
+                        let mut gate_decision = None;
+                        if let Some(gate) = completion_gate {
+                            candidate_revision += 1;
+                            let candidate = CompletionCandidate {
+                                task_id: task.id.clone(),
+                                working_dir: task.context.working_dir.clone(),
+                                proposed_output: proposed,
+                                files_modified: files_modified.clone(),
+                                files_to_send: files_to_send.clone(),
+                                iteration,
+                                cumulative_usage: turn.total_usage().clone(),
+                                revision: candidate_revision,
+                            };
+                            let mut decision = gate
+                                .verify(&candidate, contract_failures.as_deref(), repair_rounds_sent)
+                                .await;
+                            let stale = decision.receipt().task_id != candidate.task_id
+                                || decision.receipt().candidate_revision != candidate.revision
+                                || matches!(&decision, CompletionDecision::Repairable { ticket, .. } if !ticket.applies_to(&candidate));
+                            if stale {
+                                let receipt = match decision {
+                                    CompletionDecision::Pass(receipt)
+                                    | CompletionDecision::Repairable { receipt, .. }
+                                    | CompletionDecision::TerminalFailure { receipt, .. } => receipt,
+                                };
+                                decision = CompletionDecision::TerminalFailure {
+                                    reason: TerminalReason::StaleCandidate,
+                                    receipt,
+                                };
+                            }
+                            match decision {
+                                CompletionDecision::Repairable { ticket, receipt } => {
+                                    messages.push(self.response_to_message(&final_response));
+                                    pending_repair = Some((ticket, receipt));
+                                    max_token_fragments.clear();
+                                    max_token_continuations = 0;
+                                    continue;
+                                }
+                                other => gate_decision = Some(other),
+                            }
+                        }
+                        let gate_failed = matches!(gate_decision, Some(CompletionDecision::TerminalFailure { .. }));
+                        if self.config.save_episodes && completion_gate.is_some() && !gate_failed && contract_failures.is_none() {
+                            self.save_task_episode(task, &final_response, &files_modified).await;
+                        }
+
                         self.reporter().report(ProgressEvent::TaskCompleted {
-                            success: contract_failures.is_none(),
+                            success: contract_failures.is_none() && !gate_failed,
                             iterations: iteration,
                             duration: task_start.elapsed(),
                         });
@@ -2886,7 +2944,14 @@ impl Agent {
                                 result.output = format!("{}\n\n{}", result.output, failure_msg);
                             }
                         }
-                        return Ok(result);
+                        if let Some(CompletionDecision::TerminalFailure { reason, .. }) = &gate_decision {
+                            result.success = false;
+                            if !result.output.is_empty() {
+                                result.output.push_str("\n\n");
+                            }
+                            result.output.push_str(&format!("completion_gate_failed: {reason:?}"));
+                        }
+                        return Ok(GatedTaskResult { task_result: result, decision: gate_decision });
                     }
                     StopReason::ToolUse => {
                         // Task loop never emits the synth-ack so the per-call
@@ -2974,12 +3039,12 @@ impl Agent {
                             iterations: iteration,
                             duration: task_start.elapsed(),
                         });
-                        return Ok(self.build_result(
+                        return Ok(GatedTaskResult { task_result: self.build_result(
                             &final_response,
                             turn.total_usage().clone(),
                             files_modified,
                             files_to_send,
-                        ));
+                        ), decision: None });
                     }
                     StopReason::ContentFiltered => {
                         warn!("content filtered by provider safety/moderation in task");
@@ -2999,13 +3064,53 @@ impl Agent {
                             result.output =
                                 "[Content was blocked by the model's safety filter.]".to_string();
                         }
-                        return Ok(result);
+                        return Ok(GatedTaskResult { task_result: result, decision: None });
                     }
                 }
             }
             })
             .instrument(span)
             .await
+    }
+
+    async fn save_task_episode(
+        &self,
+        task: &Task,
+        response: &ChatResponse,
+        files_modified: &[PathBuf],
+    ) {
+        let summary = response.content.clone().unwrap_or_default();
+        let summary_truncated = octos_core::truncated_utf8(&summary, 500, "...");
+        let mut episode = Episode::new(
+            task.id.clone(),
+            self.id.clone(),
+            task.context.working_dir.clone(),
+            summary_truncated.clone(),
+            EpisodeOutcome::Success,
+        );
+        episode.files_modified = files_modified.to_vec();
+        let ep_id = episode.id.clone();
+        if let Err(e) = self.memory.store(episode).await {
+            warn!(error = %e, "failed to save episode to memory");
+        }
+        if let Some(ref embedder) = self.embedder {
+            let embedder = embedder.clone();
+            let memory = self.memory.clone();
+            tokio::spawn(async move {
+                match embedder.embed(&[&summary_truncated]).await {
+                    Ok(vecs) => {
+                        if let Some(vec) = vecs.into_iter().next() {
+                            if let Err(e) = memory.store_embedding(&ep_id, vec).await {
+                                warn!(error = %e, "failed to store embedding");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, episode_id = %ep_id, "failed to generate embedding for episode");
+                    }
+                }
+            });
+        }
     }
 
     fn build_result(
