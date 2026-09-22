@@ -29,6 +29,8 @@ use crate::agent::progress_observation::{
 pub const NO_PROGRESS_HINT: &str = "\n\n[NO PROGRESS] You have now called this tool 3 times in a row with identical arguments AND received identical results. Calling it again will produce the same result. To make progress, either switch to a different tool (read_file / list_dir / view_image for file content) or finish the turn with the information you already have.";
 pub const H07_EXACT_HINT: &str = "\n\n[NO PROGRESS] This tool returned the same result twice for identical arguments. Choose a different diagnostic action or finish with the evidence already available.";
 
+pub const VERIFIED_WAIT_HINT: &str = "\n\n[VERIFIED WAIT] The same live task handle returned unchanged output three times. Do not busy-wait or restart the task from this observation alone. Do independent work or use a bounded wait before reading this handle again.";
+
 const PEER_POLLING_HINT: &str = "\n\n[PEER POLLING] Three consecutive reads returned the same peer snapshot. Peer work is asynchronous: this does not prove failure or that a later read cannot change. Do not busy-wait. Reflect on the reported peer state, do independent work or use an available bounded wait, and gather fresh evidence before claiming completion.";
 
 fn is_peer_polling_tool(tool_name: &str) -> bool {
@@ -95,6 +97,10 @@ pub struct LoopDetector {
     /// An unchanged asynchronous peer snapshot requests reflection, not a
     /// fabricated final or an abort before its next read can observe progress.
     pending_peer_polling: Option<String>,
+    /// Repeated unchanged reads of a runtime-confirmed live task ask for one
+    /// bounded reflection while preserving the running task.
+    verified_wait_signatures: Vec<u64>,
+    pending_verified_wait: Option<String>,
 }
 
 impl LoopDetector {
@@ -119,6 +125,8 @@ impl LoopDetector {
                 .unwrap_or(5),
             pending_file_churn: None,
             pending_peer_polling: None,
+            verified_wait_signatures: Vec::with_capacity(window * 2),
+            pending_verified_wait: None,
         }
     }
 
@@ -152,6 +160,7 @@ impl LoopDetector {
             ProgressClass::StateChanged => "state_changed",
             ProgressClass::NoProgress => "no_progress",
             ProgressClass::EvidenceChanged => "evidence_changed",
+            ProgressClass::VerifiedWait => "verified_wait",
             ProgressClass::Unknown => "unknown",
         };
         let confidence = match observation.confidence {
@@ -299,6 +308,42 @@ impl LoopDetector {
 
     pub fn take_peer_polling_signal(&mut self) -> Option<String> {
         self.pending_peer_polling.take()
+    }
+
+    /// Record an observed read of a runtime-confirmed live task. Exact-call
+    /// termination never owns this lane: unchanged output requests a bounded
+    /// reflection, while changed output naturally breaks the streak.
+    pub(crate) fn after_verified_wait(
+        &mut self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        result: &str,
+        wait_key: &str,
+    ) -> Option<String> {
+        self.exact_result_streak = 0;
+        self.exact_last_call = None;
+        self.exact_last_result = None;
+        let signature =
+            Self::signature_with_result(tool_name, args, &format!("{wait_key}:{result}"));
+        self.verified_wait_signatures.push(signature);
+        if self.verified_wait_signatures.len() > self.window * 2 {
+            let drain_to = self.verified_wait_signatures.len() - self.window;
+            self.verified_wait_signatures.drain(..drain_to);
+        }
+        let len = self.verified_wait_signatures.len();
+        if len >= 3 {
+            let last = &self.verified_wait_signatures[len - 3..];
+            if last[0] == last[1] && last[1] == last[2] {
+                self.verified_wait_signatures.clear();
+                self.pending_verified_wait = Some(tool_name.to_owned());
+                return Some(VERIFIED_WAIT_HINT.to_owned());
+            }
+        }
+        None
+    }
+
+    pub(crate) fn take_verified_wait_signal(&mut self) -> Option<String> {
+        self.pending_verified_wait.take()
     }
 
     /// #1765: record a tool call for the doom-loop guard and return the
@@ -565,6 +610,53 @@ mod tests {
             );
             detector.after_result("check_background_tasks", &args, "still running", None, true);
         }
+    }
+
+    #[test]
+    fn h07_m5_verified_wait_reflects_without_establishing_exact_termination() {
+        let mut detector = LoopDetector::new(12).with_no_progress(true);
+        let args = json!({"task_handle": "task-1"});
+        for index in 1..=3 {
+            assert_eq!(detector.before_call("read_task_output", &args, true), None);
+            let hint = detector.after_verified_wait(
+                "read_task_output",
+                &args,
+                "still running",
+                "task-1:running",
+            );
+            if index < 3 {
+                assert!(hint.is_none());
+            } else {
+                assert_eq!(hint.as_deref(), Some(VERIFIED_WAIT_HINT));
+            }
+        }
+        assert_eq!(
+            detector.take_verified_wait_signal().as_deref(),
+            Some("read_task_output")
+        );
+        assert_eq!(detector.before_call("read_task_output", &args, true), None);
+    }
+
+    #[test]
+    fn h07_m5_changed_wait_output_breaks_the_unchanged_streak() {
+        let mut detector = LoopDetector::new(12).with_no_progress(true);
+        let args = json!({"task_handle": "task-1"});
+        assert!(
+            detector
+                .after_verified_wait("read_task_output", &args, "page one", "live",)
+                .is_none()
+        );
+        assert!(
+            detector
+                .after_verified_wait("read_task_output", &args, "page two", "live",)
+                .is_none()
+        );
+        assert!(
+            detector
+                .after_verified_wait("read_task_output", &args, "page two", "live",)
+                .is_none()
+        );
+        assert!(detector.take_verified_wait_signal().is_none());
     }
 
     #[test]

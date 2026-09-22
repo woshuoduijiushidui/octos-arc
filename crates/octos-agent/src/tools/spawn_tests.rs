@@ -2038,6 +2038,7 @@ fn classify_child_session_failure_as_retryable_when_budget_exhausted() {
     let result = Ok::<octos_core::TaskResult, eyre::Report>(octos_core::TaskResult {
         schema_version: octos_core::TASK_RESULT_SCHEMA_VERSION,
         success: false,
+        failure: None,
         output: "Token budget exceeded (120 of 100).".to_string(),
         files_modified: vec![],
         files_to_send: vec![],
@@ -2049,6 +2050,50 @@ fn classify_child_session_failure_as_retryable_when_budget_exhausted() {
         classify_child_session_lifecycle_kind(&result),
         ChildSessionLifecycleKind::RetryableFailed
     );
+}
+
+#[test]
+fn h07_m5_typed_terminal_child_ignores_retry_words_in_output() {
+    let result = Ok::<octos_core::TaskResult, eyre::Report>(octos_core::TaskResult {
+        schema_version: octos_core::TASK_RESULT_SCHEMA_VERSION,
+        success: false,
+        failure: Some(octos_core::TaskFailure {
+            code: "h07_terminal_non_retryable".to_string(),
+            retryable: false,
+        }),
+        output: "Do not retry this unchanged operation.".to_string(),
+        files_modified: vec![],
+        files_to_send: vec![],
+        subtasks: vec![],
+        token_usage: Default::default(),
+    });
+
+    assert_eq!(
+        classify_child_session_lifecycle_kind(&result),
+        ChildSessionLifecycleKind::TerminalFailed
+    );
+    assert!(!task_result_needs_recovery(&result));
+}
+
+#[test]
+fn h07_m5_untyped_and_typed_retryable_failures_still_enter_recovery() {
+    let failure = |typed: bool| {
+        Ok::<octos_core::TaskResult, eyre::Report>(octos_core::TaskResult {
+            schema_version: octos_core::TASK_RESULT_SCHEMA_VERSION,
+            success: false,
+            failure: typed.then(|| octos_core::TaskFailure {
+                code: "provider_unavailable".to_string(),
+                retryable: true,
+            }),
+            output: "temporary failure".to_string(),
+            files_modified: vec![],
+            files_to_send: vec![],
+            subtasks: vec![],
+            token_usage: Default::default(),
+        })
+    };
+    assert!(task_result_needs_recovery(&failure(false)));
+    assert!(task_result_needs_recovery(&failure(true)));
 }
 
 #[test]

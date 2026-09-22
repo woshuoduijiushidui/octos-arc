@@ -684,6 +684,22 @@ fn classify_child_session_lifecycle_kind(
 ) -> ChildSessionLifecycleKind {
     match result {
         Ok(task_result) if task_result.success => ChildSessionLifecycleKind::Completed,
+        Ok(task_result)
+            if task_result
+                .failure
+                .as_ref()
+                .is_some_and(|failure| !failure.retryable) =>
+        {
+            ChildSessionLifecycleKind::TerminalFailed
+        }
+        Ok(task_result)
+            if task_result
+                .failure
+                .as_ref()
+                .is_some_and(|failure| failure.retryable) =>
+        {
+            ChildSessionLifecycleKind::RetryableFailed
+        }
         Ok(task_result) if is_retryable_child_failure(&task_result.output) => {
             ChildSessionLifecycleKind::RetryableFailed
         }
@@ -2302,10 +2318,7 @@ async fn run_task_with_m8_9_recovery(
     task_desc: &str,
 ) -> Result<TaskResult> {
     let initial = worker.run_task(subtask).await;
-    let needs_recovery = match &initial {
-        Err(_) => true,
-        Ok(task_result) => !task_result.success,
-    };
+    let needs_recovery = task_result_needs_recovery(&initial);
     if !needs_recovery {
         return initial;
     }
@@ -2339,6 +2352,17 @@ async fn run_task_with_m8_9_recovery(
         "M8.9 spawn-task recovery: re-engaging worker after initial failure"
     );
     worker.run_task(&recovery_task).await
+}
+
+fn task_result_needs_recovery(result: &Result<TaskResult>) -> bool {
+    match result {
+        Err(_) => true,
+        Ok(task_result) if task_result.success => false,
+        Ok(task_result) => task_result
+            .failure
+            .as_ref()
+            .is_none_or(|failure| failure.retryable),
+    }
 }
 
 /// Build the synthetic `[system-internal]` instruction the spawn-task

@@ -5,7 +5,74 @@ use std::collections::VecDeque;
 
 use crate::harness_errors::HarnessError;
 use crate::output_recovery::{ExecutionStatus, OutputSource, OutputView};
-use crate::tools::ToolResult;
+use crate::tools::{ToolRegistry, ToolResult};
+
+pub(crate) const H07_TERMINAL_CODE: &str = "h07_terminal_non_retryable";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct H07Terminal {
+    pub message: String,
+}
+
+impl H07Terminal {
+    fn from_observation(observation: &ProgressObservation) -> Self {
+        let family = match observation.family {
+            OperationFamily::Read => "read",
+            OperationFamily::Search => "search",
+            OperationFamily::Mutate => "mutation",
+            OperationFamily::Validate => "validation",
+            OperationFamily::Execute => "execution",
+            OperationFamily::Wait => "wait",
+            OperationFamily::Other => "tool operation",
+        };
+        Self {
+            message: bounded(
+                &format!(
+                    "Stopped after repeated {family} at {} returned unchanged evidence after a strategy change.",
+                    observation.target_label
+                ),
+                MAX_HINT_BYTES,
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct VerifiedWaitFact {
+    task_handle: String,
+    status: String,
+}
+
+/// Extract a wait fact only from declared async surfaces and only while the
+/// runtime supervisor confirms that the referenced handle is live.
+pub(super) fn verified_wait_fact(
+    tools: &ToolRegistry,
+    call: &ToolCall,
+    visible: Option<&str>,
+) -> Option<VerifiedWaitFact> {
+    let task_handle = if call.name == "read_task_output" {
+        call.arguments
+            .get("task_handle")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    } else if tools.is_spawn_only(&call.name) {
+        visible
+            .and_then(|body| serde_json::from_str::<Value>(body).ok())
+            .and_then(|value| {
+                value
+                    .get("task_handle")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+    } else {
+        None
+    }?;
+    let task = tools.supervisor().get_task(&task_handle)?;
+    task.status.is_active().then(|| VerifiedWaitFact {
+        task_handle,
+        status: task.status.as_str().to_owned(),
+    })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OperationFamily {
@@ -354,6 +421,32 @@ impl ObservationFacts {
 }
 
 impl ProgressObservation {
+    pub(super) fn verified_wait(call: &ToolCall, fact: &VerifiedWaitFact, visible: &str) -> Self {
+        let wait_key = digest(
+            &serde_json::to_vec(&(fact.task_handle.as_str(), fact.status.as_str()))
+                .unwrap_or_default(),
+        );
+        Self {
+            call_id: call.id.clone(),
+            family: OperationFamily::Wait,
+            target_key: digest(fact.task_handle.as_bytes()),
+            target_label: bounded(&call.name, 96),
+            status: ObservationStatus::Success,
+            outcome: None,
+            state_digest: None,
+            evidence_key: digest(
+                &serde_json::to_vec(&(wait_key.as_str(), digest(visible.as_bytes())))
+                    .unwrap_or_default(),
+            ),
+            validation_key: None,
+            wait_key: Some(wait_key),
+            error_kind: None,
+            confidence: ObservationConfidence::TrustedAdapter,
+            diagnostic: None,
+            semantic_eligible: true,
+        }
+    }
+
     pub fn downgrade_ambiguous_read(&mut self, visible: &str) {
         if self.family == OperationFamily::Read {
             self.state_digest = None;
@@ -458,6 +551,7 @@ pub(crate) enum ProgressClass {
     StateChanged,
     NoProgress,
     EvidenceChanged,
+    VerifiedWait,
     Unknown,
 }
 
@@ -543,6 +637,42 @@ impl EpisodeTracker {
                 hint: None,
             };
         }
+        if observation.family == OperationFamily::Wait && observation.wait_key.is_some() {
+            if let Some(index) = self.episodes.iter().position(|episode| episode.key == key) {
+                let episode = self.episodes.remove(index).expect("existing wait episode");
+                self.episodes.push_back(episode);
+                return EpisodeOutcome {
+                    class: ProgressClass::VerifiedWait,
+                    decision: ProgressDecision::Continue,
+                    hint: None,
+                };
+            }
+            let known_scope = self
+                .episodes
+                .iter()
+                .any(|episode| episode.key.target_key == key.target_key);
+            if self.episodes.len() == MAX_EPISODES {
+                self.episodes.pop_front();
+            }
+            self.episodes.push_back(Episode {
+                key: key.clone(),
+                samples: VecDeque::from([key.evidence_key]),
+                observations: 1,
+                hinted: false,
+                switch_required: false,
+                post_switch_probe: false,
+                terminal: false,
+            });
+            return EpisodeOutcome {
+                class: if known_scope {
+                    ProgressClass::EvidenceChanged
+                } else {
+                    ProgressClass::VerifiedWait
+                },
+                decision: ProgressDecision::Continue,
+                hint: None,
+            };
+        }
         if let Some(index) = self.episodes.iter().position(|episode| episode.key == key) {
             let mut episode = self.episodes.remove(index).expect("existing episode");
             episode.observations = episode.observations.saturating_add(1);
@@ -618,6 +748,14 @@ impl EpisodeTracker {
         }
     }
 
+    pub(crate) fn terminal_for(
+        observation: &ProgressObservation,
+        outcome: &EpisodeOutcome,
+    ) -> Option<H07Terminal> {
+        (outcome.decision == ProgressDecision::TerminalNonRetryable)
+            .then(|| H07Terminal::from_observation(observation))
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.episodes.len()
@@ -629,6 +767,76 @@ mod tests {
     use super::*;
     use crate::output_recovery::{OutputRange, OutputStream};
     use serde_json::json;
+
+    #[test]
+    fn h07_m5_verified_wait_requires_a_live_runtime_handle() {
+        let mut tools = ToolRegistry::new();
+        tools.mark_spawn_only("async_tool", None);
+        let supervisor = tools.supervisor();
+        let live = supervisor.register("async_tool", "call-live", Some("session"));
+        supervisor.mark_running(&live);
+        let call = call("async_tool", json!({}));
+        let body = json!({"task_handle": live.clone()}).to_string();
+        let fact = verified_wait_fact(&tools, &call, Some(&body)).expect("live handle");
+        let observation = ProgressObservation::verified_wait(&call, &fact, &body);
+        let mut tracker = EpisodeTracker::default();
+        assert_eq!(
+            tracker.observe(&observation).class,
+            ProgressClass::VerifiedWait
+        );
+        assert_eq!(
+            tracker.observe(&observation).class,
+            ProgressClass::VerifiedWait
+        );
+
+        supervisor.mark_completed(&live, vec![]);
+        assert!(verified_wait_fact(&tools, &call, Some(&body)).is_none());
+        let failed = supervisor.register("async_tool", "call-failed", Some("session"));
+        supervisor.mark_failed(&failed, "failed".to_string());
+        let failed_body = json!({"task_handle": failed}).to_string();
+        assert!(verified_wait_fact(&tools, &call, Some(&failed_body)).is_none());
+        let parked = supervisor.register("async_tool", "call-parked", Some("session"));
+        supervisor.mark_parked(&parked, "reattach".to_string());
+        let parked_body = json!({"task_handle": parked}).to_string();
+        assert!(verified_wait_fact(&tools, &call, Some(&parked_body)).is_none());
+        let missing = json!({"task_handle": "missing"}).to_string();
+        assert!(verified_wait_fact(&tools, &call, Some(&missing)).is_none());
+    }
+
+    #[test]
+    fn h07_m5_live_read_output_changes_evidence_without_stalling_wait() {
+        let tools = ToolRegistry::new();
+        let supervisor = tools.supervisor();
+        let live = supervisor.register("async_tool", "call-live", Some("session"));
+        supervisor.mark_running(&live);
+        let read = call("read_task_output", json!({"task_handle": live}));
+        let fact = verified_wait_fact(&tools, &read, None).expect("live handle");
+        let first = ProgressObservation::verified_wait(&read, &fact, "page one");
+        let changed = ProgressObservation::verified_wait(&read, &fact, "page two");
+        let mut tracker = EpisodeTracker::default();
+        assert_eq!(tracker.observe(&first).class, ProgressClass::VerifiedWait);
+        assert_eq!(tracker.observe(&first).class, ProgressClass::VerifiedWait);
+        assert_eq!(
+            tracker.observe(&changed).class,
+            ProgressClass::EvidenceChanged
+        );
+        assert_eq!(tracker.observe(&changed).class, ProgressClass::VerifiedWait);
+    }
+
+    #[test]
+    fn h07_m5_terminal_message_is_bounded_and_uses_observed_scope() {
+        let call = call("diff_edit", json!({"path": "src/main.rs"}));
+        let observation = h07_m4_mutation(&call, "modified", true, "confirmed", 'a', 'a');
+        let outcome = EpisodeOutcome {
+            class: ProgressClass::NoProgress,
+            decision: ProgressDecision::TerminalNonRetryable,
+            hint: None,
+        };
+        let terminal = EpisodeTracker::terminal_for(&observation, &outcome).unwrap();
+        assert!(terminal.message.contains("mutation"));
+        assert!(terminal.message.contains("main.rs"));
+        assert!(terminal.message.len() <= MAX_HINT_BYTES);
+    }
 
     fn h07_m4_mutation(
         call: &ToolCall,

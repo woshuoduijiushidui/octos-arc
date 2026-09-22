@@ -42,8 +42,8 @@ pub use session_scope::{
 };
 pub use task::{
     DecisionRecord, FileRecord, SESSION_SUMMARY_SCHEMA_VERSION, STALE_DECISION_PREFIX,
-    SessionSummary, TASK_RESULT_SCHEMA_VERSION, Task, TaskContext, TaskKind, TaskResult,
-    TaskStatus, TokenUsage, UnsupportedSessionSummaryVersion,
+    SessionSummary, TASK_RESULT_SCHEMA_VERSION, Task, TaskContext, TaskFailure, TaskKind,
+    TaskResult, TaskStatus, TokenUsage, UnsupportedSessionSummaryVersion,
 };
 pub use types::{
     AgentId, ClientMessageId, EpisodeRef, IdentityError, IdentityKind, MAIN_PROFILE_ID, Message,

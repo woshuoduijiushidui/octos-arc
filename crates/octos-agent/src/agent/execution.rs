@@ -63,7 +63,9 @@ use octos_llm::ChatResponse;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use super::progress_observation::{ObservationFacts, ObservationStatus, ProgressObservation};
+use super::progress_observation::{
+    ObservationFacts, ObservationStatus, ProgressObservation, verified_wait_fact,
+};
 use super::{Agent, MAX_TOOL_TIMEOUT_SECS};
 use crate::harness_errors::HarnessError;
 use crate::harness_events::{lookup_event_sink_context, write_event_to_sink};
@@ -2796,7 +2798,11 @@ impl Agent {
                     &message.content,
                 )
             });
-            if duplicate_ids.contains(call.id.as_str()) {
+            if !duplicate_ids.contains(call.id.as_str()) {
+                if let Some(fact) = verified_wait_fact(&self.tools, call, Some(&message.content)) {
+                    observation = ProgressObservation::verified_wait(call, &fact, &message.content);
+                }
+            } else {
                 observation.downgrade_ambiguous_read(&message.content);
             }
             observations.push(observation);

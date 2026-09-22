@@ -989,6 +989,84 @@ async fn run_peer_polling_regression(
 }
 
 #[tokio::test]
+async fn h07_m5_live_handle_uses_bounded_wait_reflection_without_restarting_task() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let executions = Arc::new(AtomicUsize::new(0));
+    let mut tools = ToolRegistry::new();
+    tools.register(StaticResultTool {
+        name: "read_task_output",
+        output: "still running",
+        success: true,
+        calls: executions.clone(),
+    });
+    let supervisor = tools.supervisor();
+    let handle = supervisor.register("async_tool", "call-live", Some("session"));
+    supervisor.mark_running(&handle);
+    let mut responses = (0..3)
+        .map(|index| {
+            tool_use(
+                vec![ToolCall {
+                    id: format!("wait_{index}"),
+                    name: "read_task_output".into(),
+                    arguments: serde_json::json!({"task_handle": handle.clone()}),
+                    metadata: None,
+                }],
+                1,
+                1,
+            )
+        })
+        .collect::<Vec<_>>();
+    responses.push(end_turn("PRIVATE-WAIT-REFLECTION", 1, 1));
+    responses.push(end_turn(
+        "live task still owned by its original runner",
+        1,
+        1,
+    ));
+    let provider = Arc::new(ConfigRecordingProvider::new(responses, requests.clone()));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("h07-m5-verified-wait"),
+        provider,
+        tools,
+        memory,
+    )
+    .with_config(AgentConfig {
+        no_progress: true,
+        save_episodes: false,
+        max_iterations: 10,
+        ..Default::default()
+    })
+    .with_convergence_intervals(100, 100_000_000, std::time::Duration::from_secs(86_400));
+
+    let result = agent
+        .process_message("monitor it", &[], vec![])
+        .await
+        .unwrap();
+    assert_eq!(
+        result.content,
+        "live task still owned by its original runner"
+    );
+    assert_eq!(executions.load(AtomicOrdering::SeqCst), 3);
+    assert_eq!(
+        supervisor.get_task(&handle).unwrap().status.as_str(),
+        "running"
+    );
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 5);
+    let reflections: Vec<_> = requests
+        .iter()
+        .filter(|(_, _, config)| matches!(config.tool_choice, ToolChoice::None))
+        .collect();
+    assert_eq!(reflections.len(), 1);
+    let prompt = &reflections[0].0.last().unwrap().content;
+    assert!(prompt.contains("live task"));
+    assert!(prompt.contains("runtime-confirmed"));
+    assert!(!prompt.contains("peer polling"));
+    assert!(prompt.contains("busy-wait"));
+}
+
+#[tokio::test]
 async fn peer_polling_should_allow_changed_result_on_third_identical_request() {
     for tool in ["peer_gather", "peer_list"] {
         run_peer_polling_regression(
@@ -5669,6 +5747,13 @@ async fn h07_m3_conversation_semantic_hints_without_extra_model_requests() {
             .iter()
             .any(|m| m.content.contains("[NO PROGRESS] The same Mutate failure"))
     );
+    assert_eq!(
+        prompts[2]
+            .iter()
+            .map(|m| m.content.matches("[NO PROGRESS]").count())
+            .sum::<usize>(),
+        1
+    );
     assert!(
         prompts[3]
             .iter()
@@ -5712,6 +5797,95 @@ async fn h07_m3_task_uses_the_same_semantic_episode() {
             .iter()
             .any(|m| m.content.contains("[SWITCH REQUIRED]"))
     );
+}
+
+fn h07_m5_terminal_attempts() -> Vec<ChatResponse> {
+    (0..4)
+        .map(|n| {
+            tool_use(
+                vec![ToolCall {
+                    id: format!("terminal_attempt_{n}"),
+                    name: "diff_edit".into(),
+                    arguments: serde_json::json!({
+                        "path": "a.rs",
+                        "diff": format!("@@ -4 +4 @@\n-{n}\n+{n}")
+                    }),
+                    metadata: None,
+                }],
+                1,
+                1,
+            )
+        })
+        .chain(std::iter::once(end_turn("must not be requested", 1, 1)))
+        .collect()
+}
+
+#[tokio::test]
+async fn h07_m5_conversation_terminal_ends_turn_without_another_model_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(ScriptedProvider::new(h07_m5_terminal_attempts()));
+    let mut tools = ToolRegistry::new();
+    tools.register(H07M3NoMatchTool {
+        calls: calls.clone(),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("h07-m5-conversation-terminal"),
+        provider.clone(),
+        tools,
+        memory,
+    )
+    .with_config(AgentConfig {
+        no_progress: true,
+        max_iterations: 10,
+        save_episodes: false,
+        ..Default::default()
+    });
+
+    let result = agent
+        .process_message("diagnose", &[], vec![])
+        .await
+        .unwrap();
+    assert!(result.content.contains("Stopped after repeated mutation"));
+    assert!(result.content.contains("a.rs"));
+    assert_eq!(calls.load(AtomicOrdering::SeqCst), 4);
+    assert_eq!(provider.prompts.lock().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn h07_m5_task_terminal_has_machine_readable_non_retryable_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(ScriptedProvider::new(h07_m5_terminal_attempts()));
+    let mut tools = ToolRegistry::new();
+    tools.register(H07M3NoMatchTool {
+        calls: calls.clone(),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("h07-m5-task-terminal"),
+        provider.clone(),
+        tools,
+        memory,
+    )
+    .with_config(AgentConfig {
+        no_progress: true,
+        max_iterations: 10,
+        save_episodes: false,
+        ..Default::default()
+    });
+
+    let result = agent
+        .run_task(&task_for("diagnose", dir.path()))
+        .await
+        .unwrap();
+    assert!(!result.success);
+    let failure = result.failure.expect("typed H07 failure");
+    assert_eq!(failure.code, H07_TERMINAL_CODE);
+    assert!(!failure.retryable);
+    assert_eq!(calls.load(AtomicOrdering::SeqCst), 4);
+    assert_eq!(provider.prompts.lock().unwrap().len(), 4);
 }
 
 #[derive(Clone, Copy)]

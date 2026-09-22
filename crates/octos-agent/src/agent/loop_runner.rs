@@ -6,7 +6,7 @@ use std::time::Instant;
 use std::{collections::HashMap, collections::HashSet, collections::VecDeque};
 
 use eyre::Result;
-use octos_core::{Message, MessageRole, Task, TaskResult, TokenUsage};
+use octos_core::{Message, MessageRole, Task, TaskFailure, TaskResult, TokenUsage};
 use octos_llm::{ChatConfig, ChatResponse, StopReason};
 use octos_memory::{Episode, EpisodeOutcome};
 use tracing::{Instrument, info, info_span, warn};
@@ -20,8 +20,9 @@ use super::loop_compaction::{prepare_conversation_messages, prepare_task_message
 use super::loop_state::{LoopDecision, LoopRetryState, SHELL_SPIRAL_VARIANT};
 use super::message_repair::sanitize_tool_call_id;
 use super::progress_observation::{
-    MutationOutcome, ObservationConfidence, ObservationDiagnostic, ObservationStatus,
-    OperationFamily, ProgressClass, ProgressObservation,
+    EpisodeTracker, H07_TERMINAL_CODE, H07Terminal, MutationOutcome, ObservationConfidence,
+    ObservationDiagnostic, ObservationStatus, OperationFamily, ProgressClass, ProgressObservation,
+    verified_wait_fact,
 };
 use super::turn_state::{LoopRetryReason, LoopTurnState, attach_partial_usage};
 use super::verifier::{TurnLedger, ledger_entry_from_tool_result};
@@ -57,6 +58,20 @@ const SHELL_RETRY_RECOVERY_THRESHOLD: usize = 4;
 struct TurnOutputLog {
     messages: Vec<Message>,
     provenance: AssistantSegmentProvenance,
+}
+
+struct HandledToolUse {
+    response: ChatResponse,
+    terminal: Option<H07Terminal>,
+}
+
+impl From<ChatResponse> for HandledToolUse {
+    fn from(response: ChatResponse) -> Self {
+        Self {
+            response,
+            terminal: None,
+        }
+    }
 }
 
 impl TurnOutputLog {
@@ -1817,6 +1832,15 @@ impl Agent {
                                         pending_approval: None,
                                     });
                                 }
+                                if loop_detector.no_progress_enabled()
+                                    && verified_wait_fact(&self.tools, tc, None).is_some()
+                                {
+                                    // A runtime-confirmed live handle is
+                                    // result-aware. Its read must execute so
+                                    // one observation timeout cannot restart
+                                    // or terminate the underlying task.
+                                    continue;
+                                }
                                 // The legacy guard rejects the third identical
                                 // call. With H07 enabled, the same pre-call
                                 // slot requires two identical actual results.
@@ -2069,7 +2093,7 @@ impl Agent {
                             let mut iter_pending_approval: Option<
                                 crate::approval::PendingApprovalDraft,
                             > = None;
-                            let sanitized_response = match self
+                            let handled = match self
                                 .handle_tool_use(
                                     &response,
                                     &mut messages,
@@ -2088,7 +2112,7 @@ impl Agent {
                                 )
                                 .await
                             {
-                                Ok(sanitized) => sanitized,
+                                Ok(handled) => handled,
                                 Err(e) => {
                                     match self.handle_loop_error_with_dispatch(
                                         &e,
@@ -2101,9 +2125,36 @@ impl Agent {
                                     }
                                 }
                             };
+                            let sanitized_response = handled.response;
+
+                            if let Some(terminal) = handled.terminal {
+                                self.emit_cost_update(&turn, &sanitized_response, attributed_cost);
+                                return Ok(ConversationResponse {
+                                    content: terminal.message,
+                                    reasoning_content: None,
+                                    provider_metadata: Some(
+                                        self.llm.provider_metadata_for_index(
+                                            sanitized_response.provider_index,
+                                        ),
+                                    ),
+                                    token_usage: turn.total_usage().clone(),
+                                    estimated_spend_usd: turn.priced_spend(),
+                                    files_modified,
+                                    files_to_send,
+                                    streamed,
+                                    assistant_segments: turn_output_log.provenance.clone(),
+                                    messages: turn_output_log.messages.clone(),
+                                    tool_results: tool_structured_metadata.clone(),
+                                    synthesized_from_spawn_only: false,
+                                    pending_approval: None,
+                                });
+                            }
 
                             if let Some(tool_name) = loop_detector.take_peer_polling_signal() {
                                 convergence.force(CheckpointReason::PeerPolling { tool_name });
+                            }
+                            if let Some(tool_name) = loop_detector.take_verified_wait_signal() {
+                                convergence.force(CheckpointReason::VerifiedWait { tool_name });
                             }
 
                             if let Some(churn) = loop_detector.take_file_churn_signal() {
@@ -2633,6 +2684,7 @@ impl Agent {
                         return Ok(TaskResult {
                             schema_version: octos_core::TASK_RESULT_SCHEMA_VERSION,
                             success: false,
+                            failure: None,
                             output,
                             files_modified,
                             files_to_send,
@@ -2893,6 +2945,9 @@ impl Agent {
                     StopReason::ToolUse => {
                         if self.config.no_progress {
                             for tc in &response.tool_calls {
+                                if verified_wait_fact(&self.tools, tc, None).is_some() {
+                                    continue;
+                                }
                                 if loop_detector.before_call(
                                     &tc.name,
                                     &tc.arguments,
@@ -2907,6 +2962,10 @@ impl Agent {
                                     return Ok(TaskResult {
                                         schema_version: octos_core::TASK_RESULT_SCHEMA_VERSION,
                                         success: false,
+                                        failure: Some(TaskFailure {
+                                            code: H07_TERMINAL_CODE.to_owned(),
+                                            retryable: false,
+                                        }),
                                         output: exact_repeat_terminal_message(),
                                         files_modified,
                                         files_to_send,
@@ -2922,7 +2981,7 @@ impl Agent {
                         // gate; see the matching call site above.) Codex
                         // round-3: ignore the sanitized response too — task
                         // loop has no synth-ack gate that would need it.
-                        if let Err(e) = self
+                        let handled = match self
                             .handle_tool_use(
                                 &response,
                                 &mut messages,
@@ -2944,7 +3003,8 @@ impl Agent {
                             )
                             .await
                         {
-                            match self.handle_loop_error_with_dispatch(
+                            Ok(handled) => handled,
+                            Err(e) => match self.handle_loop_error_with_dispatch(
                                 &e,
                                 &mut retry_state,
                                 iteration,
@@ -2952,7 +3012,28 @@ impl Agent {
                             ) {
                                 LoopErrorAction::Retry => continue,
                                 LoopErrorAction::Bail => return Err(attach_partial_usage(e, turn.total_usage().clone())),
-                            }
+                            },
+                        };
+                        if let Some(terminal) = handled.terminal {
+                            self.emit_cost_update(&turn, &handled.response, attributed_cost);
+                            self.reporter().report(ProgressEvent::TaskCompleted {
+                                success: false,
+                                iterations: iteration,
+                                duration: task_start.elapsed(),
+                            });
+                            return Ok(TaskResult {
+                                schema_version: octos_core::TASK_RESULT_SCHEMA_VERSION,
+                                success: false,
+                                failure: Some(TaskFailure {
+                                    code: H07_TERMINAL_CODE.to_owned(),
+                                    retryable: false,
+                                }),
+                                output: terminal.message,
+                                files_modified,
+                                files_to_send,
+                                subtasks: Vec::new(),
+                                token_usage: turn.total_usage().clone(),
+                            });
                         }
                         if let Err(e) = self
                             .maybe_run_verifier_after_tool_batch(
@@ -3056,6 +3137,7 @@ impl Agent {
         TaskResult {
             schema_version: octos_core::TASK_RESULT_SCHEMA_VERSION,
             success,
+            failure: None,
             output,
             files_modified,
             files_to_send,
@@ -3142,7 +3224,7 @@ impl Agent {
         //   matched call is denied with an "approval not available" tool
         //   result instead of being silently bypassed.
         pending_approval_out: Option<&mut Option<crate::approval::PendingApprovalDraft>>,
-    ) -> Result<ChatResponse> {
+    ) -> Result<HandledToolUse> {
         // Sanitize tool_call_id characters: some providers (e.g. Moonshot/kimi)
         // generate IDs like "admin_view_sessions:11" which OpenAI rejects (only
         // letters, numbers, underscores, dashes accepted). This is a documented
@@ -3262,7 +3344,7 @@ impl Agent {
                                  host; denying instead of suspending"
                             );
                         }
-                        return Ok(response);
+                        return Ok(response.into());
                     }
                     Ok(None) => {}
                     Err(err) => {
@@ -3287,7 +3369,7 @@ impl Agent {
                             log.extend(placeholders.iter().cloned());
                         }
                         messages.extend(placeholders);
-                        return Ok(response);
+                        return Ok(response.into());
                     }
                 }
             }
@@ -3421,6 +3503,7 @@ impl Agent {
         // The H07 path shares exact-result history between both loops. The
         // legacy third-result hint remains unchanged when H07 is disabled.
         let mut detached_hint = None;
+        let mut terminal = None;
         let mut progress_by_index = vec![None; merged.len()];
         {
             use std::collections::HashMap;
@@ -3465,17 +3548,31 @@ impl Agent {
                         && observation.state_digest.is_some())
                     .then_some(observation.evidence_key.as_str())
                 });
-                let exact_hint = loop_detector.after_result(
-                    name,
-                    args,
-                    &result_before_hint,
-                    trusted_read_key,
-                    synchronous_result,
-                );
-                // M3 records the typed terminal decision in the episode and
-                // metric. M5 will route it through task/spawn's non-retryable
-                // lifecycle; until then only the bounded hints affect output.
-                let semantic_outcome = if loop_detector.no_progress_enabled() && synchronous_result
+                let verified_wait_key = loop_detector
+                    .no_progress_enabled()
+                    .then(|| {
+                        ordered_observations.get(index).and_then(|observation| {
+                            (observation.family == OperationFamily::Wait
+                                && observation.call_id == id
+                                && observation.confidence == ObservationConfidence::TrustedAdapter)
+                                .then(|| observation.wait_key.as_deref())
+                                .flatten()
+                        })
+                    })
+                    .flatten();
+                let exact_hint = if let Some(wait_key) = verified_wait_key {
+                    loop_detector.after_verified_wait(name, args, &result_before_hint, wait_key)
+                } else {
+                    loop_detector.after_result(
+                        name,
+                        args,
+                        &result_before_hint,
+                        trusted_read_key,
+                        synchronous_result,
+                    )
+                };
+                let semantic_outcome = if loop_detector.no_progress_enabled()
+                    && (synchronous_result || verified_wait_key.is_some())
                 {
                     ordered_observations
                         .get(index)
@@ -3485,6 +3582,11 @@ impl Agent {
                 };
                 if let Some(outcome) = semantic_outcome.as_ref() {
                     progress_by_index[index] = Some(outcome.class);
+                    if terminal.is_none() {
+                        terminal = ordered_observations.get(index).and_then(|observation| {
+                            EpisodeTracker::terminal_for(observation, outcome)
+                        });
+                    }
                 }
                 let semantic_hint = semantic_outcome.and_then(|outcome| outcome.hint);
                 let repeating = if let Some(hint) = semantic_hint.or(exact_hint) {
@@ -3579,7 +3681,7 @@ impl Agent {
         // Codex round-3: return the sanitized response so the caller's
         // synth-ack gate sees the SAME tool_call_ids that the success-bit
         // sink was keyed by. See doc-comment on this fn.
-        Ok(response)
+        Ok(HandledToolUse { response, terminal })
     }
 }
 

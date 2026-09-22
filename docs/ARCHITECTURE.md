@@ -81,7 +81,8 @@ pub struct Task {
 - `working_dir: PathBuf`, `git_state: Option<GitState>`, `working_memory: Vec<Message>`, `episodic_refs: Vec<EpisodeRef>`, `files_in_scope: Vec<PathBuf>`
 
 **TaskResult**:
-- `success: bool`, `output: String`, `files_modified: Vec<PathBuf>`, `subtasks: Vec<TaskId>`, `token_usage: TokenUsage`
+- `success: bool`, `failure: Option<TaskFailure>`, `output: String`, `files_modified: Vec<PathBuf>`, `subtasks: Vec<TaskId>`, `token_usage: TokenUsage`
+- `TaskFailure { code: String, retryable: bool }` is optional so legacy v1 payloads remain valid.
 
 **TokenUsage**: `input_tokens: u32`, `output_tokens: u32` (defaults to 0/0)
 

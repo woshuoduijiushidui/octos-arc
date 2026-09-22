@@ -43,6 +43,9 @@ pub(super) enum CheckpointReason {
     PeerPolling {
         tool_name: String,
     },
+    VerifiedWait {
+        tool_name: String,
+    },
 }
 
 impl CheckpointReason {
@@ -59,6 +62,9 @@ impl CheckpointReason {
             }
             Self::PeerPolling { tool_name } => {
                 format!("{tool_name} returned the same asynchronous peer snapshot three times")
+            }
+            Self::VerifiedWait { tool_name } => {
+                format!("{tool_name} returned unchanged output for the same live task three times")
             }
             Self::FileChurn {
                 path,
@@ -201,6 +207,8 @@ impl ConvergenceController {
     pub(super) fn prompt(reason: &CheckpointReason) -> String {
         let escalation_instruction = if matches!(reason, CheckpointReason::PeerPolling { .. }) {
             "\nThis is asynchronous peer polling, not proof the tool cannot change. Identify whether peers are still running, awaiting input, completed, or failed from the actual tool evidence. Do not busy-wait or invent a completed result: choose independent work, address a peer's input request, or use an available bounded wait before gathering again. Only claim completion after seeing the required result."
+        } else if matches!(reason, CheckpointReason::VerifiedWait { .. }) {
+            "\nThis is a runtime-confirmed live task wait, not proof the task failed or cannot change. Do not busy-wait, invent a completed result, or start a replacement task from this observation alone: choose independent work or use an available bounded wait before reading the same handle again. Only claim completion after observing its actual completed or failed state."
         } else if matches!(
             reason,
             CheckpointReason::FileChurn {

@@ -133,6 +133,18 @@ fn default_task_result_schema_version() -> u32 {
     TASK_RESULT_SCHEMA_VERSION
 }
 
+/// Optional machine-readable failure identity for an unsuccessful task.
+///
+/// This is additive within the TaskResult v1 ABI. Older payloads omit it;
+/// callers must continue to handle `success=false` with no typed failure.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskFailure {
+    /// Stable failure code owned by the subsystem that ended the task.
+    pub code: String,
+    /// Whether an outer coordinator may automatically retry this task.
+    pub retryable: bool,
+}
+
 /// Result of task execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskResult {
@@ -143,6 +155,10 @@ pub struct TaskResult {
     pub schema_version: u32,
     /// Whether the task succeeded.
     pub success: bool,
+    /// Optional typed failure identity. Absent for legacy and unclassified
+    /// failures so existing v1 producers and consumers remain compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<TaskFailure>,
     /// Output or summary.
     pub output: String,
     /// Files that were modified.
@@ -495,6 +511,7 @@ mod tests {
         let result = TaskResult {
             schema_version: TASK_RESULT_SCHEMA_VERSION,
             success: true,
+            failure: None,
             output: "all tests pass".to_string(),
             files_modified: vec![PathBuf::from("src/main.rs")],
             files_to_send: vec![PathBuf::from("output/report.md")],
@@ -508,6 +525,7 @@ mod tests {
         let json = serde_json::to_string(&result).unwrap();
         let parsed: TaskResult = serde_json::from_str(&json).unwrap();
         assert!(parsed.success);
+        assert_eq!(parsed.failure, None);
         assert_eq!(parsed.output, "all tests pass");
         assert_eq!(
             parsed.files_to_send,
@@ -530,6 +548,27 @@ mod tests {
         let parsed: TaskResult = serde_json::from_str(legacy).expect("legacy result parses");
         assert_eq!(parsed.schema_version, TASK_RESULT_SCHEMA_VERSION);
         assert!(parsed.success);
+        assert_eq!(parsed.failure, None);
+    }
+
+    #[test]
+    fn task_result_round_trips_typed_non_retryable_failure() {
+        let result = TaskResult {
+            schema_version: TASK_RESULT_SCHEMA_VERSION,
+            success: false,
+            failure: Some(TaskFailure {
+                code: "h07_terminal_non_retryable".to_string(),
+                retryable: false,
+            }),
+            output: "unchanged evidence".to_string(),
+            files_modified: vec![],
+            files_to_send: vec![],
+            subtasks: vec![],
+            token_usage: TokenUsage::default(),
+        };
+        let parsed: TaskResult =
+            serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
+        assert_eq!(parsed.failure, result.failure);
     }
 
     #[test]
