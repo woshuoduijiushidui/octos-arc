@@ -102,14 +102,17 @@ fn hard_failures_are_repairable_and_mixed_terminal_failure_wins() {
     assert!(ticket.applies_to(&candidate));
     assert_eq!(ticket.failures.len(), 1);
 
-    for terminal in [ValidatorStatus::Timeout, ValidatorStatus::Error] {
+    for (terminal, expected_reason) in [
+        (ValidatorStatus::Timeout, TerminalReason::GateTimeout),
+        (ValidatorStatus::Error, TerminalReason::GateError),
+    ] {
         let checks = vec![
             validator("build", ValidatorStatus::Fail, true),
             validator("infra", terminal, true),
         ];
         assert!(matches!(
             classify(&candidate, receipt(&candidate, checks), 1, 2),
-            CompletionDecision::TerminalFailure { .. }
+            CompletionDecision::TerminalFailure { reason, .. } if reason == expected_reason
         ));
     }
 }

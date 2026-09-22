@@ -42,6 +42,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use clap::{Args, ValueEnum};
@@ -54,7 +55,7 @@ use octos_agent::arc_task::{
 use octos_agent::completion_gate::{
     ArtifactCheckKind, ArtifactCheckOutcome, ArtifactReasonCode, ArtifactState, CheckOutcome,
     CompletionCandidate, CompletionDecision, CompletionGate, CompletionReceipt,
-    ProgressObservation, TerminalReason, classify, observe_progress,
+    ProgressObservation, TerminalReason, classify, failure_signature, observe_progress,
 };
 use octos_agent::mcp_server::{
     McpServer, McpServerError, McpSessionCost, McpSessionDispatch, McpSessionOutcome,
@@ -786,6 +787,16 @@ impl McpSessionDispatch for RealSessionDispatch {
             let protected = match ProtectedWorkspace::new(&self.config.cwd, &self.config.data_dir) {
                 Ok(protected) => protected,
                 Err(error) => {
+                    tracing::warn!(
+                        target: "h06_observation",
+                        event = "repair_session_final",
+                        invocation_id = %invocation_id,
+                        task_id = %task.id,
+                        decision = "terminal_failure",
+                        stop_reason = "rollback_unavailable",
+                        usage_status = "not_started",
+                        "H06 repair workspace protection unavailable"
+                    );
                     observer.mark_state(TaskLifecycleState::Failed);
                     return Ok(McpSessionOutcome {
                         final_state: TaskLifecycleState::Failed,
@@ -817,6 +828,13 @@ impl McpSessionDispatch for RealSessionDispatch {
                 Ok(result) => result,
                 Err(err) => {
                     let restore = gate.restore_best(None, None).await;
+                    let candidate_revision = gate
+                        .previous
+                        .lock()
+                        .expect("MCP progress mutex")
+                        .as_ref()
+                        .map(|previous| previous.receipt.candidate_revision)
+                        .unwrap_or(0);
                     let partial = err.downcast_ref::<octos_agent::PartialTurnUsage>();
                     let cost = partial
                         .map(|usage| McpSessionCost::from(&usage.total))
@@ -826,6 +844,28 @@ impl McpSessionDispatch for RealSessionDispatch {
                     } else {
                         "unknown; numeric_cost_is_compatibility_placeholder"
                     };
+                    let restore_result = match &restore {
+                        Some(Ok(_)) => "restored",
+                        Some(Err(_)) => "failed",
+                        None => "not_available",
+                    };
+                    tracing::warn!(
+                        target: "h06_observation",
+                        event = "repair_session_final",
+                        invocation_id = %invocation_id,
+                        task_id = %task.id,
+                        candidate_revision,
+                        decision = "provider_error",
+                        stop_reason = "provider_error",
+                        usage_status,
+                        input_tokens = cost.input_tokens,
+                        output_tokens = cost.output_tokens,
+                        reasoning_tokens = cost.reasoning_tokens,
+                        cache_read_tokens = cost.cache_read_tokens,
+                        cache_write_tokens = cost.cache_write_tokens,
+                        restore_result,
+                        "H06 repair session stopped"
+                    );
                     observer.mark_state(TaskLifecycleState::Failed);
                     return Ok(McpSessionOutcome {
                         final_state: TaskLifecycleState::Failed,
@@ -868,13 +908,34 @@ impl McpSessionDispatch for RealSessionDispatch {
                     true
                 }
                 Some(Err(error)) => {
+                    let cost = McpSessionCost::from(&gated.task_result.token_usage);
+                    tracing::warn!(
+                        target: "h06_observation",
+                        event = "repair_session_final",
+                        invocation_id = %invocation_id,
+                        task_id = %task.id,
+                        candidate_revision = gated
+                            .decision
+                            .as_ref()
+                            .map(|decision| decision.receipt().candidate_revision)
+                            .unwrap_or(0),
+                        decision = "terminal_failure",
+                        stop_reason = "rollback_unavailable",
+                        input_tokens = cost.input_tokens,
+                        output_tokens = cost.output_tokens,
+                        reasoning_tokens = cost.reasoning_tokens,
+                        cache_read_tokens = cost.cache_read_tokens,
+                        cache_write_tokens = cost.cache_write_tokens,
+                        restore_result = "failed",
+                        "H06 repair session stopped"
+                    );
                     observer.mark_state(TaskLifecycleState::Failed);
                     return Ok(McpSessionOutcome {
                         final_state: TaskLifecycleState::Failed,
                         artifact_path: None,
                         artifact_content: None,
                         validator_results: Vec::new(),
-                        cost: McpSessionCost::from(&gated.task_result.token_usage),
+                        cost,
                         error: Some(format!("rollback_unavailable: {error}")),
                     });
                 }
@@ -934,6 +995,28 @@ impl McpSessionDispatch for RealSessionDispatch {
                     ) {
                         observer.mark_state(TaskLifecycleState::Verifying);
                     }
+                    tracing::info!(
+                        target: "h06_observation",
+                        event = "repair_session_final",
+                        invocation_id = %invocation_id,
+                        task_id = %decision.receipt().task_id,
+                        candidate_revision = decision.receipt().candidate_revision,
+                        decision = decision_code(decision),
+                        stop_reason = match decision {
+                            CompletionDecision::Pass(_) => "ready",
+                            CompletionDecision::Repairable { .. } => "invalid_repairable_final",
+                            CompletionDecision::TerminalFailure { reason, .. } => {
+                                terminal_reason_code(*reason)
+                            }
+                        },
+                        input_tokens = outcome.cost.input_tokens,
+                        output_tokens = outcome.cost.output_tokens,
+                        reasoning_tokens = outcome.cost.reasoning_tokens,
+                        cache_read_tokens = outcome.cost.cache_read_tokens,
+                        cache_write_tokens = outcome.cost.cache_write_tokens,
+                        restored,
+                        "H06 repair session completed"
+                    );
                     observer.mark_state(outcome.final_state);
                     return Ok(outcome);
                 }
@@ -963,6 +1046,24 @@ impl McpSessionDispatch for RealSessionDispatch {
                 cost: McpSessionCost::from(&gated.task_result.token_usage),
                 error: Some(error),
             };
+            tracing::info!(
+                target: "h06_observation",
+                event = "repair_session_final",
+                invocation_id = %invocation_id,
+                task_id = %task.id,
+                decision = "task_failed",
+                stop_reason = if final_state == TaskLifecycleState::Cancelled {
+                    "cancelled"
+                } else {
+                    "task_failed"
+                },
+                input_tokens = outcome.cost.input_tokens,
+                output_tokens = outcome.cost.output_tokens,
+                reasoning_tokens = outcome.cost.reasoning_tokens,
+                cache_read_tokens = outcome.cost.cache_read_tokens,
+                cache_write_tokens = outcome.cost.cache_write_tokens,
+                "H06 repair session completed"
+            );
             observer.mark_state(final_state);
             return Ok(outcome);
         }
@@ -1074,6 +1175,133 @@ fn terminal_reason_code(reason: TerminalReason) -> &'static str {
     }
 }
 
+fn decision_code(decision: &CompletionDecision) -> &'static str {
+    match decision {
+        CompletionDecision::Pass(_) => "pass",
+        CompletionDecision::Repairable { .. } => "repairable",
+        CompletionDecision::TerminalFailure { .. } => "terminal_failure",
+    }
+}
+
+fn progress_code(progress: Option<ProgressObservation>) -> &'static str {
+    match progress {
+        None => "initial",
+        Some(ProgressObservation::Improved) => "improved",
+        Some(ProgressObservation::StrategyChange) => "strategy_change",
+        Some(ProgressObservation::EvidenceChanged) => "evidence_changed",
+        Some(ProgressObservation::NoWorkspaceChange) => "no_workspace_change",
+        Some(ProgressObservation::Regressed) => "regressed",
+    }
+}
+
+fn observation_facts(receipt: &CompletionReceipt) -> (usize, usize, String, String) {
+    let mut hard_passes = 0usize;
+    let mut hard_failures = Vec::new();
+    let mut categories = BTreeSet::new();
+    for check in &receipt.checks {
+        match check {
+            CheckOutcome::Validator(outcome) if outcome.required => {
+                if outcome.status == ValidatorStatus::Pass {
+                    hard_passes += 1;
+                } else {
+                    hard_failures.push(check.clone());
+                    categories.insert(match outcome.status {
+                        ValidatorStatus::Fail => "validator_fail",
+                        ValidatorStatus::Timeout => "validator_timeout",
+                        ValidatorStatus::Error => "validator_error",
+                        ValidatorStatus::Pass => unreachable!(),
+                    });
+                }
+            }
+            CheckOutcome::Artifact(outcome) => {
+                if outcome.status == ValidatorStatus::Pass {
+                    hard_passes += 1;
+                } else {
+                    hard_failures.push(check.clone());
+                    categories.insert(match outcome.reason_code {
+                        ArtifactReasonCode::Missing => "artifact_missing",
+                        ArtifactReasonCode::UnsafeLocation => "artifact_unsafe_location",
+                        ArtifactReasonCode::TooLarge => "artifact_too_large",
+                        ArtifactReasonCode::InvalidUtf8 => "artifact_invalid_utf8",
+                        ArtifactReasonCode::InvalidJson => "artifact_invalid_json",
+                        ArtifactReasonCode::SchemaMismatch => "artifact_schema_mismatch",
+                        ArtifactReasonCode::Other => "artifact_other",
+                    });
+                }
+            }
+            CheckOutcome::Validator(_) => {}
+        }
+    }
+    (
+        hard_passes,
+        hard_failures.len(),
+        categories.into_iter().collect::<Vec<_>>().join(","),
+        failure_signature(&hard_failures),
+    )
+}
+
+fn stop_code(decision: &CompletionDecision, repair_rounds_sent: u8) -> &'static str {
+    match decision {
+        CompletionDecision::Pass(_) if repair_rounds_sent == 0 => "initial_ready",
+        CompletionDecision::Pass(_) if repair_rounds_sent == 1 => "first_round_ready",
+        CompletionDecision::Pass(_) => "second_round_ready",
+        CompletionDecision::Repairable { .. } => "repair_requested",
+        CompletionDecision::TerminalFailure { reason, .. } => terminal_reason_code(*reason),
+    }
+}
+
+fn emit_gate_observation(
+    candidate: &CompletionCandidate,
+    decision: &CompletionDecision,
+    repair_rounds_sent: u8,
+    progress: Option<ProgressObservation>,
+    workspace_changed: bool,
+    gate_duration_ms: u64,
+) {
+    let (hard_pass_count, hard_fail_count, failure_categories, signature) =
+        observation_facts(decision.receipt());
+    let (ticket_visible_bytes, evidence_reference_count) = match decision {
+        CompletionDecision::Repairable { ticket, .. } => (
+            ticket
+                .render(octos_agent::completion_gate::TICKET_BYTES)
+                .len(),
+            ticket.validator_references.len(),
+        ),
+        _ => (0, 0),
+    };
+    tracing::info!(
+        target: "h06_observation",
+        event = "completion_gate",
+        task_id = %candidate.task_id,
+        candidate_revision = candidate.revision,
+        round = repair_rounds_sent,
+        decision = decision_code(decision),
+        stop_reason = stop_code(decision, repair_rounds_sent),
+        progress = progress_code(progress),
+        failure_categories = %failure_categories,
+        hard_pass_count,
+        hard_fail_count,
+        signature = %signature,
+        gate_duration_ms,
+        ticket_visible_bytes,
+        evidence_reference_count,
+        workspace_changed,
+        converted_to_ready = repair_rounds_sent > 0
+            && matches!(decision, CompletionDecision::Pass(_)),
+        success_round = if matches!(decision, CompletionDecision::Pass(_)) {
+            repair_rounds_sent
+        } else {
+            0
+        },
+        input_tokens = candidate.cumulative_usage.input_tokens,
+        output_tokens = candidate.cumulative_usage.output_tokens,
+        reasoning_tokens = candidate.cumulative_usage.reasoning_tokens,
+        cache_read_tokens = candidate.cumulative_usage.cache_read_tokens,
+        cache_write_tokens = candidate.cumulative_usage.cache_write_tokens,
+        "H06 completion gate observation"
+    );
+}
+
 impl McpRepairGate<'_> {
     /// Restore a saved failing candidate and build the final projection only
     /// from checks rerun against those restored bytes. A failed restore never
@@ -1084,66 +1312,89 @@ impl McpRepairGate<'_> {
         revision: Option<u64>,
     ) -> Option<Result<(CompletionReceipt, McpSessionOutcome)>> {
         let best = self.best.lock().expect("MCP best candidate mutex").take()?;
-        Some(
-            async {
-                self.protected.restore(best.snapshot, best.manifest).await?;
-                let mut candidate = best.candidate;
-                candidate.revision =
-                    revision.unwrap_or_else(|| candidate.revision.saturating_add(1));
-                if let Some(usage) = usage {
-                    candidate.cumulative_usage = usage.clone();
-                }
-                let _ = octos_agent::workspace_contract::run_project_root_validators(
-                    self.tools.as_ref(),
-                    &candidate.working_dir,
-                    None,
-                    &candidate.files_to_send,
-                    self.tools.sandbox(),
-                )
-                .await;
-                let core_failed = octos_agent::workspace_git::inspect_workspace_contracts(
-                    &candidate.working_dir,
-                )?
-                .iter()
-                .any(|status| status.policy_managed && !status.ready);
-                let mut result = run_completion_gate(CompletionGateInput {
-                    candidate,
-                    contract: self.contract,
-                    expected_artifact: self.expected_artifact,
-                    artifact_name: self.artifact_name,
-                    native_arc: self.native_arc,
-                    response_schema: self.response_schema,
-                    tools: self.tools,
-                    sandbox: self.sandbox,
-                })
-                .await;
-                if core_failed {
-                    result.outcome.error =
-                        Some("contract_failed: restored workspace contract failed".into());
-                }
-                let mut receipt = result.decision.receipt().clone();
-                if core_failed {
-                    let mut check = artifact_check(
-                        Path::new(""),
-                        ArtifactCheckKind::Location,
-                        ValidatorStatus::Error,
-                        ArtifactReasonCode::Other,
-                        "project workspace contract did not pass",
-                        false,
-                    );
-                    if let CheckOutcome::Artifact(ref mut artifact) = check {
-                        artifact.gate_id = "core/workspace_contract".into();
-                    }
-                    receipt.checks.push(check);
-                }
-                sanitize_repair_receipt(&mut receipt, &self.protected.root);
-                result.outcome.final_state = TaskLifecycleState::Failed;
-                result.outcome.artifact_path = None;
-                result.outcome.artifact_content = None;
-                Ok((receipt, result.outcome))
+        let restore_started = Instant::now();
+        let task_id = best.candidate.task_id.clone();
+        let saved_revision = best.candidate.revision;
+        let restored_revision = revision.unwrap_or_else(|| saved_revision.saturating_add(1));
+        let result = async {
+            self.protected.restore(best.snapshot, best.manifest).await?;
+            let mut candidate = best.candidate;
+            candidate.revision = restored_revision;
+            if let Some(usage) = usage {
+                candidate.cumulative_usage = usage.clone();
             }
-            .await,
-        )
+            let _ = octos_agent::workspace_contract::run_project_root_validators(
+                self.tools.as_ref(),
+                &candidate.working_dir,
+                None,
+                &candidate.files_to_send,
+                self.tools.sandbox(),
+            )
+            .await;
+            let core_failed =
+                octos_agent::workspace_git::inspect_workspace_contracts(&candidate.working_dir)?
+                    .iter()
+                    .any(|status| status.policy_managed && !status.ready);
+            let mut result = run_completion_gate(CompletionGateInput {
+                candidate,
+                contract: self.contract,
+                expected_artifact: self.expected_artifact,
+                artifact_name: self.artifact_name,
+                native_arc: self.native_arc,
+                response_schema: self.response_schema,
+                tools: self.tools,
+                sandbox: self.sandbox,
+            })
+            .await;
+            if core_failed {
+                result.outcome.error =
+                    Some("contract_failed: restored workspace contract failed".into());
+            }
+            let mut receipt = result.decision.receipt().clone();
+            if core_failed {
+                let mut check = artifact_check(
+                    Path::new(""),
+                    ArtifactCheckKind::Location,
+                    ValidatorStatus::Error,
+                    ArtifactReasonCode::Other,
+                    "project workspace contract did not pass",
+                    false,
+                );
+                if let CheckOutcome::Artifact(ref mut artifact) = check {
+                    artifact.gate_id = "core/workspace_contract".into();
+                }
+                receipt.checks.push(check);
+            }
+            sanitize_repair_receipt(&mut receipt, &self.protected.root);
+            result.outcome.final_state = TaskLifecycleState::Failed;
+            result.outcome.artifact_path = None;
+            result.outcome.artifact_content = None;
+            Ok((receipt, result.outcome))
+        }
+        .await;
+        match &result {
+            Ok(_) => tracing::info!(
+                target: "h06_observation",
+                event = "candidate_restore",
+                task_id = %task_id,
+                saved_revision,
+                restored_revision,
+                restore_result = "restored",
+                restore_duration_ms = restore_started.elapsed().as_millis() as u64,
+                "H06 candidate restore observation"
+            ),
+            Err(_) => tracing::warn!(
+                target: "h06_observation",
+                event = "candidate_restore",
+                task_id = %task_id,
+                saved_revision,
+                restored_revision,
+                restore_result = "failed",
+                restore_duration_ms = restore_started.elapsed().as_millis() as u64,
+                "H06 candidate restore observation"
+            ),
+        }
+        Some(result)
     }
 }
 
@@ -1160,6 +1411,7 @@ impl CompletionGate for McpRepairGate<'_> {
         core_contract_failure: Option<&str>,
         repair_rounds_sent: u8,
     ) -> CompletionDecision {
+        let gate_started = Instant::now();
         let mut result = run_completion_gate(CompletionGateInput {
             candidate: candidate.clone(),
             contract: self.contract,
@@ -1312,7 +1564,14 @@ impl CompletionGate for McpRepairGate<'_> {
                     });
                 }
                 Err(error) => {
-                    tracing::warn!(error = %error, "H06 candidate snapshot unavailable");
+                    tracing::warn!(
+                        target: "h06_observation",
+                        event = "candidate_snapshot",
+                        task_id = %candidate.task_id,
+                        candidate_revision = candidate.revision,
+                        snapshot_result = "failed",
+                        "H06 candidate snapshot unavailable"
+                    );
                     result.outcome.error = Some(format!("rollback_unavailable: {error}"));
                     decision = CompletionDecision::TerminalFailure {
                         reason: TerminalReason::RollbackUnavailable,
@@ -1323,6 +1582,14 @@ impl CompletionGate for McpRepairGate<'_> {
         }
         *self.latest.lock().expect("MCP gate result mutex") =
             Some((candidate.revision, result.outcome));
+        emit_gate_observation(
+            candidate,
+            &decision,
+            repair_rounds_sent,
+            progress,
+            workspace_changed,
+            gate_started.elapsed().as_millis() as u64,
+        );
         decision
     }
 }
@@ -1524,6 +1791,7 @@ impl ProtectedWorkspace {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(lock_root.join(format!(
                 "{}.lock",
                 octos_agent::snapshot::workspace_hash(&root)
@@ -2114,6 +2382,52 @@ mod tests {
         assert!(workspace_fingerprint(&candidate).is_none());
     }
 
+    #[test]
+    fn h06_m6_observation_uses_bounded_facts_without_changing_decision() {
+        let workspace = tempfile::tempdir().unwrap();
+        let candidate = gate_candidate(workspace.path());
+        let secret = "ARCBENCH_API_KEY=secret schema={very_large} stderr=private";
+        let receipt = CompletionReceipt {
+            task_id: candidate.task_id.clone(),
+            candidate_revision: candidate.revision,
+            gate_policy_version: 1,
+            checks: vec![artifact_check(
+                Path::new("result.json"),
+                ArtifactCheckKind::Exists,
+                ValidatorStatus::Fail,
+                ArtifactReasonCode::Missing,
+                secret,
+                true,
+            )],
+            artifact_state: ArtifactState::Missing,
+            artifact_path: None,
+            artifact_content: None,
+            validator_references: BTreeMap::new(),
+        };
+        let decision = CompletionDecision::TerminalFailure {
+            reason: TerminalReason::GateError,
+            receipt,
+        };
+
+        let (hard_passes, hard_failures, categories, signature) =
+            observation_facts(decision.receipt());
+        assert_eq!(hard_passes, 0);
+        assert_eq!(hard_failures, 1);
+        assert_eq!(categories, "artifact_missing");
+        assert_eq!(signature.len(), 64);
+        assert!(!categories.contains(secret));
+        assert!(!signature.contains(secret));
+
+        emit_gate_observation(&candidate, &decision, 1, None, false, 7);
+        assert!(matches!(
+            decision,
+            CompletionDecision::TerminalFailure {
+                reason: TerminalReason::GateError,
+                ..
+            }
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn h06_m5_disposable_workspace_lock_is_exclusive() {
@@ -2330,13 +2644,14 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let candidate = gate_candidate(workspace.path());
         let schema = serde_json::json!({"type": "object", "required": ["count"]});
-        let cases: &[(
-            &str,
-            Option<&[u8]>,
+        type ArtifactFailureCase<'a> = (
+            &'a str,
+            Option<&'a [u8]>,
             ArtifactCheckKind,
             ArtifactReasonCode,
-            &str,
-        )] = &[
+            &'a str,
+        );
+        let cases: &[ArtifactFailureCase<'_>] = &[
             (
                 "missing.json",
                 None,

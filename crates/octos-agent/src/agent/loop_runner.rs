@@ -2680,7 +2680,7 @@ impl Agent {
                         ticket.ticket_id.get(..16).unwrap_or(&ticket.ticket_id)
                     );
                     messages.push(Message::user(text.clone()));
-                    (marker, text)
+                    (ticket, marker, text)
                 });
 
                 let iteration = turn.advance_iteration();
@@ -2715,7 +2715,8 @@ impl Agent {
                     },
                     iteration,
                 );
-                if let Some((marker, ticket_text)) = ticket_text {
+                let total_usage = turn.total_usage().clone();
+                if let Some((ticket, marker, ticket_text)) = ticket_text {
                     if !messages.iter().any(|message| {
                         message.role == MessageRole::User && message.content == ticket_text
                     }) {
@@ -2727,8 +2728,27 @@ impl Agent {
                         messages.push(Message::user(ticket_text));
                     }
                     repair_rounds_sent = repair_rounds_sent.saturating_add(1);
+                    tracing::info!(
+                        target: "h06_observation",
+                        event = "repair_ticket_injected",
+                        task_id = %ticket.task_id,
+                        candidate_revision = ticket.candidate_revision,
+                        round = ticket.repair_round,
+                        max_repair_rounds = ticket.max_repair_rounds,
+                        ticket_id = %ticket.ticket_id,
+                        signature = %ticket.failure_signature,
+                        ticket_visible_bytes = ticket.render(TICKET_BYTES).len(),
+                        evidence_reference_count = ticket.validator_references.len(),
+                        failure_count = ticket.failures.len(),
+                        hard_pass_count = ticket.passed_gate_ids.len(),
+                        input_tokens = total_usage.input_tokens,
+                        output_tokens = total_usage.output_tokens,
+                        reasoning_tokens = total_usage.reasoning_tokens,
+                        cache_read_tokens = total_usage.cache_read_tokens,
+                        cache_write_tokens = total_usage.cache_write_tokens,
+                        "H06 repair ticket injected"
+                    );
                 }
-                let total_usage = turn.total_usage().clone();
 
                 // M8.5 tier 2: decorate the config with the Anthropic header.
                 let call_config = with_tier2_context_management(&config, self);
