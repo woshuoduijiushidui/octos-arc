@@ -173,6 +173,7 @@ pub enum TerminalReason {
     RepairRoundLimit,
     NoWorkspaceChange,
     UnchangedFailure,
+    Regressed,
     TaskBudgetExhausted,
     GateTimeout,
     GateError,
@@ -445,6 +446,79 @@ pub fn failure_signature(failures: &[CheckOutcome]) -> String {
     parts.sort();
     parts.dedup();
     digest_parts(&parts)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProgressObservation {
+    Improved,
+    StrategyChange,
+    EvidenceChanged,
+    NoWorkspaceChange,
+    Regressed,
+}
+
+/// Compare hard gate facts for two verified candidates. Workspace change is
+/// supplied by the caller from observed file bytes, never from model claims.
+pub fn observe_progress(
+    previous: &CompletionReceipt,
+    current: &CompletionReceipt,
+    workspace_changed: bool,
+) -> ProgressObservation {
+    let facts = |receipt: &CompletionReceipt| {
+        let mut passed = BTreeSet::new();
+        let mut failed = BTreeSet::new();
+        let mut failures = Vec::new();
+        for check in &receipt.checks {
+            let hard = match check {
+                CheckOutcome::Validator(outcome) => outcome.required,
+                CheckOutcome::Artifact(_) => true,
+            };
+            if !hard {
+                continue;
+            }
+            if check.status() == ValidatorStatus::Pass {
+                passed.insert(check.gate_id().to_string());
+            } else {
+                failed.insert(check.gate_id().to_string());
+                failures.push(check.clone());
+            }
+        }
+        (passed, failed, failure_signature(&failures))
+    };
+    let (old_pass, old_fail, old_signature) = facts(previous);
+    let (new_pass, new_fail, new_signature) = facts(current);
+    let newly_exposed_artifacts: BTreeSet<_> =
+        if previous.artifact_state == ArtifactState::Unchecked {
+            current
+                .checks
+                .iter()
+                .filter_map(|check| match check {
+                    CheckOutcome::Artifact(_) => Some(check.gate_id().to_string()),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
+    if !old_pass.is_subset(&new_pass)
+        || new_fail
+            .iter()
+            .any(|id| !old_fail.contains(id) && !newly_exposed_artifacts.contains(id))
+    {
+        return ProgressObservation::Regressed;
+    }
+    if new_pass.len() > old_pass.len() {
+        return ProgressObservation::Improved;
+    }
+    if old_signature == new_signature {
+        if workspace_changed {
+            ProgressObservation::StrategyChange
+        } else {
+            ProgressObservation::NoWorkspaceChange
+        }
+    } else {
+        ProgressObservation::EvidenceChanged
+    }
 }
 
 fn digest_parts(parts: &[String]) -> String {

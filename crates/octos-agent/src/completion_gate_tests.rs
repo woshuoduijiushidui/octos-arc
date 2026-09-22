@@ -223,6 +223,120 @@ fn stale_revision_and_round_limit_are_terminal() {
 }
 
 #[test]
+fn progress_requires_hard_pass_improvement_or_observed_workspace_change() {
+    let candidate = make_candidate(12);
+    let previous = receipt(
+        &candidate,
+        vec![
+            validator("build", ValidatorStatus::Fail, true),
+            validator("lint", ValidatorStatus::Pass, true),
+            validator("optional", ValidatorStatus::Fail, false),
+        ],
+    );
+    let unchanged = receipt(
+        &candidate,
+        vec![
+            validator("build", ValidatorStatus::Fail, true),
+            validator("lint", ValidatorStatus::Pass, true),
+        ],
+    );
+    assert_eq!(
+        observe_progress(&previous, &unchanged, false),
+        ProgressObservation::NoWorkspaceChange
+    );
+    assert_eq!(
+        observe_progress(&previous, &unchanged, true),
+        ProgressObservation::StrategyChange
+    );
+
+    let improved = receipt(
+        &candidate,
+        vec![
+            validator("build", ValidatorStatus::Pass, true),
+            validator("lint", ValidatorStatus::Pass, true),
+        ],
+    );
+    assert_eq!(
+        observe_progress(&previous, &improved, true),
+        ProgressObservation::Improved
+    );
+}
+
+#[test]
+fn newly_exposed_artifact_failure_does_not_hide_validator_progress() {
+    let candidate = make_candidate(15);
+    let previous = receipt(
+        &candidate,
+        vec![validator("build", ValidatorStatus::Fail, true)],
+    );
+    let current = receipt(
+        &candidate,
+        vec![
+            validator("build", ValidatorStatus::Pass, true),
+            artifact(ArtifactCheckKind::Exists, ValidatorStatus::Fail),
+        ],
+    );
+    assert_eq!(
+        observe_progress(&previous, &current, true),
+        ProgressObservation::Improved
+    );
+}
+
+#[test]
+fn progress_detects_new_hard_failure_and_lost_pass_without_count_heuristics() {
+    let candidate = make_candidate(13);
+    let mut previous = receipt(
+        &candidate,
+        vec![
+            validator("build", ValidatorStatus::Fail, true),
+            validator("lint", ValidatorStatus::Pass, true),
+        ],
+    );
+    previous.artifact_state = ArtifactState::Rejected;
+    let lost_pass = receipt(
+        &candidate,
+        vec![
+            validator("build", ValidatorStatus::Pass, true),
+            validator("lint", ValidatorStatus::Fail, true),
+        ],
+    );
+    assert_eq!(
+        observe_progress(&previous, &lost_pass, true),
+        ProgressObservation::Regressed
+    );
+    let new_failure = receipt(
+        &candidate,
+        vec![
+            validator("build", ValidatorStatus::Fail, true),
+            validator("lint", ValidatorStatus::Pass, true),
+            artifact(ArtifactCheckKind::Schema, ValidatorStatus::Fail),
+        ],
+    );
+    assert_eq!(
+        observe_progress(&previous, &new_failure, true),
+        ProgressObservation::Regressed
+    );
+}
+
+#[test]
+fn changed_failure_evidence_is_not_a_gate_pass() {
+    let candidate = make_candidate(14);
+    let old = artifact(ArtifactCheckKind::Schema, ValidatorStatus::Fail);
+    let mut changed = old.clone();
+    if let CheckOutcome::Artifact(ref mut outcome) = changed {
+        outcome.schema_pointer = Some("/properties/new_field".into());
+    }
+    assert_eq!(
+        observe_progress(
+            &receipt(&candidate, vec![old]),
+            &receipt(&candidate, vec![changed]),
+            true
+        ),
+        ProgressObservation::EvidenceChanged
+    );
+}
+
+#[test]
 fn renderer_is_bounded_stable_and_quotes_untrusted_text() {
     let candidate = make_candidate(5);
     let mut check = artifact(ArtifactCheckKind::Schema, ValidatorStatus::Fail);
