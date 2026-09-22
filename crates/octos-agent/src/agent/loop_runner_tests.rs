@@ -5362,6 +5362,65 @@ async fn doom_loop_does_not_execute_the_tripping_call() {
 }
 
 #[test]
+fn h07_m0_long_repeated_read_with_hint_is_marked_productive() {
+    let message = format!(
+        "{}{}",
+        "read body ".repeat(20),
+        crate::loop_detect::NO_PROGRESS_HINT
+    );
+    assert!(is_productive_tool_message(&message));
+}
+
+#[tokio::test]
+async fn h07_m0_task_loop_executes_third_exact_call_without_conversation_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let executions = Arc::new(AtomicUsize::new(0));
+    let responses = (0..3)
+        .map(|index| {
+            tool_use(
+                vec![ToolCall {
+                    id: format!("repeat_{index}"),
+                    name: "repeat_tool".to_string(),
+                    arguments: serde_json::json!({}),
+                    metadata: None,
+                }],
+                1,
+                1,
+            )
+        })
+        .chain(std::iter::once(end_turn("done", 1, 1)))
+        .collect();
+    let provider = Arc::new(ScriptedProvider::new(responses));
+    let mut tools = ToolRegistry::new();
+    tools.register(CountingEchoTool {
+        name: "repeat_tool",
+        output: "same result",
+        calls: Arc::clone(&executions),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("task-repeat-baseline"),
+        provider,
+        tools,
+        memory,
+    )
+    .with_config(AgentConfig {
+        max_iterations: 10,
+        save_episodes: false,
+        ..Default::default()
+    });
+
+    let result = agent
+        .run_task(&task_for("repeat", dir.path()))
+        .await
+        .unwrap();
+    assert!(result.success);
+    assert_eq!(executions.load(AtomicOrdering::SeqCst), 3);
+    assert_eq!(result.token_usage.input_tokens, 4);
+    assert_eq!(result.token_usage.output_tokens, 4);
+}
+
+#[test]
 fn doom_loop_terminal_message_is_model_and_user_facing() {
     let msg = doom_loop_terminal_message("read_file", 3);
     assert!(msg.contains("read_file"), "names the looping tool: {msg}");

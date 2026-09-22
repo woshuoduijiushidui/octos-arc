@@ -446,6 +446,29 @@ mod tests {
     }
 
     #[test]
+    fn h07_m0_successful_no_change_is_counted_as_file_churn() {
+        let mut detector = detector_with_churn_threshold(2);
+        let no_change = crate::tools::ToolResult {
+            success: true,
+            file_modified: None,
+            structured_metadata: Some(json!({"outcome": "no_change", "file_modified": false})),
+            ..Default::default()
+        };
+        let args = json!({"path": "same.txt"});
+        assert!(
+            detector
+                .record_file_mutation("edit_file", &args, no_change.success)
+                .is_none()
+        );
+        assert!(
+            detector
+                .record_file_mutation("edit_file", &args, no_change.success)
+                .is_some()
+        );
+        assert_eq!(detector.take_file_churn_signal().unwrap().edits, 2);
+    }
+
+    #[test]
     fn should_not_detect_on_few_calls() {
         let mut d = LoopDetector::new(10);
         assert!(d.record("shell", &json!({"command": "ls"})).is_none());
