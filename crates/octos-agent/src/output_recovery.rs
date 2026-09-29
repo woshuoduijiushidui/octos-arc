@@ -1619,6 +1619,21 @@ impl OutputState {
             .map(|e| e.rendered.clone())
     }
 
+    pub(crate) fn lookup_unambiguous(
+        &self,
+        call_id: &str,
+        content: &str,
+    ) -> Option<RenderedOutput> {
+        let call_id = crate::agent::normalize_tool_call_id(call_id);
+        let hash = digest(content.as_bytes());
+        let entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        let mut matching = entries
+            .iter()
+            .filter(|e| e.rendered.view.call_id == call_id && e.rendered.view.view_digest == hash);
+        let first = matching.next()?;
+        matching.next().is_none().then(|| first.rendered.clone())
+    }
+
     pub fn project(
         &self,
         call_id: &str,

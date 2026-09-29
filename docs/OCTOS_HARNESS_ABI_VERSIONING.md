@@ -169,6 +169,8 @@ Stable:
 
 Experimental:
 
+- `failure.code`, `failure.retryable` — optional typed identity for unsuccessful
+  tasks; absent on legacy or unclassified failures.
 - `token_usage.reasoning_tokens`, `token_usage.cache_read_tokens`,
   `token_usage.cache_write_tokens` — optional and omitted when zero; their
   reporting semantics depend on provider support and may tighten inside v1.

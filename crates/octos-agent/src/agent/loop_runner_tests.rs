@@ -64,6 +64,44 @@ use octos_llm::{
     ChatResponse, LlmError, LlmErrorKind, LlmProvider, StopReason, TokenUsage as LlmTokenUsage,
     ToolChoice,
 };
+
+#[test]
+fn h07_m1_limited_batch_keeps_duplicate_ids_and_blocked_slot_aligned() {
+    let call = |id: &str, ordinal: u64| ToolCall {
+        id: id.into(),
+        name: "read_file".into(),
+        arguments: serde_json::json!({"path": format!("file_{ordinal}.rs")}),
+        metadata: None,
+    };
+    let calls = vec![call("duplicate", 1), call("duplicate", 2), call("last", 3)];
+    let original = ChatResponse {
+        content: None,
+        reasoning_content: None,
+        tool_calls: calls.clone(),
+        stop_reason: StopReason::ToolUse,
+        usage: LlmTokenUsage::default(),
+        provider_index: None,
+    };
+    let limited = ChatResponse {
+        tool_calls: vec![calls[0].clone(), calls[2].clone()],
+        ..original.clone()
+    };
+    let executed = [0, 2].map(|index| {
+        ProgressObservation::placeholder(&calls[index], ObservationStatus::Success, "visible")
+    });
+    let blocked = vec![session_limit_message(
+        &calls[1],
+        "[SESSION LIMIT] blocked".into(),
+    )];
+    let ordered = order_progress_observations(&original, &limited, executed.into(), &blocked);
+    assert_eq!(ordered.len(), 3);
+    assert_eq!(ordered[0].target_label, "file_1.rs");
+    assert_eq!(ordered[1].target_label, "file_2.rs");
+    assert_eq!(ordered[1].status, ObservationStatus::Blocked);
+    assert_eq!(ordered[2].target_label, "file_3.rs");
+    assert_eq!(ordered[0].call_id, ordered[1].call_id);
+    assert_ne!(ordered[0].target_key, ordered[1].target_key);
+}
 use octos_memory::EpisodeStore;
 
 use crate::completion_gate::{
@@ -109,12 +147,14 @@ fn end_turn(content: &str, input_tokens: u32, output_tokens: u32) -> ChatRespons
 
 struct ScriptedProvider {
     responses: StdMutex<Vec<ChatResponse>>,
+    prompts: StdMutex<Vec<Vec<Message>>>,
 }
 
 impl ScriptedProvider {
     fn new(responses: Vec<ChatResponse>) -> Self {
         Self {
             responses: StdMutex::new(responses.into_iter().rev().collect()),
+            prompts: StdMutex::new(Vec::new()),
         }
     }
 }
@@ -123,10 +163,11 @@ impl ScriptedProvider {
 impl LlmProvider for ScriptedProvider {
     async fn chat(
         &self,
-        _messages: &[Message],
+        messages: &[Message],
         _tools: &[octos_llm::ToolSpec],
         _config: &ChatConfig,
     ) -> Result<ChatResponse> {
+        self.prompts.lock().unwrap().push(messages.to_vec());
         self.responses
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -864,6 +905,7 @@ async fn run_peer_polling_regression(
     tool_name: &'static str,
     outputs: Vec<String>,
     reflection_after: &[usize],
+    no_progress: bool,
 ) {
     let dir = tempfile::tempdir().unwrap();
     let requests = Arc::new(StdMutex::new(Vec::new()));
@@ -908,6 +950,7 @@ async fn run_peer_polling_regression(
     let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
     let agent = Agent::new(AgentId::new("peer-polling"), provider, tools, memory)
         .with_config(AgentConfig {
+            no_progress,
             save_episodes: false,
             max_iterations: 30,
             ..Default::default()
@@ -953,6 +996,84 @@ async fn run_peer_polling_regression(
 }
 
 #[tokio::test]
+async fn h07_m5_live_handle_uses_bounded_wait_reflection_without_restarting_task() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let executions = Arc::new(AtomicUsize::new(0));
+    let mut tools = ToolRegistry::new();
+    tools.register(StaticResultTool {
+        name: "read_task_output",
+        output: "still running",
+        success: true,
+        calls: executions.clone(),
+    });
+    let supervisor = tools.supervisor();
+    let handle = supervisor.register("async_tool", "call-live", Some("session"));
+    supervisor.mark_running(&handle);
+    let mut responses = (0..3)
+        .map(|index| {
+            tool_use(
+                vec![ToolCall {
+                    id: format!("wait_{index}"),
+                    name: "read_task_output".into(),
+                    arguments: serde_json::json!({"task_handle": handle.clone()}),
+                    metadata: None,
+                }],
+                1,
+                1,
+            )
+        })
+        .collect::<Vec<_>>();
+    responses.push(end_turn("PRIVATE-WAIT-REFLECTION", 1, 1));
+    responses.push(end_turn(
+        "live task still owned by its original runner",
+        1,
+        1,
+    ));
+    let provider = Arc::new(ConfigRecordingProvider::new(responses, requests.clone()));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("h07-m5-verified-wait"),
+        provider,
+        tools,
+        memory,
+    )
+    .with_config(AgentConfig {
+        no_progress: true,
+        save_episodes: false,
+        max_iterations: 10,
+        ..Default::default()
+    })
+    .with_convergence_intervals(100, 100_000_000, std::time::Duration::from_secs(86_400));
+
+    let result = agent
+        .process_message("monitor it", &[], vec![])
+        .await
+        .unwrap();
+    assert_eq!(
+        result.content,
+        "live task still owned by its original runner"
+    );
+    assert_eq!(executions.load(AtomicOrdering::SeqCst), 3);
+    assert_eq!(
+        supervisor.get_task(&handle).unwrap().status.as_str(),
+        "running"
+    );
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 5);
+    let reflections: Vec<_> = requests
+        .iter()
+        .filter(|(_, _, config)| matches!(config.tool_choice, ToolChoice::None))
+        .collect();
+    assert_eq!(reflections.len(), 1);
+    let prompt = &reflections[0].0.last().unwrap().content;
+    assert!(prompt.contains("live task"));
+    assert!(prompt.contains("runtime-confirmed"));
+    assert!(!prompt.contains("peer polling"));
+    assert!(prompt.contains("busy-wait"));
+}
+
+#[tokio::test]
 async fn peer_polling_should_allow_changed_result_on_third_identical_request() {
     for tool in ["peer_gather", "peer_list"] {
         run_peer_polling_regression(
@@ -963,6 +1084,7 @@ async fn peer_polling_should_allow_changed_result_on_third_identical_request() {
                 "done: actual result".into(),
             ],
             &[],
+            false,
         )
         .await;
     }
@@ -980,6 +1102,7 @@ async fn peer_polling_should_reflect_after_unchanged_results_and_resume_for_genu
                 "done: actual result".into(),
             ],
             &[3],
+            false,
         )
         .await;
     }
@@ -998,6 +1121,25 @@ async fn peer_polling_should_reset_no_progress_threshold_when_output_changes() {
                 "done: result".into(),
             ],
             &[],
+            false,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn h07_m2_peer_polling_keeps_async_exception() {
+    for tool in ["peer_gather", "peer_list"] {
+        run_peer_polling_regression(
+            tool,
+            vec![
+                "still running".into(),
+                "still running".into(),
+                "still running".into(),
+                "done: actual result".into(),
+            ],
+            &[3],
+            true,
         )
         .await;
     }
@@ -4851,6 +4993,73 @@ fn productive_message_rejects_failed_to_prefix_in_long_body() {
     assert!(!is_productive_tool_message(&body));
 }
 
+#[test]
+fn h07_m4_typed_progress_overrides_legacy_productive_text_heuristic() {
+    let call = ToolCall {
+        id: "typed".into(),
+        name: "edit_file".into(),
+        arguments: serde_json::json!({"path": "a.rs"}),
+        metadata: None,
+    };
+    let mut typed =
+        ProgressObservation::placeholder(&call, ObservationStatus::Success, "typed mutation");
+    typed.confidence = ObservationConfidence::Typed;
+    typed.outcome = Some(MutationOutcome::NoChange);
+    typed.semantic_eligible = true;
+    let misleading = format!(
+        "{}\nExit code: 0{}",
+        "unchanged output ".repeat(20),
+        crate::loop_detect::H07_EXACT_HINT
+    );
+    assert!(!should_record_productive_tool_call(
+        true,
+        Some(&typed),
+        Some(ProgressClass::NoProgress),
+        &misleading,
+    ));
+    assert!(!should_record_productive_tool_call(
+        true,
+        Some(&typed),
+        Some(ProgressClass::Unknown),
+        &misleading,
+    ));
+    assert!(should_record_productive_tool_call(
+        true,
+        Some(&typed),
+        Some(ProgressClass::StateChanged),
+        "ok",
+    ));
+    assert!(should_record_productive_tool_call(
+        true,
+        Some(&typed),
+        Some(ProgressClass::ValidationImproved),
+        "ok",
+    ));
+    assert!(!should_record_productive_tool_call(
+        true,
+        Some(&typed),
+        Some(ProgressClass::Regressed),
+        "tests passed",
+    ));
+
+    let untyped = ProgressObservation::placeholder(
+        &ToolCall {
+            id: "legacy".into(),
+            name: "legacy_tool".into(),
+            arguments: serde_json::json!({}),
+            metadata: None,
+        },
+        ObservationStatus::Success,
+        "legacy",
+    );
+    assert!(should_record_productive_tool_call(
+        true,
+        Some(&untyped),
+        Some(ProgressClass::Unknown),
+        &misleading,
+    ));
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Review A F-001 — dispatch_loop_error wiring.
 // ─────────────────────────────────────────────────────────────────────
@@ -5764,6 +5973,32 @@ async fn alternating_cycle_still_uses_two_stage_warning_not_doom_abort() {
     );
 }
 
+#[tokio::test]
+async fn h07_m2_alternating_cycle_keeps_two_stage_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"a").unwrap();
+    std::fs::write(dir.path().join("b.txt"), b"b").unwrap();
+    let provider = Arc::new(CountingAlternatingArgsProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let tools = ToolRegistry::with_builtins(dir.path());
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("h07-cycle"), provider.clone(), tools, memory).with_config(
+        AgentConfig {
+            no_progress: true,
+            max_iterations: 30,
+            save_episodes: false,
+            ..Default::default()
+        },
+    );
+    let result = agent
+        .process_message("alternate", &[], vec![])
+        .await
+        .unwrap();
+    assert_eq!(result.content, loop_detected_terminal_message());
+    assert!(provider.calls.load(AtomicOrdering::SeqCst) >= 7);
+}
+
 /// LLM mock that always calls a named tool, so the loop detector fires
 /// repeatedly on a tool whose EXECUTION count the test can observe.
 struct CountingAlwaysNamedToolProvider {
@@ -5852,6 +6087,1104 @@ async fn doom_loop_does_not_execute_the_tripping_call() {
         "the tripping call must NOT execute; got {executions} executions \
              across {total_calls} LLM calls"
     );
+}
+
+#[test]
+fn h07_m0_long_repeated_read_with_hint_is_marked_productive() {
+    let message = format!(
+        "{}{}",
+        "read body ".repeat(20),
+        crate::loop_detect::NO_PROGRESS_HINT
+    );
+    assert!(is_productive_tool_message(&message));
+}
+
+#[tokio::test]
+async fn h07_m0_task_loop_executes_third_exact_call_without_conversation_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let executions = Arc::new(AtomicUsize::new(0));
+    let responses = (0..3)
+        .map(|index| {
+            tool_use(
+                vec![ToolCall {
+                    id: format!("repeat_{index}"),
+                    name: "repeat_tool".to_string(),
+                    arguments: serde_json::json!({}),
+                    metadata: None,
+                }],
+                1,
+                1,
+            )
+        })
+        .chain(std::iter::once(end_turn("done", 1, 1)))
+        .collect();
+    let provider = Arc::new(ScriptedProvider::new(responses));
+    let mut tools = ToolRegistry::new();
+    tools.register(CountingEchoTool {
+        name: "repeat_tool",
+        output: "same result",
+        calls: Arc::clone(&executions),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("task-repeat-baseline"),
+        provider,
+        tools,
+        memory,
+    )
+    .with_config(AgentConfig {
+        max_iterations: 10,
+        save_episodes: false,
+        ..Default::default()
+    });
+
+    let result = agent
+        .run_task(&task_for("repeat", dir.path()))
+        .await
+        .unwrap();
+    assert!(result.success);
+    assert_eq!(executions.load(AtomicOrdering::SeqCst), 3);
+    assert_eq!(result.token_usage.input_tokens, 4);
+    assert_eq!(result.token_usage.output_tokens, 4);
+}
+
+fn h07_m2_repeated_calls(last_batch: bool) -> Vec<ChatResponse> {
+    (0..3)
+        .map(|index| {
+            let mut calls = vec![ToolCall {
+                id: format!("repeat_{index}"),
+                name: "repeat_tool".to_string(),
+                arguments: serde_json::json!({}),
+                metadata: None,
+            }];
+            if last_batch && index == 2 {
+                calls.push(ToolCall {
+                    id: "companion".to_string(),
+                    name: "companion_tool".to_string(),
+                    arguments: serde_json::json!({}),
+                    metadata: None,
+                });
+            }
+            tool_use(calls, 1, 1)
+        })
+        .collect()
+}
+
+struct H07M3NoMatchTool {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for H07M3NoMatchTool {
+    fn name(&self) -> &str {
+        "diff_edit"
+    }
+    fn description(&self) -> &str {
+        "typed no-match fixture"
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+    async fn execute(&self, _args: &serde_json::Value) -> Result<ToolResult> {
+        let n = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+        Ok(ToolResult {
+            output: format!("same failure, duration={n}ms request_id={n}"),
+            success: false,
+            structured_metadata: Some(serde_json::json!({
+                "error_code": "diff_context_no_match",
+                "file_modified": false,
+                "matcher": "context",
+                "reason": "no_match",
+                "hunk_index": 0,
+                "expected_line": 4,
+                "occurrence_count": 0,
+                "current_version": {"content_sha256": format!("sha256:{}", "a".repeat(64))},
+                "duration_ms": n,
+                "request_id": format!("volatile-{n}")
+            })),
+            ..Default::default()
+        })
+    }
+}
+
+fn h07_m3_changed_attempts() -> Vec<ChatResponse> {
+    (0..3).map(|n| tool_use(vec![ToolCall {
+        id: format!("attempt_{n}"),
+        name: "diff_edit".into(),
+        arguments: serde_json::json!({"path": "a.rs", "diff": format!("@@ -4 +4 @@\n-{n}\n+{n}")}),
+        metadata: None,
+    }], 1, 1)).chain(std::iter::once(end_turn("diagnosed", 1, 1))).collect()
+}
+
+#[tokio::test]
+async fn h07_m3_conversation_semantic_hints_without_extra_model_requests() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(ScriptedProvider::new(h07_m3_changed_attempts()));
+    let mut tools = ToolRegistry::new();
+    tools.register(H07M3NoMatchTool {
+        calls: calls.clone(),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("h07-m3-conversation"),
+        provider.clone(),
+        tools,
+        memory,
+    )
+    .with_config(AgentConfig {
+        no_progress: true,
+        max_iterations: 10,
+        save_episodes: false,
+        ..Default::default()
+    });
+    let result = agent
+        .process_message("diagnose", &[], vec![])
+        .await
+        .unwrap();
+    assert_eq!(result.content, "diagnosed");
+    assert_eq!(calls.load(AtomicOrdering::SeqCst), 3);
+    assert_eq!(result.token_usage.input_tokens, 4);
+    let prompts = provider.prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 4);
+    assert!(
+        prompts[2]
+            .iter()
+            .any(|m| m.content.contains("[NO PROGRESS] The same Mutate failure"))
+    );
+    assert_eq!(
+        prompts[2]
+            .iter()
+            .map(|m| m.content.matches("[NO PROGRESS]").count())
+            .sum::<usize>(),
+        1
+    );
+    assert!(
+        prompts[3]
+            .iter()
+            .any(|m| m.content.contains("[SWITCH REQUIRED]"))
+    );
+}
+
+#[tokio::test]
+async fn h07_m3_task_uses_the_same_semantic_episode() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(ScriptedProvider::new(h07_m3_changed_attempts()));
+    let mut tools = ToolRegistry::new();
+    tools.register(H07M3NoMatchTool {
+        calls: calls.clone(),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("h07-m3-task"), provider.clone(), tools, memory)
+        .with_config(AgentConfig {
+            no_progress: true,
+            max_iterations: 10,
+            save_episodes: false,
+            ..Default::default()
+        });
+    let result = agent
+        .run_task(&task_for("diagnose", dir.path()))
+        .await
+        .unwrap();
+    assert!(result.success);
+    assert_eq!(calls.load(AtomicOrdering::SeqCst), 3);
+    assert_eq!(result.token_usage.input_tokens, 4);
+    let prompts = provider.prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 4);
+    assert!(
+        prompts[2]
+            .iter()
+            .any(|m| m.content.contains("[NO PROGRESS] The same Mutate failure"))
+    );
+    assert!(
+        prompts[3]
+            .iter()
+            .any(|m| m.content.contains("[SWITCH REQUIRED]"))
+    );
+}
+
+fn h07_m6_strategy_responses(reflection: ChatResponse) -> Vec<ChatResponse> {
+    let mut responses = h07_m3_changed_attempts();
+    responses.pop();
+    responses.push(reflection);
+    responses.push(tool_use(
+        vec![ToolCall {
+            id: "different_diagnostic".into(),
+            name: "check".into(),
+            arguments: serde_json::json!({"scope": "fresh"}),
+            metadata: None,
+        }],
+        1,
+        1,
+    ));
+    responses.push(end_turn("diagnosed after a different action", 1, 1));
+    responses
+}
+
+fn h07_m6_tools(diff_calls: Arc<AtomicUsize>, diagnostic_calls: Arc<AtomicUsize>) -> ToolRegistry {
+    let mut tools = ToolRegistry::new();
+    tools.register(H07M3NoMatchTool { calls: diff_calls });
+    tools.register(StaticResultTool {
+        name: "check",
+        output: "fresh diagnostic evidence",
+        success: true,
+        calls: diagnostic_calls,
+    });
+    tools
+}
+
+#[tokio::test]
+async fn h07_m6_b_policy_keeps_the_ladder_without_an_extra_model_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let mut responses = h07_m3_changed_attempts();
+    responses.pop();
+    responses.push(tool_use(
+        vec![ToolCall {
+            id: "different_diagnostic".into(),
+            name: "check".into(),
+            arguments: serde_json::json!({"scope": "fresh"}),
+            metadata: None,
+        }],
+        1,
+        1,
+    ));
+    responses.push(end_turn("diagnosed after a different action", 1, 1));
+    let provider = Arc::new(ConfigRecordingProvider::new(responses, requests.clone()));
+    let diff_calls = Arc::new(AtomicUsize::new(0));
+    let diagnostic_calls = Arc::new(AtomicUsize::new(0));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("h07-m6-b"),
+        provider,
+        h07_m6_tools(diff_calls.clone(), diagnostic_calls.clone()),
+        memory,
+    )
+    .with_config(AgentConfig {
+        no_progress: true,
+        no_progress_reflection: false,
+        max_iterations: 10,
+        save_episodes: false,
+        ..Default::default()
+    });
+
+    let result = agent
+        .process_message("diagnose parser", &[], vec![])
+        .await
+        .unwrap();
+    assert_eq!(result.content, "diagnosed after a different action");
+    assert_eq!(diff_calls.load(AtomicOrdering::SeqCst), 3);
+    assert_eq!(diagnostic_calls.load(AtomicOrdering::SeqCst), 1);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 5);
+    assert!(
+        requests
+            .iter()
+            .all(|(_, _, config)| !matches!(config.tool_choice, ToolChoice::None))
+    );
+    assert!(
+        requests[3]
+            .0
+            .iter()
+            .any(|message| message.content.contains("[SWITCH REQUIRED]"))
+    );
+}
+
+#[tokio::test]
+async fn h07_m6_c_policy_reflects_once_then_gives_the_next_action_a_strategy_chance() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let mut reflection = end_turn("PRIVATE-H07-REFLECTION", 7, 3);
+    reflection.usage.reasoning_tokens = 2;
+    reflection.usage.cache_read_tokens = 3;
+    reflection.usage.cache_write_tokens = 4;
+    let provider = Arc::new(ConfigRecordingProvider::new(
+        h07_m6_strategy_responses(reflection),
+        requests.clone(),
+    ));
+    let diff_calls = Arc::new(AtomicUsize::new(0));
+    let diagnostic_calls = Arc::new(AtomicUsize::new(0));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("h07-m6-c"),
+        provider,
+        h07_m6_tools(diff_calls.clone(), diagnostic_calls.clone()),
+        memory,
+    )
+    .with_config(AgentConfig {
+        no_progress: true,
+        no_progress_reflection: true,
+        max_iterations: 10,
+        save_episodes: false,
+        ..Default::default()
+    })
+    .with_convergence_intervals(3, 100_000_000, std::time::Duration::from_secs(86_400));
+
+    let result = agent
+        .process_message("diagnose parser", &[], vec![])
+        .await
+        .unwrap();
+    assert_eq!(result.content, "diagnosed after a different action");
+    assert_eq!(diff_calls.load(AtomicOrdering::SeqCst), 3);
+    assert_eq!(diagnostic_calls.load(AtomicOrdering::SeqCst), 1);
+    assert_eq!(result.token_usage.input_tokens, 12);
+    assert_eq!(result.token_usage.output_tokens, 8);
+    assert_eq!(result.token_usage.reasoning_tokens, 2);
+    assert_eq!(result.token_usage.cache_read_tokens, 3);
+    assert_eq!(result.token_usage.cache_write_tokens, 4);
+    assert!(
+        result
+            .messages
+            .iter()
+            .all(|message| !message.content.contains("PRIVATE-H07-REFLECTION"))
+    );
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 6);
+    let reflections: Vec<_> = requests
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, _, config))| matches!(config.tool_choice, ToolChoice::None))
+        .collect();
+    assert_eq!(reflections.len(), 1);
+    assert_eq!(reflections[0].0, 3);
+    let reflection_messages = &reflections[0].1.0;
+    assert_eq!(reflection_messages.len(), 2);
+    let prompt = &reflection_messages.last().unwrap().content;
+    assert!(prompt.contains("User goal: diagnose parser"));
+    assert!(prompt.contains("Episode category: mutate/no_progress"));
+    assert!(prompt.contains("diff_context_no_match"));
+    assert!(prompt.contains("Related trigger: 3 LLM action calls"));
+    assert!(!prompt.contains("same failure, duration="));
+    assert!(
+        requests[4]
+            .0
+            .iter()
+            .any(|message| message.content.contains("PRIVATE-H07-REFLECTION"))
+    );
+    assert!(matches!(requests[4].2.tool_choice, ToolChoice::Auto));
+}
+
+#[tokio::test]
+async fn h07_m6_same_episode_is_terminal_after_its_single_reflection() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let mut responses = h07_m5_terminal_attempts();
+    responses.insert(3, end_turn("PRIVATE-H07-REFLECTION", 1, 1));
+    let provider = Arc::new(ConfigRecordingProvider::new(responses, requests.clone()));
+    let diff_calls = Arc::new(AtomicUsize::new(0));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("h07-m6-reflected-terminal"),
+        provider,
+        h07_m6_tools(diff_calls.clone(), Arc::new(AtomicUsize::new(0))),
+        memory,
+    )
+    .with_config(AgentConfig {
+        no_progress: true,
+        no_progress_reflection: true,
+        max_iterations: 10,
+        save_episodes: false,
+        ..Default::default()
+    });
+
+    let result = agent
+        .process_message("diagnose parser", &[], vec![])
+        .await
+        .unwrap();
+    assert!(result.content.contains("Stopped after repeated mutation"));
+    assert_eq!(diff_calls.load(AtomicOrdering::SeqCst), 4);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 5);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|(_, _, config)| matches!(config.tool_choice, ToolChoice::None))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn h07_m6_task_reuses_the_tools_disabled_reflection_without_periodic_checkpoints() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let provider = Arc::new(ConfigRecordingProvider::new(
+        h07_m6_strategy_responses(end_turn("PRIVATE-TASK-REFLECTION", 2, 2)),
+        requests.clone(),
+    ));
+    let diff_calls = Arc::new(AtomicUsize::new(0));
+    let diagnostic_calls = Arc::new(AtomicUsize::new(0));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("h07-m6-task-c"),
+        provider,
+        h07_m6_tools(diff_calls.clone(), diagnostic_calls.clone()),
+        memory,
+    )
+    .with_config(AgentConfig {
+        no_progress: true,
+        no_progress_reflection: true,
+        max_iterations: 10,
+        save_episodes: false,
+        ..Default::default()
+    })
+    .with_convergence_intervals(2, 1_000, std::time::Duration::from_secs(10));
+
+    let result = agent
+        .run_task(&task_for("diagnose parser", dir.path()))
+        .await
+        .unwrap();
+    assert!(result.success);
+    assert_eq!(result.output, "diagnosed after a different action");
+    assert!(!result.output.contains("PRIVATE-TASK-REFLECTION"));
+    assert_eq!(diff_calls.load(AtomicOrdering::SeqCst), 3);
+    assert_eq!(diagnostic_calls.load(AtomicOrdering::SeqCst), 1);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 6);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|(_, _, config)| matches!(config.tool_choice, ToolChoice::None))
+            .count(),
+        1
+    );
+    assert!(
+        requests[4]
+            .0
+            .iter()
+            .any(|message| message.content.contains("PRIVATE-TASK-REFLECTION"))
+    );
+}
+
+#[tokio::test]
+async fn h07_m6_empty_reflection_is_not_retried_and_falls_back_to_b() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let provider = Arc::new(ConfigRecordingProvider::new(
+        h07_m6_strategy_responses(end_turn("", 5, 1)),
+        requests.clone(),
+    ));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("h07-m6-empty-reflection"),
+        provider,
+        h07_m6_tools(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))),
+        memory,
+    )
+    .with_config(AgentConfig {
+        no_progress: true,
+        no_progress_reflection: true,
+        max_iterations: 10,
+        save_episodes: false,
+        ..Default::default()
+    });
+
+    let result = agent
+        .process_message("diagnose parser", &[], vec![])
+        .await
+        .unwrap();
+    assert_eq!(result.content, "diagnosed after a different action");
+    assert_eq!(result.token_usage.input_tokens, 10);
+    assert_eq!(result.token_usage.output_tokens, 6);
+    let requests = requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        6,
+        "the empty reflection must consume one request only"
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|(_, _, config)| matches!(config.tool_choice, ToolChoice::None))
+            .count(),
+        1
+    );
+    assert!(
+        requests[4]
+            .0
+            .iter()
+            .any(|message| message.content.contains("[SWITCH REQUIRED]"))
+    );
+    assert!(
+        requests[4]
+            .0
+            .iter()
+            .all(|message| !message.content.contains("PRIVATE-H07"))
+    );
+}
+
+#[tokio::test]
+async fn h07_m6_near_iteration_limit_uses_b_instead_of_spending_the_last_call_on_reflection() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let provider = Arc::new(ConfigRecordingProvider::new(
+        h07_m3_changed_attempts(),
+        requests.clone(),
+    ));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("h07-m6-budget-b"),
+        provider,
+        h07_m6_tools(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))),
+        memory,
+    )
+    .with_config(AgentConfig {
+        no_progress: true,
+        no_progress_reflection: true,
+        max_iterations: 4,
+        save_episodes: false,
+        ..Default::default()
+    });
+
+    let result = agent
+        .process_message("diagnose parser", &[], vec![])
+        .await
+        .unwrap();
+    assert_eq!(result.content, "diagnosed");
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 4);
+    assert!(
+        requests
+            .iter()
+            .all(|(_, _, config)| !matches!(config.tool_choice, ToolChoice::None))
+    );
+}
+
+#[tokio::test]
+async fn h07_m6_verifier_owner_suppresses_the_h07_reflection_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let planner = Arc::new(ConfigRecordingProvider::new(
+        h07_m3_changed_attempts(),
+        requests.clone(),
+    ));
+    let verifier = Arc::new(ScriptedProvider::new(
+        (0..4)
+            .map(|_| end_turn(r#"{"verdict":"ReadyToAnswer"}"#, 1, 1))
+            .collect(),
+    ));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("h07-m6-verifier-owner"),
+        planner,
+        h07_m6_tools(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))),
+        memory,
+    )
+    .with_config(AgentConfig {
+        no_progress: true,
+        no_progress_reflection: true,
+        max_iterations: 10,
+        save_episodes: false,
+        ..Default::default()
+    })
+    .with_verifier_config(AgentVerifierConfig::with_provider(
+        verifier.clone(),
+        "haiku-test",
+    ));
+
+    let result = agent
+        .process_message("diagnose parser", &[], vec![])
+        .await
+        .unwrap();
+    assert_eq!(result.content, "diagnosed");
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 4);
+    assert!(
+        requests
+            .iter()
+            .all(|(_, _, config)| !matches!(config.tool_choice, ToolChoice::None))
+    );
+    assert_eq!(verifier.prompts.lock().unwrap().len(), 3);
+}
+
+fn h07_m5_terminal_attempts() -> Vec<ChatResponse> {
+    (0..4)
+        .map(|n| {
+            tool_use(
+                vec![ToolCall {
+                    id: format!("terminal_attempt_{n}"),
+                    name: "diff_edit".into(),
+                    arguments: serde_json::json!({
+                        "path": "a.rs",
+                        "diff": format!("@@ -4 +4 @@\n-{n}\n+{n}")
+                    }),
+                    metadata: None,
+                }],
+                1,
+                1,
+            )
+        })
+        .chain(std::iter::once(end_turn("must not be requested", 1, 1)))
+        .collect()
+}
+
+#[tokio::test]
+async fn h07_m5_conversation_terminal_ends_turn_without_another_model_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(ScriptedProvider::new(h07_m5_terminal_attempts()));
+    let mut tools = ToolRegistry::new();
+    tools.register(H07M3NoMatchTool {
+        calls: calls.clone(),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("h07-m5-conversation-terminal"),
+        provider.clone(),
+        tools,
+        memory,
+    )
+    .with_config(AgentConfig {
+        no_progress: true,
+        max_iterations: 10,
+        save_episodes: false,
+        ..Default::default()
+    });
+
+    let result = agent
+        .process_message("diagnose", &[], vec![])
+        .await
+        .unwrap();
+    assert!(result.content.contains("Stopped after repeated mutation"));
+    assert!(result.content.contains("a.rs"));
+    assert_eq!(calls.load(AtomicOrdering::SeqCst), 4);
+    assert_eq!(provider.prompts.lock().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn h07_m5_task_terminal_has_machine_readable_non_retryable_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(ScriptedProvider::new(h07_m5_terminal_attempts()));
+    let mut tools = ToolRegistry::new();
+    tools.register(H07M3NoMatchTool {
+        calls: calls.clone(),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("h07-m5-task-terminal"),
+        provider.clone(),
+        tools,
+        memory,
+    )
+    .with_config(AgentConfig {
+        no_progress: true,
+        max_iterations: 10,
+        save_episodes: false,
+        ..Default::default()
+    });
+
+    let result = agent
+        .run_task(&task_for("diagnose", dir.path()))
+        .await
+        .unwrap();
+    assert!(!result.success);
+    let failure = result.failure.expect("typed H07 failure");
+    assert_eq!(failure.code, H07_TERMINAL_CODE);
+    assert!(!failure.retryable);
+    assert_eq!(calls.load(AtomicOrdering::SeqCst), 4);
+    assert_eq!(provider.prompts.lock().unwrap().len(), 4);
+}
+
+#[derive(Clone, Copy)]
+enum H07M4MutationMode {
+    NoChange,
+    Changing,
+}
+
+struct H07M4MutationTool {
+    mode: H07M4MutationMode,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for H07M4MutationTool {
+    fn name(&self) -> &str {
+        "edit_file"
+    }
+    fn description(&self) -> &str {
+        "typed mutation progress fixture"
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+    async fn execute(&self, _args: &serde_json::Value) -> Result<ToolResult> {
+        let n = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+        let (outcome, modified, final_char) = match self.mode {
+            H07M4MutationMode::NoChange => ("no_change", false, 'a'),
+            H07M4MutationMode::Changing => (
+                "modified",
+                true,
+                char::from_digit((n + 10) as u32, 16).unwrap(),
+            ),
+        };
+        Ok(ToolResult {
+            output: format!(
+                "{}\nExit code: 0",
+                "substantive but unchanged output ".repeat(8)
+            ),
+            success: true,
+            file_modified: modified.then(|| "a.rs".into()),
+            structured_metadata: Some(serde_json::json!({
+                "outcome": outcome,
+                "file_modified": modified,
+                "final_state": "confirmed",
+                "write_version": {"content_sha256": format!("sha256:{}", "f".repeat(64))},
+                "final_version": {"content_sha256": format!("sha256:{}", final_char.to_string().repeat(64))},
+                "changed_range": {"before": {"start": 1, "count": n + 1}},
+            })),
+            ..Default::default()
+        })
+    }
+}
+
+fn h07_m4_budget_responses() -> Vec<ChatResponse> {
+    (0..2)
+        .map(|n| {
+            tool_use(
+                vec![ToolCall {
+                    id: format!("mutation_{n}"),
+                    name: "edit_file".into(),
+                    arguments: serde_json::json!({
+                        "path": "a.rs", "old_string": format!("attempt-{n}")
+                    }),
+                    metadata: None,
+                }],
+                1,
+                1,
+            )
+        })
+        .chain(std::iter::once(end_turn("done", 1, 1)))
+        .collect()
+}
+
+#[tokio::test]
+async fn h07_m4_no_change_long_success_gets_no_budget_grace() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(ScriptedProvider::new(h07_m4_budget_responses()));
+    let mut tools = ToolRegistry::new();
+    tools.register(H07M4MutationTool {
+        mode: H07M4MutationMode::NoChange,
+        calls: calls.clone(),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("h07-m4-no-change"),
+        provider.clone(),
+        tools,
+        memory,
+    )
+    .with_config(AgentConfig {
+        no_progress: true,
+        max_iterations: 2,
+        save_episodes: false,
+        ..Default::default()
+    });
+    let result = agent.process_message("edit", &[], vec![]).await.unwrap();
+    assert_ne!(result.content, "done");
+    assert_eq!(calls.load(AtomicOrdering::SeqCst), 2);
+    assert_eq!(provider.prompts.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn h07_m4_distinct_final_versions_remain_productive() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(ScriptedProvider::new(h07_m4_budget_responses()));
+    let mut tools = ToolRegistry::new();
+    tools.register(H07M4MutationTool {
+        mode: H07M4MutationMode::Changing,
+        calls: calls.clone(),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("h07-m4-changing"),
+        provider.clone(),
+        tools,
+        memory,
+    )
+    .with_config(AgentConfig {
+        no_progress: true,
+        max_iterations: 2,
+        save_episodes: false,
+        ..Default::default()
+    });
+    let result = agent.process_message("edit", &[], vec![]).await.unwrap();
+    assert_eq!(result.content, "done");
+    assert_eq!(calls.load(AtomicOrdering::SeqCst), 2);
+    assert_eq!(provider.prompts.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn h07_m2_conversation_hints_then_rejects_whole_batch_before_execution() {
+    let dir = tempfile::tempdir().unwrap();
+    let repeat = Arc::new(AtomicUsize::new(0));
+    let companion = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(ScriptedProvider::new(h07_m2_repeated_calls(true)));
+    let mut tools = ToolRegistry::new();
+    for (name, calls) in [
+        ("repeat_tool", repeat.clone()),
+        ("companion_tool", companion.clone()),
+    ] {
+        tools.register(CountingEchoTool {
+            name,
+            output: "same result",
+            calls,
+        });
+    }
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("h07-m2-conversation"),
+        provider.clone(),
+        tools,
+        memory,
+    )
+    .with_config(AgentConfig {
+        no_progress: true,
+        max_iterations: 10,
+        save_episodes: false,
+        ..Default::default()
+    });
+    let result = agent.process_message("repeat", &[], vec![]).await.unwrap();
+    assert_eq!(result.content, exact_repeat_terminal_message());
+    assert_eq!(repeat.load(AtomicOrdering::SeqCst), 2);
+    assert_eq!(companion.load(AtomicOrdering::SeqCst), 0);
+    assert_eq!(result.token_usage.input_tokens, 3);
+    assert_eq!(result.token_usage.output_tokens, 3);
+    let prompts = provider.prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 3);
+    assert!(prompts[2].iter().any(|message| {
+        message.role == MessageRole::Tool
+            && message
+                .content
+                .contains(crate::loop_detect::H07_EXACT_HINT.trim())
+    }));
+    assert_eq!(
+        result
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::Tool)
+            .count(),
+        2
+    );
+    assert_eq!(
+        result
+            .messages
+            .iter()
+            .filter_map(|m| m.tool_calls.as_ref())
+            .map(Vec::len)
+            .sum::<usize>(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn h07_m2_task_uses_same_hint_and_pre_call_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let executions = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(ScriptedProvider::new(h07_m2_repeated_calls(false)));
+    let mut tools = ToolRegistry::new();
+    tools.register(CountingEchoTool {
+        name: "repeat_tool",
+        output: "same result",
+        calls: executions.clone(),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("h07-m2-task"), provider.clone(), tools, memory)
+        .with_config(AgentConfig {
+            no_progress: true,
+            max_iterations: 10,
+            save_episodes: false,
+            ..Default::default()
+        });
+    let result = agent
+        .run_task(&task_for("repeat", dir.path()))
+        .await
+        .unwrap();
+    assert!(!result.success);
+    assert_eq!(result.output, exact_repeat_terminal_message());
+    assert_eq!(executions.load(AtomicOrdering::SeqCst), 2);
+    assert_eq!(result.token_usage.input_tokens, 3);
+    assert_eq!(result.token_usage.output_tokens, 3);
+    let prompts = provider.prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 3);
+    assert!(prompts[2].iter().any(|message| {
+        message.role == MessageRole::Tool
+            && message
+                .content
+                .contains(crate::loop_detect::H07_EXACT_HINT.trim())
+    }));
+    assert_eq!(
+        prompts[2]
+            .iter()
+            .filter(|m| m.role == MessageRole::Tool)
+            .count(),
+        2
+    );
+    assert_eq!(
+        prompts[2]
+            .iter()
+            .filter_map(|m| m.tool_calls.as_ref())
+            .map(Vec::len)
+            .sum::<usize>(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn h07_m2_untyped_policy_failure_keeps_original_tool_lifecycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let executions = Arc::new(AtomicUsize::new(0));
+    let mut responses = h07_m2_repeated_calls(false);
+    for response in &mut responses {
+        response.tool_calls[0].name = "policy_tool".into();
+    }
+    responses.push(end_turn("done", 1, 1));
+    let provider = Arc::new(ScriptedProvider::new(responses));
+    let mut tools = ToolRegistry::new();
+    tools.register(StaticResultTool::new(
+        "policy_tool",
+        "[POLICY DENIED] operation unavailable",
+        false,
+        executions.clone(),
+    ));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("h07-policy"), provider.clone(), tools, memory)
+        .with_config(AgentConfig {
+            no_progress: true,
+            max_iterations: 10,
+            save_episodes: false,
+            ..Default::default()
+        });
+    let result = agent.process_message("attempt", &[], vec![]).await.unwrap();
+    assert_eq!(result.content, "done");
+    assert_eq!(executions.load(AtomicOrdering::SeqCst), 3);
+    assert_eq!(provider.prompts.lock().unwrap().len(), 4);
+    assert_eq!(result.token_usage.input_tokens, 4);
+    assert_eq!(result.token_usage.output_tokens, 4);
+}
+
+#[tokio::test]
+async fn h07_m2_read_hint_preserves_h03_view_and_recovery_fields() {
+    use crate::model_read_receipts::ReadReceiptOwner;
+    use crate::output_recovery::{OutputPolicy, OutputState};
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("long.txt"),
+        "line of evidence\n".repeat(3000),
+    )
+    .unwrap();
+    let provider = Arc::new(ScriptedProvider::new(
+        (0..3)
+            .map(|index| {
+                tool_use(
+                    vec![ToolCall {
+                        id: format!("read_{index}"),
+                        name: "read_file".to_string(),
+                        arguments: serde_json::json!({"path": "long.txt"}),
+                        metadata: None,
+                    }],
+                    1,
+                    1,
+                )
+            })
+            .collect(),
+    ));
+    let mut tools = ToolRegistry::new();
+    tools.register(crate::tools::ReadFileTool::new(dir.path()));
+    let state = Arc::new(OutputState::new(
+        OutputPolicy { enabled: true },
+        ReadReceiptOwner::new("workspace", "task", "session", "branch").unwrap(),
+    ));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("h07-m2-h03"), provider.clone(), tools, memory)
+        .with_config(AgentConfig {
+            no_progress: true,
+            max_iterations: 10,
+            save_episodes: false,
+            ..Default::default()
+        })
+        .with_output_state(state.clone());
+    let result = agent.process_message("read", &[], vec![]).await.unwrap();
+    assert_eq!(result.content, exact_repeat_terminal_message());
+    let prompts = provider.prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 3);
+    let prompt = &prompts[2];
+    assert!(prompt.iter().any(|message| {
+        message.role == MessageRole::System && message.content.contains("[NO PROGRESS]")
+    }));
+    let tool = prompt
+        .iter()
+        .rev()
+        .find(|message| message.role == MessageRole::Tool)
+        .unwrap();
+    assert!(!tool.content.contains("[NO PROGRESS]"));
+    assert!(tool.content.contains("\"ranges\""));
+    assert!(tool.content.contains("\"read_file_next\""));
+    assert!(tool.content.contains("\"source_sha256\""));
+    assert!(
+        state
+            .lookup(tool.tool_call_id.as_deref().unwrap(), &tool.content)
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn h07_m2_shell_spiral_recovery_precedes_exact_rejection() {
+    let dir = tempfile::tempdir().unwrap();
+    let executions = Arc::new(AtomicUsize::new(0));
+    let responses: Vec<_> = ["a", "b", "a", "a", "a"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, command)| {
+            tool_use(
+                vec![ToolCall {
+                    id: format!("shell_{index}"),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": command}),
+                    metadata: None,
+                }],
+                1,
+                1,
+            )
+        })
+        .collect();
+    let provider = Arc::new(ScriptedProvider::new(responses));
+    let mut tools = ToolRegistry::new();
+    tools.register(CountingEchoTool {
+        name: "shell",
+        output: "error[E0999]: broken\n\nExit code: 101",
+        calls: executions.clone(),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("h07-shell"), provider.clone(), tools, memory).with_config(
+        AgentConfig {
+            no_progress: true,
+            max_iterations: 10,
+            save_episodes: false,
+            ..Default::default()
+        },
+    );
+    let result = agent
+        .process_message("fix shell", &[], vec![])
+        .await
+        .unwrap();
+    assert!(
+        result
+            .content
+            .starts_with("I tried multiple shell approaches")
+    );
+    assert!(result.content.contains("error[E0999]: broken"));
+    assert_ne!(result.content, exact_repeat_terminal_message());
+    assert_eq!(executions.load(AtomicOrdering::SeqCst), 4);
+    assert_eq!(result.token_usage.input_tokens, 5);
+    assert_eq!(result.token_usage.output_tokens, 5);
+    let prompts = provider.prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 5);
 }
 
 #[test]

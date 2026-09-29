@@ -44,6 +44,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use eyre::Result;
 use serde::Deserialize;
+use serde_json::json;
 use tokio::time::timeout;
 
 use super::{ConcurrencyClass, Tool, ToolResult};
@@ -705,7 +706,27 @@ impl Tool for CheckTool {
         // false` is reserved for infrastructure errors (bad args, spawn
         // failure, timeout) so an M8.8 serial batch is not cascaded-
         // cancelled just because the project has pre-existing warnings.
-        Ok(ok(report))
+        if output.status.success() || diags.errors > 0 {
+            Ok(ToolResult {
+                output: report,
+                success: true,
+                structured_metadata: Some(json!({
+                    "validation": {
+                        "schema": "octos.validation.v1",
+                        "adapter": "check",
+                        "ran": true,
+                        "errors": diags.errors,
+                        "warnings": diags.warnings,
+                    }
+                })),
+                ..Default::default()
+            })
+        } else {
+            // A non-zero checker exit with no parseable diagnostics is an
+            // answer for the model, but it is not trusted evidence that the
+            // program improved or regressed.
+            Ok(ok(report))
+        }
     }
 }
 
@@ -1205,6 +1226,12 @@ vet: helper.go:4:6: undefined: missingFn
             "header must count levels: {}",
             result.output
         );
+        let validation = &result.structured_metadata.as_ref().unwrap()["validation"];
+        assert_eq!(validation["schema"], "octos.validation.v1");
+        assert_eq!(validation["adapter"], "check");
+        assert_eq!(validation["ran"], true);
+        assert_eq!(validation["errors"], 1);
+        assert_eq!(validation["warnings"], 1);
     }
 
     // ---- execute: session-sandbox confinement ----

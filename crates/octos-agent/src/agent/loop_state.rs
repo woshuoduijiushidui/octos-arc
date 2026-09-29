@@ -639,6 +639,16 @@ mod tests {
     }
 
     #[test]
+    fn h07_m5_productive_read_does_not_clear_provider_retry_bucket() {
+        let mut state = LoopRetryState::new();
+        assert_eq!(state.observe(&rate_limit()), LoopDecision::Continue);
+        let before = state.counters().rate_limited;
+        state.record_productive_tool_call();
+        assert_eq!(state.counters().rate_limited, before);
+        assert_eq!(state.productive_tool_calls_since_last_grace, 1);
+    }
+
+    #[test]
     fn observe_context_overflow_returns_compact_then_exhausts() {
         let mut state = LoopRetryState::with_limits(LoopRetryLimits {
             context_overflow: 1,

@@ -6,8 +6,8 @@ use std::time::Instant;
 use std::{collections::HashMap, collections::HashSet, collections::VecDeque};
 
 use eyre::Result;
-use octos_core::{Message, MessageRole, Task, TaskResult, TokenUsage};
-use octos_llm::{ChatConfig, ChatResponse, StopReason};
+use octos_core::{Message, MessageRole, Task, TaskFailure, TaskResult, TokenUsage};
+use octos_llm::{ChatConfig, ChatResponse, StopReason, ToolSpec};
 use octos_memory::{Episode, EpisodeOutcome};
 use tracing::{Instrument, info, info_span, warn};
 
@@ -19,6 +19,11 @@ use super::convergence::{
 use super::loop_compaction::{prepare_conversation_messages, prepare_task_messages};
 use super::loop_state::{LoopDecision, LoopRetryState, SHELL_SPIRAL_VARIANT};
 use super::message_repair::sanitize_tool_call_id;
+use super::progress_observation::{
+    EpisodeTracker, H07_TERMINAL_CODE, H07Terminal, MutationOutcome, ObservationConfidence,
+    ObservationDiagnostic, ObservationStatus, OperationFamily, ProgressClass, ProgressObservation,
+    verified_wait_fact,
+};
 use super::turn_state::{LoopRetryReason, LoopTurnState, attach_partial_usage};
 use super::verifier::{TurnLedger, ledger_entry_from_tool_result};
 use super::{Agent, AssistantSegmentProvenance, ConversationResponse, TASK_REPORTER, TokenTracker};
@@ -52,11 +57,41 @@ const MAX_TOKENS_EMPTY_RECOVERY_PROMPT: &str = "Your previous response reached t
 const MAX_TOKENS_EMPTY_EXHAUSTED_MESSAGE: &str = "[The model repeatedly reached the output token limit without producing any text or tool call — a degenerate or looping generation. Try a stronger model, reduce the context size, or configure an anti-repetition sampler (a non-zero temperature or a repeat penalty).]";
 const SHELL_RETRY_RECOVERY_THRESHOLD: usize = 4;
 
+fn usage_delta(before: &TokenUsage, after: &TokenUsage) -> TokenUsage {
+    TokenUsage {
+        input_tokens: after.input_tokens.saturating_sub(before.input_tokens),
+        output_tokens: after.output_tokens.saturating_sub(before.output_tokens),
+        reasoning_tokens: after
+            .reasoning_tokens
+            .saturating_sub(before.reasoning_tokens),
+        cache_read_tokens: after
+            .cache_read_tokens
+            .saturating_sub(before.cache_read_tokens),
+        cache_write_tokens: after
+            .cache_write_tokens
+            .saturating_sub(before.cache_write_tokens),
+    }
+}
+
 /// Keep projection provenance beside the immutable output log, not in prompt
 /// messages: compaction, voice rewrites and skipped user rows cannot shift it.
 struct TurnOutputLog {
     messages: Vec<Message>,
     provenance: AssistantSegmentProvenance,
+}
+
+struct HandledToolUse {
+    response: ChatResponse,
+    terminal: Option<H07Terminal>,
+}
+
+impl From<ChatResponse> for HandledToolUse {
+    fn from(response: ChatResponse) -> Self {
+        Self {
+            response,
+            terminal: None,
+        }
+    }
 }
 
 impl TurnOutputLog {
@@ -364,6 +399,133 @@ impl Drop for PersistentRetryStateGuard {
 }
 
 impl Agent {
+    fn reflection_budget_available(&self, iteration: u32, usage: &TokenUsage) -> bool {
+        let iteration_room = self.config.max_iterations == 0
+            || iteration.saturating_mul(5) < self.config.max_iterations.saturating_mul(4);
+        let used = usage
+            .input_tokens
+            .saturating_add(usage.output_tokens)
+            .saturating_add(usage.cache_read_tokens)
+            .saturating_add(usage.cache_write_tokens);
+        let token_room = self
+            .config
+            .max_tokens
+            .is_none_or(|limit| used.saturating_mul(5) < limit.saturating_mul(4));
+        iteration_room && token_room
+    }
+
+    /// Shared tools-disabled checkpoint path for conversation and task mode.
+    /// H07 semantic requests use a minimal prompt containing only the stable
+    /// system row plus bounded typed evidence; ordinary periodic checkpoints
+    /// keep the action request prefix for provider-cache reuse.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_convergence_checkpoint(
+        &self,
+        convergence: &mut ConvergenceController,
+        reason: &CheckpointReason,
+        user_goal: &str,
+        messages: &[Message],
+        tools_spec: &[ToolSpec],
+        call_config: &ChatConfig,
+        iteration: u32,
+        turn: &mut LoopTurnState,
+        tracker: Option<&TokenTracker>,
+    ) -> bool {
+        let total_usage = turn.total_usage().clone();
+        let prompt = ConvergenceController::prompt(reason, user_goal);
+        let mut checkpoint_messages = if reason.contains_semantic_no_progress() {
+            messages
+                .iter()
+                .find(|message| message.role == MessageRole::System)
+                .cloned()
+                .into_iter()
+                .collect::<Vec<_>>()
+        } else {
+            messages.to_vec()
+        };
+        checkpoint_messages.push(Message::user(prompt));
+
+        let mut checkpoint_config = call_config.clone();
+        checkpoint_config.tool_choice = octos_llm::ToolChoice::None;
+        if checkpoint_config.reasoning_effort.is_none() {
+            checkpoint_config.max_tokens =
+                Some(checkpoint_config.max_tokens.unwrap_or(1_024).min(1_024));
+        }
+
+        let before = turn.total_usage().clone();
+        let h07_reflection = reason.contains_semantic_no_progress();
+        if h07_reflection {
+            crate::agent::h07_metrics::record_reflection("requested");
+        }
+        match self
+            .call_llm_with_hooks_silent(
+                &checkpoint_messages,
+                tools_spec,
+                &checkpoint_config,
+                iteration,
+                &total_usage,
+                turn,
+            )
+            .await
+        {
+            Ok((reflection, _streamed, attributed_cost)) => {
+                turn.record_llm_usage(&reflection.usage, tracker, attributed_cost);
+                let usage = TokenUsage {
+                    input_tokens: reflection.usage.input_tokens,
+                    output_tokens: reflection.usage.output_tokens,
+                    reasoning_tokens: reflection.usage.reasoning_tokens,
+                    cache_read_tokens: reflection.usage.cache_read_tokens,
+                    cache_write_tokens: reflection.usage.cache_write_tokens,
+                };
+                let content = reflection.content.unwrap_or_default();
+                let usable = !content.trim().is_empty();
+                convergence.complete(turn.total_usage(), Some(&usage), content);
+                if h07_reflection {
+                    crate::agent::h07_metrics::record_reflection_tokens(&usage);
+                    crate::agent::h07_metrics::record_reflection(if usable {
+                        "completed"
+                    } else {
+                        "failed"
+                    });
+                }
+                if usable {
+                    tracing::info!(
+                        iteration,
+                        checkpoint = convergence.checkpoints(),
+                        "convergence checkpoint completed; continuing turn"
+                    );
+                } else {
+                    warn!(
+                        iteration,
+                        checkpoint = convergence.checkpoints(),
+                        "convergence checkpoint returned no text; falling back to the existing strategy hint"
+                    );
+                }
+                usable
+            }
+            Err(error) => {
+                // Rejected empty responses still carry usage into `turn` in
+                // llm_call.rs. Exclude that delta from action-token thresholds
+                // while charging it to the turn's actual budget.
+                let reflection_usage = usage_delta(&before, turn.total_usage());
+                if h07_reflection {
+                    crate::agent::h07_metrics::record_reflection_tokens(&reflection_usage);
+                    crate::agent::h07_metrics::record_reflection("failed");
+                }
+                let reflection_usage =
+                    (active_tokens(&reflection_usage) > 0).then_some(&reflection_usage);
+                convergence.complete(turn.total_usage(), reflection_usage, String::new());
+                warn!(
+                    %error,
+                    iteration,
+                    checkpoint = convergence.checkpoints(),
+                    "convergence checkpoint failed once; falling back to the existing strategy hint"
+                );
+                false
+            }
+        }
+    }
+
     /// Classify a raw error escaping the agent loop into a `HarnessError`,
     /// increment the `octos_loop_error_total{variant, recovery}` counter, and
     /// emit a structured error event via the local harness event sink (if
@@ -1096,7 +1258,7 @@ impl Agent {
                 // so bucket counters carry across turns for the same session.
                 let mut retry_state =
                     PersistentRetryStateGuard::new(self.persistent_retry_state.clone());
-                let mut loop_detector = LoopDetector::new(12);
+                let mut loop_detector = LoopDetector::new(12).with_no_progress(self.config.no_progress);
                 // #27d — turn-local malformed-tool-call feedback counter.
                 let mut malformed_feedback_used: u32 = 0;
                 // Tools may report that they have already exhausted all
@@ -1399,7 +1561,10 @@ impl Agent {
                     // then continue the same user turn with normal tools. A
                     // budget-grace iteration is exempt: its single remaining
                     // call belongs to the model's deliverable.
-                    let checkpoint_due = if grace_iteration {
+                    let checkpoint_due = if grace_iteration
+                        || convergence.semantic_reflection_pending()
+                            && !self.reflection_budget_available(iteration, &total_usage)
+                    {
                         None
                     } else {
                         convergence.due(&total_usage)
@@ -1412,94 +1577,24 @@ impl Agent {
                             checkpoints: convergence.checkpoints(),
                             reflecting: true,
                         });
-                        // The instruction is the final User row and the call
-                        // carries the SAME tool slice as the action call, so
-                        // the checkpoint request is the action request plus
-                        // appended rows: byte-identical stable prefix, same
-                        // epoch, a cache hit instead of a full re-prefill.
-                        // `tool_choice = None` still forbids tool use; a
-                        // provider that ignores it contributes only its text
-                        // (tool calls on the reflection are dropped below).
-                        let mut checkpoint_messages = messages.clone();
-                        checkpoint_messages.push(Message::user(ConvergenceController::prompt(
-                            &reason,
-                        )));
-                        // Derived from `call_config`, not the bare `config`:
-                        // the `context_management` payload is a stable cache
-                        // segment on Anthropic, so the checkpoint must carry
-                        // it exactly like the action call. The output cap
-                        // bounds reflection spend only when no reasoning
-                        // effort is configured — Anthropic derives the
-                        // `thinking` budget from `max_tokens`, and a changed
-                        // thinking config invalidates the message cache.
-                        let mut checkpoint_config = call_config.clone();
-                        checkpoint_config.tool_choice = octos_llm::ToolChoice::None;
-                        if checkpoint_config.reasoning_effort.is_none() {
-                            checkpoint_config.max_tokens = Some(
-                                checkpoint_config
-                                    .max_tokens
-                                    .unwrap_or(1_024)
-                                    .min(1_024),
-                            );
-                        }
-                        match self
-                            .call_llm_with_hooks_silent(
-                                &checkpoint_messages,
+                        if self
+                            .run_convergence_checkpoint(
+                                &mut convergence,
+                                &reason,
+                                user_content,
+                                &messages,
                                 &tools_spec,
-                                &checkpoint_config,
+                                &call_config,
                                 iteration,
-                                &total_usage,
                                 &mut turn,
+                                tracker,
                             )
                             .await
                         {
-                            Ok((reflection, _streamed, attributed_cost)) => {
-                                turn.record_llm_usage(
-                                    &reflection.usage,
-                                    tracker,
-                                    attributed_cost,
-                                );
-                                let content = reflection.content.unwrap_or_else(|| {
-                                    "Checkpoint returned no text; continue with one bounded next action."
-                                        .to_string()
-                                });
-                                let usage_after_checkpoint = turn.total_usage().clone();
-                                // The reflection's own usage is real spend for
-                                // the turn (recorded above) but is excluded
-                                // from the convergence thresholds.
-                                let reflection_usage = TokenUsage {
-                                    input_tokens: reflection.usage.input_tokens,
-                                    output_tokens: reflection.usage.output_tokens,
-                                    cache_read_tokens: reflection.usage.cache_read_tokens,
-                                    cache_write_tokens: reflection.usage.cache_write_tokens,
-                                    ..Default::default()
-                                };
-                                convergence.complete(
-                                    &usage_after_checkpoint,
-                                    Some(&reflection_usage),
-                                    content,
-                                );
-                                tracing::info!(
-                                    iteration,
-                                    checkpoint = convergence.checkpoints(),
-                                    "convergence checkpoint completed; continuing user turn"
-                                );
-                                continue 'agent_loop;
-                            }
-                            Err(error) => {
-                                // Reflection is a guardrail, not a new failure
-                                // mode. Rearm it and proceed with the normal
-                                // call when the checkpoint provider fails.
-                                warn!(%error, iteration, "convergence checkpoint failed open");
-                                convergence.complete(
-                                    turn.total_usage(),
-                                    None,
-                                    "Checkpoint failed; continue with one bounded, evidence-driven action."
-                                        .to_string(),
-                                );
-                            }
+                            continue 'agent_loop;
                         }
                     }
+                    let total_usage = turn.total_usage().clone();
 
                     if iteration == 1 && tools_spec.len() > 25 {
                         tracing::warn!(
@@ -1817,18 +1912,21 @@ impl Agent {
                                         pending_approval: None,
                                     });
                                 }
-                                // #1765 doom-loop guard: 3+ CONSECUTIVE
-                                // identical tool calls (same name + identical
-                                // arguments JSON) abort the turn before the
-                                // next LLM call. Checked ahead of the cycle
-                                // detector so the tighter threshold owns pure
-                                // identical streaks; the cycle detector keeps
-                                // owning alternating (cycle 2/3) patterns,
-                                // which never build a doom streak. When the
-                                // guard fires, the shell-spiral recovery is
-                                // still consulted first — extracting real
-                                // shell output from a retry spiral is a
-                                // strictly better outcome than a doom abort.
+                                if loop_detector.no_progress_enabled()
+                                    && verified_wait_fact(&self.tools, tc, None).is_some()
+                                {
+                                    // A runtime-confirmed live handle is
+                                    // result-aware. Its read must execute so
+                                    // one observation timeout cannot restart
+                                    // or terminate the underlying task.
+                                    continue;
+                                }
+                                // The legacy guard rejects the third identical
+                                // call. With H07 enabled, the same pre-call
+                                // slot requires two identical actual results.
+                                // Length-two/three cycles retain their own
+                                // two-stage recovery. A shell spiral is still
+                                // offered recovery before this guard returns.
                                 //
                                 // Verifier-configured agents are exempt: the
                                 // verifier lane classifies each repeated
@@ -1839,13 +1937,15 @@ impl Agent {
                                 // (see `verifier_repeating_note_changes_
                                 // next_planner_action`). The cycle detector
                                 // below still terminates true thrash there.
-                                let doom_streak = if self.verifier_config.is_some() {
-                                    None
-                                } else {
-                                    loop_detector.record_doom(&tc.name, &tc.arguments)
-                                };
+                                let doom_streak = loop_detector.before_call(
+                                    &tc.name,
+                                    &tc.arguments,
+                                    self.verifier_config.is_none(),
+                                );
                                 let cycle_warning = if doom_streak.is_some() {
                                     None
+                                } else if loop_detector.no_progress_enabled() {
+                                    loop_detector.record_non_exact_cycles(&tc.name, &tc.arguments)
                                 } else {
                                     loop_detector.record(&tc.name, &tc.arguments)
                                 };
@@ -1961,9 +2061,11 @@ impl Agent {
                                             "doom loop detected — aborting turn before the next LLM call (#1765)"
                                         );
                                         return Ok(ConversationResponse {
-                                            content: doom_loop_terminal_message(
-                                                &tc.name, streak,
-                                            ),
+                                            content: if loop_detector.no_progress_enabled() {
+                                                exact_repeat_terminal_message()
+                                            } else {
+                                                doom_loop_terminal_message(&tc.name, streak)
+                                            },
                                             reasoning_content: None,
                                             provider_metadata: None,
                                             token_usage: turn.total_usage().clone(),
@@ -2071,7 +2173,7 @@ impl Agent {
                             let mut iter_pending_approval: Option<
                                 crate::approval::PendingApprovalDraft,
                             > = None;
-                            let sanitized_response = match self
+                            let handled = match self
                                 .handle_tool_use(
                                     &response,
                                     &mut messages,
@@ -2090,7 +2192,7 @@ impl Agent {
                                 )
                                 .await
                             {
-                                Ok(sanitized) => sanitized,
+                                Ok(handled) => handled,
                                 Err(e) => {
                                     match self.handle_loop_error_with_dispatch(
                                         &e,
@@ -2103,9 +2205,49 @@ impl Agent {
                                     }
                                 }
                             };
+                            let sanitized_response = handled.response;
+
+                            if let Some(terminal) = handled.terminal {
+                                crate::agent::h07_metrics::record_terminal("conversation");
+                                self.emit_cost_update(&turn, &sanitized_response, attributed_cost);
+                                return Ok(ConversationResponse {
+                                    content: terminal.message,
+                                    reasoning_content: None,
+                                    provider_metadata: Some(
+                                        self.llm.provider_metadata_for_index(
+                                            sanitized_response.provider_index,
+                                        ),
+                                    ),
+                                    token_usage: turn.total_usage().clone(),
+                                    estimated_spend_usd: turn.priced_spend(),
+                                    files_modified,
+                                    files_to_send,
+                                    streamed,
+                                    assistant_segments: turn_output_log.provenance.clone(),
+                                    messages: turn_output_log.messages.clone(),
+                                    tool_results: tool_structured_metadata.clone(),
+                                    synthesized_from_spawn_only: false,
+                                    pending_approval: None,
+                                });
+                            }
+
+                            if let Some(request) =
+                                loop_detector.take_semantic_reflection_signal()
+                                && self.config.no_progress_reflection
+                                && self.verifier_config.is_none()
+                            {
+                                convergence.force(CheckpointReason::SemanticNoProgress {
+                                    category: request.category,
+                                    target: request.target,
+                                    evidence: request.evidence,
+                                });
+                            }
 
                             if let Some(tool_name) = loop_detector.take_peer_polling_signal() {
                                 convergence.force(CheckpointReason::PeerPolling { tool_name });
+                            }
+                            if let Some(tool_name) = loop_detector.take_verified_wait_signal() {
+                                convergence.force(CheckpointReason::VerifiedWait { tool_name });
                             }
 
                             if let Some(churn) = loop_detector.take_file_churn_signal() {
@@ -2596,9 +2738,16 @@ impl Agent {
             });
 
             let mut messages = self.build_initial_messages(task).await;
+            let reflection_goal = messages
+                .iter()
+                .rev()
+                .find(|message| message.role == MessageRole::User)
+                .map(|message| message.content.clone())
+                .unwrap_or_default();
             let mut files_modified = Vec::new();
             let mut files_to_send = Vec::new();
             let mut turn = LoopTurnState::new(task_start);
+            let mut convergence = ConvergenceController::semantic_only(task_start);
             let mut max_token_continuations = 0usize;
             let mut max_token_fragments = Vec::new();
             // M6.2: per-run retry-bucket state machine. Same instance lives
@@ -2613,7 +2762,7 @@ impl Agent {
             // PR #1363: task-loop gets its own detector so handle_tool_use
             // can run the no-progress soft check on tool results here too.
             // Matches the conversation-loop's window of 12.
-            let mut loop_detector = LoopDetector::new(12);
+            let mut loop_detector = LoopDetector::new(12).with_no_progress(self.config.no_progress);
             let mut turn_ledger = self.new_turn_ledger();
             let config = self.chat_config();
             let mut candidate_revision = 0u64;
@@ -2621,6 +2770,11 @@ impl Agent {
             let mut pending_repair: Option<(RepairTicket, CompletionReceipt)> = None;
 
             loop {
+                messages.retain(|message| {
+                    !(message.role == MessageRole::User
+                        && is_checkpoint_context(&message.content))
+                });
+                let mut grace_iteration = false;
                 if let Some(stop) = turn.check_budget(self, activity.as_ref()) {
                     let stop_iteration = turn.iteration();
                     if pending_repair.is_some() || !self.try_budget_grace_call(
@@ -2664,6 +2818,7 @@ impl Agent {
                         return Ok(GatedTaskResult { task_result: TaskResult {
                             schema_version: octos_core::TASK_RESULT_SCHEMA_VERSION,
                             success: false,
+                            failure: None,
                             output,
                             files_modified,
                             files_to_send,
@@ -2671,6 +2826,7 @@ impl Agent {
                             token_usage: turn.total_usage().clone(),
                         }, decision });
                     }
+                    grace_iteration = true;
                 }
 
                 let ticket_text = pending_repair.take().map(|(ticket, _)| {
@@ -2715,6 +2871,9 @@ impl Agent {
                     },
                     iteration,
                 );
+                if let Some(context) = convergence.context_message() {
+                    messages.push(Message::user(context));
+                }
                 let total_usage = turn.total_usage().clone();
                 if let Some((ticket, marker, ticket_text)) = ticket_text {
                     if !messages.iter().any(|message| {
@@ -2752,6 +2911,35 @@ impl Agent {
 
                 // M8.5 tier 2: decorate the config with the Anthropic header.
                 let call_config = with_tier2_context_management(&config, self);
+                // Task mode has no periodic checkpoint schedule. Only an H07
+                // `switch_required` signal can make this due, and a final
+                // budget-grace iteration always belongs to the deliverable.
+                let checkpoint_due = if grace_iteration
+                    || convergence.semantic_reflection_pending()
+                        && !self.reflection_budget_available(iteration, &total_usage)
+                {
+                    None
+                } else {
+                    convergence.due(&total_usage)
+                };
+                if let Some(reason) = checkpoint_due
+                    && self
+                        .run_convergence_checkpoint(
+                            &mut convergence,
+                            &reason,
+                            &reflection_goal,
+                            &messages,
+                            &tools_spec,
+                            &call_config,
+                            iteration,
+                            &mut turn,
+                            tracker,
+                        )
+                        .await
+                {
+                    continue;
+                }
+                let total_usage = turn.total_usage().clone();
                 let (mut response, _streamed, attributed_cost) = match self
                     .call_llm_with_hooks(
                         &messages,
@@ -2974,13 +3162,45 @@ impl Agent {
                         return Ok(GatedTaskResult { task_result: result, decision: gate_decision });
                     }
                     StopReason::ToolUse => {
+                        if self.config.no_progress {
+                            for tc in &response.tool_calls {
+                                if verified_wait_fact(&self.tools, tc, None).is_some() {
+                                    continue;
+                                }
+                                if loop_detector.before_call(
+                                    &tc.name,
+                                    &tc.arguments,
+                                    self.verifier_config.is_none(),
+                                ).is_some() {
+                                    self.emit_cost_update(&turn, &response, attributed_cost);
+                                    self.reporter().report(ProgressEvent::TaskCompleted {
+                                        success: false,
+                                        iterations: iteration,
+                                        duration: task_start.elapsed(),
+                                    });
+                                    return Ok(TaskResult {
+                                        schema_version: octos_core::TASK_RESULT_SCHEMA_VERSION,
+                                        success: false,
+                                        failure: Some(TaskFailure {
+                                            code: H07_TERMINAL_CODE.to_owned(),
+                                            retryable: false,
+                                        }),
+                                        output: exact_repeat_terminal_message(),
+                                        files_modified,
+                                        files_to_send,
+                                        subtasks: Vec::new(),
+                                        token_usage: turn.total_usage().clone(),
+                                    });
+                                }
+                            }
+                        }
                         // Task loop never emits the synth-ack so the per-call
                         // success-bit sink is unused here — pass `None`. (The
                         // conversation loop wires this up to the spawn_only
                         // gate; see the matching call site above.) Codex
                         // round-3: ignore the sanitized response too — task
                         // loop has no synth-ack gate that would need it.
-                        if let Err(e) = self
+                        let handled = match self
                             .handle_tool_use(
                                 &response,
                                 &mut messages,
@@ -3002,7 +3222,8 @@ impl Agent {
                             )
                             .await
                         {
-                            match self.handle_loop_error_with_dispatch(
+                            Ok(handled) => handled,
+                            Err(e) => match self.handle_loop_error_with_dispatch(
                                 &e,
                                 &mut retry_state,
                                 iteration,
@@ -3010,7 +3231,39 @@ impl Agent {
                             ) {
                                 LoopErrorAction::Retry => continue,
                                 LoopErrorAction::Bail => return Err(attach_partial_usage(e, turn.total_usage().clone())),
-                            }
+                            },
+                        };
+                        if let Some(terminal) = handled.terminal {
+                            crate::agent::h07_metrics::record_terminal("task");
+                            self.emit_cost_update(&turn, &handled.response, attributed_cost);
+                            self.reporter().report(ProgressEvent::TaskCompleted {
+                                success: false,
+                                iterations: iteration,
+                                duration: task_start.elapsed(),
+                            });
+                            return Ok(TaskResult {
+                                schema_version: octos_core::TASK_RESULT_SCHEMA_VERSION,
+                                success: false,
+                                failure: Some(TaskFailure {
+                                    code: H07_TERMINAL_CODE.to_owned(),
+                                    retryable: false,
+                                }),
+                                output: terminal.message,
+                                files_modified,
+                                files_to_send,
+                                subtasks: Vec::new(),
+                                token_usage: turn.total_usage().clone(),
+                            });
+                        }
+                        if let Some(request) = loop_detector.take_semantic_reflection_signal()
+                            && self.config.no_progress_reflection
+                            && self.verifier_config.is_none()
+                        {
+                            convergence.force(CheckpointReason::SemanticNoProgress {
+                                category: request.category,
+                                target: request.target,
+                                evidence: request.evidence,
+                            });
                         }
                         if let Err(e) = self
                             .maybe_run_verifier_after_tool_batch(
@@ -3154,6 +3407,7 @@ impl Agent {
         TaskResult {
             schema_version: octos_core::TASK_RESULT_SCHEMA_VERSION,
             success,
+            failure: None,
             output,
             files_modified,
             files_to_send,
@@ -3240,7 +3494,7 @@ impl Agent {
         //   matched call is denied with an "approval not available" tool
         //   result instead of being silently bypassed.
         pending_approval_out: Option<&mut Option<crate::approval::PendingApprovalDraft>>,
-    ) -> Result<ChatResponse> {
+    ) -> Result<HandledToolUse> {
         // Sanitize tool_call_id characters: some providers (e.g. Moonshot/kimi)
         // generate IDs like "admin_view_sessions:11" which OpenAI rejects (only
         // letters, numbers, underscores, dashes accepted). This is a documented
@@ -3360,7 +3614,7 @@ impl Agent {
                                  host; denying instead of suspending"
                             );
                         }
-                        return Ok(response);
+                        return Ok(response.into());
                     }
                     Ok(None) => {}
                     Err(err) => {
@@ -3385,7 +3639,7 @@ impl Agent {
                             log.extend(placeholders.iter().cloned());
                         }
                         messages.extend(placeholders);
-                        return Ok(response);
+                        return Ok(response.into());
                     }
                 }
             }
@@ -3411,6 +3665,7 @@ impl Agent {
         let mut tool_send_files = Vec::new();
         let mut tool_tokens = TokenUsage::default();
         let mut tool_metadata: Vec<(String, serde_json::Value)> = Vec::new();
+        let mut tool_observations = Vec::new();
         // Codex round-2 MAJOR 2 (PR #1187 fixup): collect per-tool-call
         // success bits across every batch in this turn. Threaded out via
         // `tool_success_by_id` so the synth-ack gate can read the
@@ -3428,7 +3683,15 @@ impl Agent {
                 batch_tokens,
                 batch_metadata,
                 batch_success,
+                batch_observations,
             ) = self.execute_tools(&batch_response).await?;
+            debug_assert!(
+                batch_response
+                    .tool_calls
+                    .iter()
+                    .zip(&batch_observations)
+                    .all(|(call, observation)| call.id == observation.call_id)
+            );
             tool_messages.extend(batch_messages);
             tool_files.extend(batch_files);
             tool_send_files.extend(batch_send_files);
@@ -3438,6 +3701,7 @@ impl Agent {
             tool_tokens.cache_write_tokens += batch_tokens.cache_write_tokens;
             tool_metadata.extend(batch_metadata);
             tool_success.extend(batch_success);
+            tool_observations.extend(batch_observations);
         }
         if let Some(terminal_tools) = terminal_tools_for_turn {
             let tool_name_by_id: HashMap<&str, &str> = limited_response
@@ -3465,6 +3729,40 @@ impl Agent {
             sink.extend(tool_success);
         }
 
+        let mut seen_ids = HashSet::new();
+        let duplicate_ids: HashSet<&str> = limited_response
+            .tool_calls
+            .iter()
+            .filter_map(|call| (!seen_ids.insert(call.id.as_str())).then_some(call.id.as_str()))
+            .collect();
+        for ((call, message), observation) in limited_response
+            .tool_calls
+            .iter()
+            .zip(&tool_messages)
+            .zip(&mut tool_observations)
+        {
+            if duplicate_ids.contains(call.id.as_str()) {
+                observation.downgrade_ambiguous_read(&message.content);
+            }
+        }
+        let ordered_observations = order_progress_observations(
+            &response,
+            &limited_response,
+            tool_observations,
+            &blocked_messages,
+        );
+        let conflict_count = ordered_observations
+            .iter()
+            .filter(|observation| {
+                observation.diagnostic == Some(ObservationDiagnostic::ConflictingMutationFields)
+            })
+            .count();
+        if conflict_count > 0 {
+            tracing::debug!(
+                conflicting_mutation_fields = conflict_count,
+                "H07 observation diagnostics"
+            );
+        }
         let mut merged = merge_tool_messages_in_order(
             &response,
             &limited_response,
@@ -3472,14 +3770,11 @@ impl Agent {
             blocked_messages,
         );
 
-        // PR #1363: OpenClaw-style no-progress check. For each Tool
-        // message we just produced, record `(tool_name, args, result)`
-        // in the result-aware ring. If the last 3 records match, append
-        // a soft NO_PROGRESS hint to that tool message's content so the
-        // LLM sees it on its next iteration. Distinguishes a stuck loop
-        // (identical (args, result) repeated) from a legitimate poll
-        // (same args, evolving result). Non-terminating — the hard
-        // cycle detector at the caller's pre-call site is the backstop.
+        // The H07 path shares exact-result history between both loops. The
+        // legacy third-result hint remains unchanged when H07 is disabled.
+        let mut detached_hint = None;
+        let mut terminal = None;
+        let mut progress_by_index = vec![None; merged.len()];
         {
             use std::collections::HashMap;
             let id_to_call: HashMap<&str, (&str, &serde_json::Value)> = response
@@ -3493,7 +3788,7 @@ impl Agent {
                 .collect();
             let stated_intent = response.content.as_deref();
             let mut turn_ledger = turn_ledger;
-            for message in merged.iter_mut() {
+            for (index, message) in merged.iter_mut().enumerate() {
                 if message.role != MessageRole::Tool {
                     continue;
                 }
@@ -3504,18 +3799,86 @@ impl Agent {
                     continue;
                 };
                 let result_before_hint = message.content.clone();
-                let repeating = if let Some(hint) =
-                    loop_detector.record_result(name, args, &result_before_hint)
+                let synchronous_result =
+                    ordered_observations.get(index).is_some_and(|observation| {
+                        (observation.status == ObservationStatus::Success
+                            || observation.status == ObservationStatus::Failed
+                                && matches!(
+                                    observation.outcome,
+                                    Some(MutationOutcome::NoMatch | MutationOutcome::Ambiguous)
+                                ))
+                            && observation.call_id == id
+                            && observation.family != OperationFamily::Wait
+                            && !duplicate_ids.contains(id)
+                    });
+                let trusted_read_key = ordered_observations.get(index).and_then(|observation| {
+                    (observation.family == OperationFamily::Read
+                        && observation.call_id == id
+                        && observation.confidence != ObservationConfidence::ExactTextFallback
+                        && observation.state_digest.is_some())
+                    .then_some(observation.evidence_key.as_str())
+                });
+                let verified_wait_key = loop_detector
+                    .no_progress_enabled()
+                    .then(|| {
+                        ordered_observations.get(index).and_then(|observation| {
+                            (observation.family == OperationFamily::Wait
+                                && observation.call_id == id
+                                && observation.confidence == ObservationConfidence::TrustedAdapter)
+                                .then(|| observation.wait_key.as_deref())
+                                .flatten()
+                        })
+                    })
+                    .flatten();
+                let exact_hint = if let Some(wait_key) = verified_wait_key {
+                    loop_detector.after_verified_wait(name, args, &result_before_hint, wait_key)
+                } else {
+                    loop_detector.after_result(
+                        name,
+                        args,
+                        &result_before_hint,
+                        trusted_read_key,
+                        synchronous_result,
+                    )
+                };
+                let semantic_outcome = if loop_detector.no_progress_enabled()
+                    && (synchronous_result || verified_wait_key.is_some())
                 {
-                    message.content.push_str(&hint);
+                    ordered_observations
+                        .get(index)
+                        .map(|observation| loop_detector.observe_semantic(observation))
+                } else {
+                    None
+                };
+                if let Some(outcome) = semantic_outcome.as_ref() {
+                    progress_by_index[index] = Some(outcome.class);
+                    if terminal.is_none() {
+                        terminal = ordered_observations.get(index).and_then(|observation| {
+                            EpisodeTracker::terminal_for(observation, outcome)
+                        });
+                    }
+                }
+                let semantic_hint = semantic_outcome.and_then(|outcome| outcome.hint);
+                let repeating = if let Some(hint) = semantic_hint.or(exact_hint) {
+                    if loop_detector.no_progress_enabled()
+                        && (self.output_state.policy.enabled
+                            && self.output_state.lookup(id, &result_before_hint).is_some()
+                            || message.content.len() + hint.len()
+                                > octos_core::tool_output_limit(name))
+                    {
+                        detached_hint.get_or_insert(hint);
+                    } else {
+                        message.content.push_str(&hint);
+                    }
                     true
                 } else {
                     false
                 };
-                if let Some(hint) = loop_detector.record_file_mutation(
+                if let Some(hint) = loop_detector.record_file_mutation_progress(
                     name,
                     args,
                     success_by_id.get(id).copied().unwrap_or(false),
+                    progress_by_index[index],
                 ) {
                     message.content.push_str(&hint);
                 }
@@ -3533,13 +3896,20 @@ impl Agent {
             }
         }
 
-        // M6.2: record a productive-tool-call signal per merged Tool message
-        // so the `LoopRetryState` grace-call path sees the loop making progress.
-        // A tool message counts as productive when it is neither an error
-        // ("Error:" prefix), a panic, a timeout, nor a hook/session-limit
-        // block — i.e. the tool produced output the LLM can act on.
-        for message in &merged {
-            if message.role == MessageRole::Tool && is_productive_tool_message(&message.content) {
+        // H07 authoritative observations own grace classification. This keeps
+        // no-change, repeated reads and typed failures from gaining grace via
+        // a long body, an exit-code marker, or an appended H07 hint. Tools
+        // without typed facts retain the legacy text heuristic.
+        for (index, message) in merged.iter().enumerate() {
+            let observation = ordered_observations.get(index);
+            if message.role == MessageRole::Tool
+                && should_record_productive_tool_call(
+                    loop_detector.no_progress_enabled(),
+                    observation,
+                    progress_by_index[index],
+                    &message.content,
+                )
+            {
                 retry_state.record_productive_tool_call();
             }
         }
@@ -3556,6 +3926,11 @@ impl Agent {
             log.extend(merged.iter().cloned());
         }
         messages.extend(merged);
+        if let Some(hint) = detached_hint {
+            // A separate prompt row is counted by H03's final input budget.
+            // The trusted read/recall envelope stays byte-for-byte intact.
+            messages.push(Message::system(hint));
+        }
         files_modified.extend(tool_files);
         if let Some(files_to_send) = files_to_send {
             files_to_send.extend(tool_send_files);
@@ -3576,7 +3951,7 @@ impl Agent {
         // Codex round-3: return the sanitized response so the caller's
         // synth-ack gate sees the SAME tool_call_ids that the success-bit
         // sink was keyed by. See doc-comment on this fn.
-        Ok(response)
+        Ok(HandledToolUse { response, terminal })
     }
 }
 
@@ -3741,6 +4116,27 @@ fn is_productive_tool_message(content: &str) -> bool {
     trimmed.len() >= 128 && !trimmed.to_ascii_lowercase().contains("failed to")
 }
 
+fn should_record_productive_tool_call(
+    no_progress_enabled: bool,
+    observation: Option<&ProgressObservation>,
+    progress: Option<ProgressClass>,
+    content: &str,
+) -> bool {
+    if no_progress_enabled
+        && observation.is_some_and(ProgressObservation::has_authoritative_progress)
+    {
+        return matches!(
+            progress,
+            Some(
+                ProgressClass::ValidationImproved
+                    | ProgressClass::StateChanged
+                    | ProgressClass::EvidenceChanged
+            )
+        );
+    }
+    is_productive_tool_message(content)
+}
+
 fn check_per_tool_limit(
     usage: &crate::session::SessionUsage,
     tool_name: &str,
@@ -3802,6 +4198,30 @@ fn merge_tool_messages_in_order(
     }
     ordered.extend(executed_by_id);
     ordered
+}
+
+fn order_progress_observations(
+    original: &ChatResponse,
+    limited: &ChatResponse,
+    executed: Vec<ProgressObservation>,
+    blocked: &[Message],
+) -> Vec<ProgressObservation> {
+    let mut executed = executed.into_iter();
+    let mut allowed = limited.tool_calls.iter().peekable();
+    let mut blocked = blocked.iter();
+    original
+        .tool_calls
+        .iter()
+        .map(|call| {
+            if allowed.peek().is_some_and(|next| *next == call) {
+                allowed.next();
+                executed.next().expect("executed call has an observation")
+            } else {
+                let message = blocked.next().expect("blocked call has a placeholder");
+                ProgressObservation::placeholder(call, ObservationStatus::Blocked, &message.content)
+            }
+        })
+        .collect()
 }
 
 fn recover_shell_retry(
@@ -4232,6 +4652,10 @@ fn doom_loop_terminal_message(tool_name: &str, streak: usize) -> String {
          different approach — vary the arguments, use a different tool, or rephrase the \
          request."
     )
+}
+
+fn exact_repeat_terminal_message() -> String {
+    "[NO PROGRESS] Two executions with identical arguments returned the same result. The third identical request was skipped before execution. Choose a different diagnostic action or finish with the evidence already available.".to_owned()
 }
 
 /// A tool that has already exhausted its own retries can mark the failure as

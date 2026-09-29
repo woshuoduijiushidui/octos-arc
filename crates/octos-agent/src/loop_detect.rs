@@ -8,22 +8,27 @@ use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-/// Soft "no-progress" hint appended to a tool result when the same
-/// (name, args, result) triple has been seen 3 times in a row. The
-/// LLM sees this on its next iteration as part of the most recent
-/// tool result — it does not terminate the turn. Hard cycle detection
-/// (existing logic) catches anything that survives this nudge.
+use crate::agent::progress_observation::{
+    EpisodeOutcome, EpisodeTracker, ObservationConfidence, OperationFamily, ProgressClass,
+    ProgressDecision, ProgressObservation, SemanticReflectionRequest,
+};
+
+/// Legacy soft "no-progress" hint, used when H07 is disabled. It fires
+/// after the third identical (name, args, result) triple and does not
+/// terminate the turn. H07 uses [`H07_EXACT_HINT`] after the second result.
 ///
 /// This is the OpenClaw lesson — distinguish "no progress" (same args
 /// AND same result) from legitimate polling (same args, different
 /// result over time). The production loop on mini3 session 8w2ime had
 /// kimi-k2.5 calling `check_workspace_contract` 5 times with the same
 /// args, all returning identical 4 KB trees. With result hashing, that
-/// fires at iter 3 — early enough to nudge before the hard cycle
-/// detector terminates the turn at iter 4. Legitimate polls like
+/// fires at iter 3 on paths that permit it. Legitimate polls like
 /// `check_background_tasks` (which return different statuses while a
 /// background job runs) are unaffected.
 pub const NO_PROGRESS_HINT: &str = "\n\n[NO PROGRESS] You have now called this tool 3 times in a row with identical arguments AND received identical results. Calling it again will produce the same result. To make progress, either switch to a different tool (read_file / list_dir / view_image for file content) or finish the turn with the information you already have.";
+pub const H07_EXACT_HINT: &str = "\n\n[NO PROGRESS] This tool returned the same result twice for identical arguments. Choose a different diagnostic action or finish with the evidence already available.";
+
+pub const VERIFIED_WAIT_HINT: &str = "\n\n[VERIFIED WAIT] The same live task handle returned unchanged output three times. Do not busy-wait or restart the task from this observation alone. Do independent work or use a bounded wait before reading this handle again.";
 
 const PEER_POLLING_HINT: &str = "\n\n[PEER POLLING] Three consecutive reads returned the same peer snapshot. Peer work is asynchronous: this does not prove failure or that a later read cannot change. Do not busy-wait. Reflect on the reported peer state, do independent work or use an available bounded wait, and gather fresh evidence before claiming completion.";
 
@@ -39,13 +44,10 @@ fn is_peer_polling_tool(tool_name: &str) -> bool {
 /// burn tokens. Mirrors opencode's `DOOM_LOOP_THRESHOLD = 3`
 /// (`packages/opencode/src/session/processor.ts:29`).
 ///
-/// Scope: the guard is wired into the CONVERSATION loop
-/// (`process_message_inner`) only. Asynchronous peer reads use result-aware
-/// reflection instead: identical arguments cannot prove an immutable result.
-/// The background task loop
-/// deliberately keeps its softer treatment (the `record_result`
-/// no-progress hint) because unattended tasks legitimately poll
-/// status tools with identical arguments while a background job runs.
+/// With H07 disabled, this guard is wired into the conversation loop only.
+/// H07 instead guards exact synchronous results in both loops. Asynchronous
+/// peer reads use result-aware reflection: identical arguments cannot prove
+/// an immutable result.
 /// Verifier-configured agents are likewise exempt — the verifier lane
 /// injects a `verdict: Repeating` note at this exact streak length and
 /// the planner self-corrects, which is a richer recovery than an abort.
@@ -65,6 +67,11 @@ pub struct FileChurnSignal {
 
 /// Tracks tool call patterns and detects loops.
 pub struct LoopDetector {
+    no_progress: bool,
+    episodes: EpisodeTracker,
+    exact_last_call: Option<u64>,
+    exact_last_result: Option<u64>,
+    exact_result_streak: usize,
     /// Ring buffer of recent tool call signatures (name + args).
     /// Used by `record()` for hard cycle detection.
     signatures: Vec<u64>,
@@ -89,12 +96,26 @@ pub struct LoopDetector {
     /// An unchanged asynchronous peer snapshot requests reflection, not a
     /// fabricated final or an abort before its next read can observe progress.
     pending_peer_polling: Option<String>,
+    /// Repeated unchanged reads of a runtime-confirmed live task ask for one
+    /// bounded reflection while preserving the running task.
+    verified_wait_signatures: Vec<u64>,
+    pending_verified_wait: Option<String>,
+    /// H07 policy signal. The episode state emits it at `switch_required`;
+    /// this turn-local latch bounds strategy reflection to one request even
+    /// when a tool batch contains several stalled episodes.
+    semantic_reflection_requested: bool,
+    pending_semantic_reflection: Option<SemanticReflectionRequest>,
 }
 
 impl LoopDetector {
     /// Create a new detector with the given window size.
     pub fn new(window: usize) -> Self {
         Self {
+            no_progress: false,
+            episodes: EpisodeTracker::default(),
+            exact_last_call: None,
+            exact_last_result: None,
+            exact_result_streak: 0,
             signatures: Vec::with_capacity(window * 2),
             result_signatures: Vec::with_capacity(window * 2),
             window,
@@ -108,7 +129,164 @@ impl LoopDetector {
                 .unwrap_or(5),
             pending_file_churn: None,
             pending_peer_polling: None,
+            verified_wait_signatures: Vec::with_capacity(window * 2),
+            pending_verified_wait: None,
+            semantic_reflection_requested: false,
+            pending_semantic_reflection: None,
         }
+    }
+
+    pub fn with_no_progress(mut self, enabled: bool) -> Self {
+        self.no_progress = enabled;
+        self
+    }
+
+    pub fn no_progress_enabled(&self) -> bool {
+        self.no_progress
+    }
+
+    pub(crate) fn observe_semantic(&mut self, observation: &ProgressObservation) -> EpisodeOutcome {
+        let outcome = self.episodes.observe(observation);
+        if outcome.episode_created {
+            crate::agent::h07_metrics::record_episode_created();
+        }
+        if !self.semantic_reflection_requested
+            && let Some(request) = outcome.request_reflection.clone()
+        {
+            self.semantic_reflection_requested = true;
+            self.pending_semantic_reflection = Some(request);
+        }
+        let family = match observation.family {
+            OperationFamily::Read => "read",
+            OperationFamily::Search => "search",
+            OperationFamily::Mutate => "mutate",
+            OperationFamily::Validate => "validate",
+            OperationFamily::Execute => "execute",
+            OperationFamily::Wait => "wait",
+            OperationFamily::Other => "other",
+        };
+        let decision = match outcome.decision {
+            ProgressDecision::Continue => "continue",
+            ProgressDecision::Hint => "hint",
+            ProgressDecision::SwitchRequired => "switch_required",
+            ProgressDecision::TerminalNonRetryable => "terminal_non_retryable",
+        };
+        let progress_class = match outcome.class {
+            ProgressClass::ValidationImproved => "validation_improved",
+            ProgressClass::StateChanged => "state_changed",
+            ProgressClass::NoProgress => "no_progress",
+            ProgressClass::EvidenceChanged => "evidence_changed",
+            ProgressClass::VerifiedWait => "verified_wait",
+            ProgressClass::Regressed => "regressed",
+            ProgressClass::Unknown => "unknown",
+        };
+        let confidence = match observation.confidence {
+            ObservationConfidence::Typed => "typed",
+            ObservationConfidence::TrustedAdapter => "trusted_adapter",
+            ObservationConfidence::ExactTextFallback => "exact_text_fallback",
+        };
+        let reflection_status = if outcome.request_reflection.is_some() {
+            "requested"
+        } else {
+            "not_requested"
+        };
+        crate::agent::h07_metrics::record_observation(
+            family,
+            progress_class,
+            decision,
+            confidence,
+            reflection_status,
+        );
+        match outcome.decision {
+            ProgressDecision::Hint => crate::agent::h07_metrics::record_decision("hint"),
+            ProgressDecision::SwitchRequired => {
+                crate::agent::h07_metrics::record_decision("switch")
+            }
+            ProgressDecision::TerminalNonRetryable => {
+                crate::agent::h07_metrics::record_decision("terminal")
+            }
+            ProgressDecision::Continue => {}
+        }
+        outcome
+    }
+
+    pub(crate) fn take_semantic_reflection_signal(&mut self) -> Option<SemanticReflectionRequest> {
+        self.pending_semantic_reflection.take()
+    }
+
+    /// Shared pre-call exact guard for conversation and task loops.
+    pub fn before_call(
+        &mut self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        legacy_doom_enabled: bool,
+    ) -> Option<usize> {
+        if !self.no_progress {
+            return legacy_doom_enabled
+                .then(|| self.record_doom(tool_name, args))
+                .flatten();
+        }
+        if !legacy_doom_enabled
+            || matches!(
+                tool_name,
+                "peer_gather" | "peer_list" | "check_background_tasks"
+            )
+        {
+            self.exact_result_streak = 0;
+            return None;
+        }
+        let signature = Self::signature(tool_name, args);
+        if self.exact_last_call != Some(signature) {
+            self.exact_result_streak = 0;
+            return None;
+        }
+        let rejected = (self.exact_result_streak >= 2).then_some(3);
+        if rejected.is_some() {
+            crate::agent::h07_metrics::record_decision("pre_call_reject");
+        }
+        rejected
+    }
+
+    /// Shared post-result exact history. A blocked or ambiguous result cannot
+    /// establish that another execution would return the same result.
+    pub fn after_result(
+        &mut self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        result: &str,
+        trusted_read_key: Option<&str>,
+        synchronous_result: bool,
+    ) -> Option<String> {
+        if !self.no_progress {
+            return self.record_result(tool_name, args, result);
+        }
+        if matches!(
+            tool_name,
+            "peer_gather" | "peer_list" | "check_background_tasks"
+        ) {
+            self.exact_result_streak = 0;
+            return self.record_result(tool_name, args, result);
+        }
+        if !synchronous_result {
+            self.exact_result_streak = 0;
+            return None;
+        }
+        let call = Self::signature(tool_name, args);
+        let result =
+            Self::signature_with_result(tool_name, args, trusted_read_key.unwrap_or(result));
+        self.exact_result_streak =
+            if self.exact_last_call == Some(call) && self.exact_last_result == Some(result) {
+                self.exact_result_streak.saturating_add(1)
+            } else {
+                1
+            };
+        self.exact_last_call = Some(call);
+        self.exact_last_result = Some(result);
+        let hint = (self.exact_result_streak == 2).then(|| H07_EXACT_HINT.to_owned());
+        if hint.is_some() {
+            crate::agent::h07_metrics::record_decision("hint");
+        }
+        hint
     }
 
     /// Record a successful file-mutating tool call. Returns a model-facing
@@ -148,12 +326,67 @@ impl LoopDetector {
         ))
     }
 
+    /// H07 counts churn only when trusted final-state evidence proves that a
+    /// file reached a new confirmed version. With H07 disabled, preserve the
+    /// legacy success-based behavior for A compatibility.
+    pub(crate) fn record_file_mutation_progress(
+        &mut self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        success: bool,
+        progress: Option<ProgressClass>,
+    ) -> Option<String> {
+        if !self.no_progress {
+            return self.record_file_mutation(tool_name, args, success);
+        }
+        if progress != Some(ProgressClass::StateChanged) {
+            return None;
+        }
+        self.record_file_mutation(tool_name, args, true)
+    }
+
     pub fn take_file_churn_signal(&mut self) -> Option<FileChurnSignal> {
         self.pending_file_churn.take()
     }
 
     pub fn take_peer_polling_signal(&mut self) -> Option<String> {
         self.pending_peer_polling.take()
+    }
+
+    /// Record an observed read of a runtime-confirmed live task. Exact-call
+    /// termination never owns this lane: unchanged output requests a bounded
+    /// reflection, while changed output naturally breaks the streak.
+    pub(crate) fn after_verified_wait(
+        &mut self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        result: &str,
+        wait_key: &str,
+    ) -> Option<String> {
+        self.exact_result_streak = 0;
+        self.exact_last_call = None;
+        self.exact_last_result = None;
+        let signature =
+            Self::signature_with_result(tool_name, args, &format!("{wait_key}:{result}"));
+        self.verified_wait_signatures.push(signature);
+        if self.verified_wait_signatures.len() > self.window * 2 {
+            let drain_to = self.verified_wait_signatures.len() - self.window;
+            self.verified_wait_signatures.drain(..drain_to);
+        }
+        let len = self.verified_wait_signatures.len();
+        if len >= 3 {
+            let last = &self.verified_wait_signatures[len - 3..];
+            if last[0] == last[1] && last[1] == last[2] {
+                self.verified_wait_signatures.clear();
+                self.pending_verified_wait = Some(tool_name.to_owned());
+                return Some(VERIFIED_WAIT_HINT.to_owned());
+            }
+        }
+        None
+    }
+
+    pub(crate) fn take_verified_wait_signal(&mut self) -> Option<String> {
+        self.pending_verified_wait.take()
     }
 
     /// #1765: record a tool call for the doom-loop guard and return the
@@ -186,7 +419,26 @@ impl LoopDetector {
     /// Record a tool call and check for repeating patterns.
     /// Returns a warning message if a loop is detected.
     pub fn record(&mut self, tool_name: &str, args: &serde_json::Value) -> Option<String> {
-        if is_peer_polling_tool(tool_name) {
+        self.record_cycles(tool_name, args, 1)
+    }
+
+    pub fn record_non_exact_cycles(
+        &mut self,
+        tool_name: &str,
+        args: &serde_json::Value,
+    ) -> Option<String> {
+        self.record_cycles(tool_name, args, 2)
+    }
+
+    fn record_cycles(
+        &mut self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        min_cycle_len: usize,
+    ) -> Option<String> {
+        if is_peer_polling_tool(tool_name)
+            || min_cycle_len > 1 && tool_name == "check_background_tasks"
+        {
             // Recorded AFTER execution with its result hash instead. Keep the
             // history so genuine mixed mutating-tool cycles remain protected.
             return None;
@@ -204,7 +456,13 @@ impl LoopDetector {
         let window = &self.signatures[len - check_len..];
 
         // Check for cycles of length 1, 2, and 3
-        for cycle_len in 1..=3 {
+        for cycle_len in min_cycle_len..=3 {
+            if min_cycle_len > 1 && check_len >= cycle_len * 3 {
+                let pattern = &window[check_len - cycle_len * 3..check_len - cycle_len * 2];
+                if pattern.iter().all(|signature| *signature == pattern[0]) {
+                    continue;
+                }
+            }
             if check_len >= cycle_len * 3 && Self::is_repeating(window, cycle_len) {
                 return Some(format!(
                     "[LOOP DETECTED] The last {check_len} tool calls follow a repeating pattern \
@@ -326,7 +584,175 @@ fn mutation_path(tool_name: &str, args: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::progress_observation::{
+        MutationOutcome, ObservationStatus, ProgressObservation,
+    };
     use serde_json::json;
+
+    fn stalled_episode(target: &str) -> ProgressObservation {
+        ProgressObservation {
+            call_id: format!("call-{target}"),
+            family: OperationFamily::Mutate,
+            target_key: format!("target-{target}"),
+            target_label: target.to_owned(),
+            status: ObservationStatus::Failed,
+            outcome: Some(MutationOutcome::NoMatch),
+            state_digest: None,
+            evidence_key: format!("sha256:{:0>64}", target.len()),
+            validation_key: None,
+            validation_score: None,
+            wait_key: None,
+            error_kind: Some("diff_context_no_match".into()),
+            confidence: ObservationConfidence::Typed,
+            diagnostic: None,
+            semantic_eligible: true,
+        }
+    }
+
+    #[test]
+    fn h07_m6_bounds_semantic_reflection_to_once_per_turn() {
+        let mut detector = LoopDetector::new(12).with_no_progress(true);
+        for target in ["a.rs", "b.rs"] {
+            let observation = stalled_episode(target);
+            for _ in 0..3 {
+                detector.observe_semantic(&observation);
+            }
+        }
+        let request = detector
+            .take_semantic_reflection_signal()
+            .expect("the first stalled episode should request reflection");
+        assert_eq!(request.target, "a.rs");
+        assert!(detector.take_semantic_reflection_signal().is_none());
+    }
+
+    #[test]
+    fn h07_m2_exact_result_hints_on_second_and_rejects_third() {
+        let mut detector = LoopDetector::new(12).with_no_progress(true);
+        let args = json!({"path": "a.txt"});
+        assert_eq!(detector.before_call("read_file", &args, true), None);
+        assert_eq!(
+            detector.after_result("read_file", &args, "same", None, true),
+            None
+        );
+        assert_eq!(detector.before_call("read_file", &args, true), None);
+        assert_eq!(
+            detector
+                .after_result("read_file", &args, "same", None, true)
+                .as_deref(),
+            Some(H07_EXACT_HINT)
+        );
+        assert_eq!(detector.before_call("read_file", &args, true), Some(3));
+    }
+
+    #[test]
+    fn h07_m2_trusted_read_identity_ignores_only_envelope_ids() {
+        let mut detector = LoopDetector::new(12).with_no_progress(true);
+        let args = json!({"path": "a.txt"});
+        detector.before_call("read_file", &args, true);
+        detector.after_result(
+            "read_file",
+            &args,
+            "output_id=first",
+            Some("source-and-range"),
+            true,
+        );
+        detector.before_call("read_file", &args, true);
+        assert_eq!(
+            detector
+                .after_result(
+                    "read_file",
+                    &args,
+                    "output_id=second",
+                    Some("source-and-range"),
+                    true
+                )
+                .as_deref(),
+            Some(H07_EXACT_HINT)
+        );
+        assert_eq!(detector.before_call("read_file", &args, true), Some(3));
+    }
+
+    #[test]
+    fn h07_m2_changed_results_and_waits_do_not_trigger_exact_guard() {
+        let mut detector = LoopDetector::new(12).with_no_progress(true);
+        let args = json!({});
+        for index in 0..9 {
+            assert_eq!(detector.before_call("check", &args, true), None);
+            assert_eq!(detector.record_non_exact_cycles("check", &args), None);
+            assert_eq!(
+                detector.after_result("check", &args, &index.to_string(), None, true),
+                None
+            );
+        }
+        let mut detector = LoopDetector::new(12).with_no_progress(true);
+        for _ in 0..4 {
+            assert_eq!(
+                detector.before_call("check_background_tasks", &args, true),
+                None
+            );
+            detector.after_result("check_background_tasks", &args, "still running", None, true);
+        }
+    }
+
+    #[test]
+    fn h07_m5_verified_wait_reflects_without_establishing_exact_termination() {
+        let mut detector = LoopDetector::new(12).with_no_progress(true);
+        let args = json!({"task_handle": "task-1"});
+        for index in 1..=3 {
+            assert_eq!(detector.before_call("read_task_output", &args, true), None);
+            let hint = detector.after_verified_wait(
+                "read_task_output",
+                &args,
+                "still running",
+                "task-1:running",
+            );
+            if index < 3 {
+                assert!(hint.is_none());
+            } else {
+                assert_eq!(hint.as_deref(), Some(VERIFIED_WAIT_HINT));
+            }
+        }
+        assert_eq!(
+            detector.take_verified_wait_signal().as_deref(),
+            Some("read_task_output")
+        );
+        assert_eq!(detector.before_call("read_task_output", &args, true), None);
+    }
+
+    #[test]
+    fn h07_m5_changed_wait_output_breaks_the_unchanged_streak() {
+        let mut detector = LoopDetector::new(12).with_no_progress(true);
+        let args = json!({"task_handle": "task-1"});
+        assert!(
+            detector
+                .after_verified_wait("read_task_output", &args, "page one", "live",)
+                .is_none()
+        );
+        assert!(
+            detector
+                .after_verified_wait("read_task_output", &args, "page two", "live",)
+                .is_none()
+        );
+        assert!(
+            detector
+                .after_verified_wait("read_task_output", &args, "page two", "live",)
+                .is_none()
+        );
+        assert!(detector.take_verified_wait_signal().is_none());
+    }
+
+    #[test]
+    fn h07_m2_blocked_or_verifier_exempt_call_cannot_establish_rejection() {
+        let mut detector = LoopDetector::new(12).with_no_progress(true);
+        let args = json!({});
+        detector.before_call("check", &args, true);
+        detector.after_result("check", &args, "blocked", None, false);
+        detector.before_call("check", &args, true);
+        detector.after_result("check", &args, "same", None, true);
+        assert_eq!(detector.before_call("check", &args, true), None);
+        detector.after_result("check", &args, "same", None, true);
+        assert_eq!(detector.before_call("check", &args, false), None);
+    }
 
     fn detector_with_churn_threshold(threshold: usize) -> LoopDetector {
         let mut detector = LoopDetector::new(10);
@@ -443,6 +869,58 @@ mod tests {
                 .is_none()
         );
         assert!(detector.take_file_churn_signal().is_none());
+    }
+
+    #[test]
+    fn h07_m0_successful_no_change_is_counted_as_file_churn() {
+        let mut detector = detector_with_churn_threshold(2);
+        let no_change = crate::tools::ToolResult {
+            success: true,
+            file_modified: None,
+            structured_metadata: Some(json!({"outcome": "no_change", "file_modified": false})),
+            ..Default::default()
+        };
+        let args = json!({"path": "same.txt"});
+        assert!(
+            detector
+                .record_file_mutation("edit_file", &args, no_change.success)
+                .is_none()
+        );
+        assert!(
+            detector
+                .record_file_mutation("edit_file", &args, no_change.success)
+                .is_some()
+        );
+        assert_eq!(detector.take_file_churn_signal().unwrap().edits, 2);
+    }
+
+    #[test]
+    fn h07_m4_churn_counts_only_distinct_confirmed_final_versions() {
+        let mut detector = detector_with_churn_threshold(2).with_no_progress(true);
+        let args = json!({"path": "same.txt"});
+        for progress in [
+            ProgressClass::NoProgress,
+            ProgressClass::Unknown,
+            ProgressClass::StateChanged,
+            ProgressClass::NoProgress,
+        ] {
+            assert!(
+                detector
+                    .record_file_mutation_progress("edit_file", &args, true, Some(progress))
+                    .is_none()
+            );
+        }
+        assert!(detector.take_file_churn_signal().is_none());
+        let hint = detector
+            .record_file_mutation_progress(
+                "edit_file",
+                &args,
+                true,
+                Some(ProgressClass::StateChanged),
+            )
+            .expect("second distinct final version should reach churn threshold");
+        assert!(hint.contains("FILE CHURN"));
+        assert_eq!(detector.take_file_churn_signal().unwrap().edits, 2);
     }
 
     #[test]

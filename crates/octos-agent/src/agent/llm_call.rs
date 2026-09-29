@@ -44,9 +44,10 @@ impl Agent {
         .await
     }
 
-    /// Internal checkpoint call: retain hooks, retries, usage attribution and
-    /// provider failover, but do not stream private reflection into the user's
-    /// transcript.
+    /// Internal checkpoint call: retain hooks and usage attribution, but do
+    /// not stream private reflection into the user's transcript and do not
+    /// retry or issue a second non-streaming fallback request. A failed or
+    /// empty reflection falls open to the normal action path.
     pub(super) async fn call_llm_with_hooks_silent(
         &self,
         messages: &[Message],
@@ -56,14 +57,17 @@ impl Agent {
         total_usage: &TokenUsage,
         turn: &mut LoopTurnState,
     ) -> Result<(ChatResponse, bool, Option<f64>)> {
-        self.call_llm_with_hooks_mode(
-            messages,
-            tools_spec,
-            config,
-            iteration,
-            total_usage,
-            turn,
-            false,
+        octos_llm::with_llm_call_policy(
+            LlmCallPolicy::FailFast,
+            self.call_llm_with_hooks_mode(
+                messages,
+                tools_spec,
+                config,
+                iteration,
+                total_usage,
+                turn,
+                false,
+            ),
         )
         .await
     }
