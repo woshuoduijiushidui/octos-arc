@@ -501,7 +501,7 @@ def source_listing(output_dir: Path, limit: int = 60) -> str:
 # from it at runtime and the two MUST be bumped together. `OCTOS_RELEASE_URL`
 # overrides it for controlled tests only.
 OCTOS_RELEASE_URL = (
-    "https://github.com/woshuoduijiushidui/octos-arc/releases/download/v2.0.3-rc.11-arc.14/"
+    "https://github.com/woshuoduijiushidui/octos-arc/releases/download/v2.0.3-rc.11-arc.22/"
     "octos-bundle-x86_64-unknown-linux-gnu.tar.gz"
 )
 

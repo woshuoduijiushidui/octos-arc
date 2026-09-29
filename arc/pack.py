@@ -40,7 +40,6 @@ ENTRIES = (
     "hooks",
     "requirements.txt",
     "arcbench_agent_runtime",
-    "public-tests",
 )
 
 # 目录条目也写进包（`zip -r` 的行为），与平台已接收过的包保持同一形状。
