@@ -3178,7 +3178,7 @@ impl Agent {
                                         iterations: iteration,
                                         duration: task_start.elapsed(),
                                     });
-                                    return Ok(TaskResult {
+                                    return Ok(GatedTaskResult { task_result: TaskResult {
                                         schema_version: octos_core::TASK_RESULT_SCHEMA_VERSION,
                                         success: false,
                                         failure: Some(TaskFailure {
@@ -3190,7 +3190,7 @@ impl Agent {
                                         files_to_send,
                                         subtasks: Vec::new(),
                                         token_usage: turn.total_usage().clone(),
-                                    });
+                                    }, decision: None });
                                 }
                             }
                         }
@@ -3241,7 +3241,7 @@ impl Agent {
                                 iterations: iteration,
                                 duration: task_start.elapsed(),
                             });
-                            return Ok(TaskResult {
+                            return Ok(GatedTaskResult { task_result: TaskResult {
                                 schema_version: octos_core::TASK_RESULT_SCHEMA_VERSION,
                                 success: false,
                                 failure: Some(TaskFailure {
@@ -3253,7 +3253,7 @@ impl Agent {
                                 files_to_send,
                                 subtasks: Vec::new(),
                                 token_usage: turn.total_usage().clone(),
-                            });
+                            }, decision: None });
                         }
                         if let Some(request) = loop_detector.take_semantic_reflection_signal()
                             && self.config.no_progress_reflection
