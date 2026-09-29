@@ -419,6 +419,17 @@ impl SnapshotManager {
             .map_err(|err| eyre!("snapshot task join error: {err}"))?
     }
 
+    /// List regular paths recorded in a snapshot. Callers that need complete
+    /// coverage can compare this with an independently scanned workspace.
+    pub fn snapshot_paths(&self, id: &SnapshotId) -> Result<Vec<PathBuf>> {
+        let raw = id.as_str();
+        if raw.len() < 4 || raw.len() > 64 || !raw.chars().all(|c| c.is_ascii_hexdigit()) {
+            bail!("invalid snapshot id");
+        }
+        let output = self.run_git(&["ls-tree", "-r", "--name-only", "-z", raw])?;
+        Ok(output.split_terminator('\0').map(PathBuf::from).collect())
+    }
+
     /// Restore the workspace to the state recorded in `id`.
     ///
     /// * Files modified or deleted since the snapshot get their snapshot

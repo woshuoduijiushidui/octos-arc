@@ -23,13 +23,17 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use octos_agent::mcp_server::{McpSessionDispatch, SessionLifecycleObserver};
+use octos_agent::mcp_server::{
+    McpServerError, McpSessionDispatch, McpSessionOutcome, SessionLifecycleObserver,
+};
 use octos_agent::task_supervisor::TaskLifecycleState;
 use octos_agent::validators::ValidatorStatus;
 use octos_agent::{SandboxConfig, SandboxMode};
 use octos_cli::commands::mcp_serve::{AgentLlmFactory, RealSessionDispatch, SessionDispatchConfig};
 use octos_core::{Message, MessageRole, ToolCall};
-use octos_llm::{ChatConfig, ChatResponse, LlmProvider, StopReason, TokenUsage, ToolSpec};
+use octos_llm::{
+    ChatConfig, ChatResponse, LlmError, LlmProvider, StopReason, TokenUsage, ToolSpec,
+};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -114,6 +118,55 @@ impl LlmProvider for ScriptedLlmProvider {
     }
 }
 
+/// Returns one measured response, then a non-retryable provider error. This
+/// covers the H06 boundary where repair has started but the next model call
+/// never produces a response carrying usage.
+struct ResponseThenAuthErrorProvider {
+    response: Mutex<Option<ChatResponse>>,
+    requests: Mutex<Vec<Vec<Message>>>,
+}
+
+impl ResponseThenAuthErrorProvider {
+    fn new(response: ChatResponse) -> Arc<Self> {
+        Arc::new(Self {
+            response: Mutex::new(Some(response)),
+            requests: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn requests(&self) -> Vec<Vec<Message>> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl LlmProvider for ResponseThenAuthErrorProvider {
+    async fn chat(
+        &self,
+        messages: &[Message],
+        _tools: &[ToolSpec],
+        _config: &ChatConfig,
+    ) -> eyre::Result<ChatResponse> {
+        self.requests.lock().unwrap().push(messages.to_vec());
+        match self.response.lock().unwrap().take() {
+            Some(response) => Ok(response),
+            None => Err(LlmError::auth("scripted authentication failure").into()),
+        }
+    }
+
+    fn context_window(&self) -> u32 {
+        128_000
+    }
+
+    fn model_id(&self) -> &str {
+        "scripted-error-test"
+    }
+
+    fn provider_name(&self) -> &str {
+        "scripted-error"
+    }
+}
+
 fn end_turn(text: &str) -> ChatResponse {
     ChatResponse {
         content: Some(text.to_string()),
@@ -153,6 +206,15 @@ fn read_file_call(id: &str, path: &str) -> ChatResponse {
     })
 }
 
+fn write_file_call(id: &str, path: &str, content: &str) -> ChatResponse {
+    tool_use(ToolCall {
+        id: id.to_string(),
+        name: "write_file".to_string(),
+        arguments: json!({"path": path, "content": content}),
+        metadata: None,
+    })
+}
+
 fn recall_call(id: &str, source_call_id: &str, offset: usize) -> ChatResponse {
     tool_use(ToolCall {
         id: id.to_string(),
@@ -173,9 +235,20 @@ fn recall_call(id: &str, source_call_id: &str, offset: usize) -> ChatResponse {
 struct DispatchHarness {
     dispatch: RealSessionDispatch,
     _workspace: TempDir,
+    _data: TempDir,
 }
 
 impl DispatchHarness {
+    fn with_h06_repair(mut self) -> Self {
+        self.dispatch = self.dispatch.with_completion_repair(true);
+        self
+    }
+
+    fn with_h06_rounds(mut self, rounds: u8) -> Self {
+        self.dispatch = self.dispatch.with_completion_repair_rounds(rounds);
+        self
+    }
+
     fn build(provider: Arc<dyn LlmProvider>, workspace: TempDir) -> Self {
         // Opt out of the sandbox for the scripted success/lifecycle paths so the
         // mcp-serve fail-closed no-backend check is host-independent (CI runners
@@ -281,8 +354,8 @@ impl DispatchHarness {
         output_recovery: octos_agent::output_recovery::OutputPolicy,
     ) -> Self {
         let factory = AgentLlmFactory::scripted(provider);
-        let data_dir = workspace.path().join(".octos-data");
-        std::fs::create_dir_all(&data_dir).unwrap();
+        let data = TempDir::new().unwrap();
+        let data_dir = data.path().to_path_buf();
         let mut tool_policy_by_provider = std::collections::HashMap::new();
         if let Some(provider_policy) = provider_policy {
             tool_policy_by_provider.insert("scripted-test".to_string(), provider_policy);
@@ -296,10 +369,12 @@ impl DispatchHarness {
             tool_policy_by_provider,
             provider_name: String::new(),
             output_recovery,
+            completion_repair: octos_cli::commands::mcp_serve::CompletionRepairPolicy::new(0),
         };
         Self {
             dispatch: RealSessionDispatch::new_for_test(config, factory),
             _workspace: workspace,
+            _data: data,
         }
     }
 }
@@ -338,6 +413,1199 @@ fn sample_arc_input(
             "skills": ["/skills/leaf-full-design/"]
         }
     })
+}
+
+fn write_m0_completion_validator(
+    workspace: &std::path::Path,
+    spec: octos_agent::workspace_policy::ValidatorSpec,
+) {
+    write_completion_validators(
+        workspace,
+        vec![completion_file_validator("m0-gate", true, false, spec)],
+    );
+}
+
+fn completion_file_validator(
+    id: &str,
+    required: bool,
+    soft_fail: bool,
+    spec: octos_agent::workspace_policy::ValidatorSpec,
+) -> octos_agent::workspace_policy::Validator {
+    use octos_agent::workspace_policy::{Validator, ValidatorPhaseKind};
+
+    Validator {
+        id: id.into(),
+        required,
+        soft_fail,
+        timeout_ms: None,
+        phase: ValidatorPhaseKind::Completion,
+        spec,
+    }
+}
+
+fn write_completion_validators(
+    workspace: &std::path::Path,
+    validators: Vec<octos_agent::workspace_policy::Validator>,
+) {
+    use octos_agent::workspace_policy::{
+        WorkspacePolicy, WorkspacePolicyKind, WorkspaceSnapshotTrigger, WorkspaceTrackingPolicy,
+        WorkspaceVersionControlPolicy, WorkspaceVersionControlProvider, write_workspace_policy,
+    };
+    use octos_agent::{
+        ValidationPolicy, WorkspaceArtifactsPolicy, workspace_policy::WorkspacePolicyWorkspace,
+    };
+
+    let policy = WorkspacePolicy {
+        schema_version: octos_agent::WORKSPACE_POLICY_SCHEMA_VERSION,
+        workspace: WorkspacePolicyWorkspace {
+            kind: WorkspacePolicyKind::Slides,
+        },
+        version_control: WorkspaceVersionControlPolicy {
+            provider: WorkspaceVersionControlProvider::Git,
+            auto_init: false,
+            trigger: WorkspaceSnapshotTrigger::TurnEnd,
+            fail_on_error: false,
+        },
+        tracking: WorkspaceTrackingPolicy { ignore: Vec::new() },
+        validation: ValidationPolicy {
+            on_turn_end: Vec::new(),
+            on_source_change: Vec::new(),
+            on_completion: Vec::new(),
+            validators,
+        },
+        artifacts: WorkspaceArtifactsPolicy::default(),
+        spawn_tasks: std::collections::BTreeMap::new(),
+        compaction: None,
+    };
+    write_workspace_policy(workspace, &policy).unwrap();
+}
+
+fn assert_m0_terminal_failure(
+    outcome: &McpSessionOutcome,
+    observer: &RecordingObserver,
+    provider: &ScriptedLlmProvider,
+    prefix: &str,
+    validator_status: Option<ValidatorStatus>,
+) {
+    assert_eq!(provider.requests().len(), 1);
+    assert_eq!(
+        observer.snapshot(),
+        vec![
+            TaskLifecycleState::Running,
+            TaskLifecycleState::Verifying,
+            TaskLifecycleState::Failed,
+        ]
+    );
+    assert_eq!(outcome.final_state, TaskLifecycleState::Failed);
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with(prefix)
+    );
+    assert!(outcome.artifact_path.is_none());
+    assert!(outcome.artifact_content.is_none());
+    assert_eq!(outcome.cost.input_tokens, 42);
+    assert_eq!(outcome.cost.output_tokens, 17);
+    match validator_status {
+        Some(status) => {
+            assert_eq!(outcome.validator_results.len(), 1);
+            assert_eq!(outcome.validator_results[0].validator_id, "m0-gate");
+            assert_eq!(outcome.validator_results[0].status, status);
+        }
+        None => assert!(outcome.validator_results.is_empty()),
+    }
+}
+
+#[tokio::test]
+async fn h06_m0_required_validator_fail_is_terminal() {
+    use octos_agent::workspace_policy::ValidatorSpec;
+
+    let workspace = TempDir::new().unwrap();
+    std::fs::write(workspace.path().join("result.json"), "{}").unwrap();
+    write_m0_completion_validator(
+        workspace.path(),
+        ValidatorSpec::FileExists {
+            path: "missing-required.txt".into(),
+            min_bytes: None,
+        },
+    );
+    let provider = ScriptedLlmProvider::new(vec![end_turn("done")]);
+    let harness = DispatchHarness::build(provider.clone(), workspace);
+    let observer = RecordingObserver::new();
+    let outcome = harness
+        .dispatch
+        .run_session(
+            "coding",
+            &json!({"prompt": "deliver result", "expected_artifact": "result.json"}),
+            &observer,
+        )
+        .await
+        .unwrap();
+
+    assert_m0_terminal_failure(
+        &outcome,
+        &observer,
+        &provider,
+        "contract_failed:",
+        Some(ValidatorStatus::Fail),
+    );
+}
+
+#[tokio::test]
+async fn h06_m0_missing_arc_artifact_is_terminal() {
+    let workspace = TempDir::new().unwrap();
+    let provider = ScriptedLlmProvider::new(vec![end_turn("done")]);
+    let harness = DispatchHarness::build(provider.clone(), workspace);
+    let observer = RecordingObserver::new();
+    let outcome = harness
+        .dispatch
+        .run_session(
+            "coding",
+            &sample_arc_input(
+                harness._workspace.path(),
+                ".arc/delegated/missing.json",
+                Some(json!({"type": "object"})),
+            ),
+            &observer,
+        )
+        .await
+        .unwrap();
+
+    assert_m0_terminal_failure(&outcome, &observer, &provider, "artifact_missing:", None);
+}
+
+#[tokio::test]
+async fn h06_m0_invalid_arc_schema_is_terminal() {
+    let workspace = TempDir::new().unwrap();
+    let path = workspace.path().join(".arc/delegated/invalid.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, r#"{"count":"wrong"}"#).unwrap();
+    let provider = ScriptedLlmProvider::new(vec![end_turn("done")]);
+    let harness = DispatchHarness::build(provider.clone(), workspace);
+    let observer = RecordingObserver::new();
+    let outcome = harness
+        .dispatch
+        .run_session(
+            "coding",
+            &sample_arc_input(
+                harness._workspace.path(),
+                ".arc/delegated/invalid.json",
+                Some(json!({
+                    "type": "object", "required": ["count"],
+                    "properties": {"count": {"type": "integer"}}
+                })),
+            ),
+            &observer,
+        )
+        .await
+        .unwrap();
+
+    assert_m0_terminal_failure(
+        &outcome,
+        &observer,
+        &provider,
+        "artifact_schema_invalid:",
+        None,
+    );
+}
+
+fn assert_h06_ready(
+    outcome: &McpSessionOutcome,
+    observer: &RecordingObserver,
+    provider: &ScriptedLlmProvider,
+    artifact: &str,
+) {
+    let requests = provider.requests();
+    let ticket_index = requests
+        .iter()
+        .position(|messages| {
+            messages.iter().any(|message| {
+                message.role == MessageRole::User
+                    && message.content.starts_with("H06 repair ticket v1")
+            })
+        })
+        .expect("repair ticket in provider request");
+    assert_eq!(requests.len(), ticket_index + 2);
+    assert_eq!(
+        observer.snapshot(),
+        vec![
+            TaskLifecycleState::Running,
+            TaskLifecycleState::Verifying,
+            TaskLifecycleState::Ready,
+        ],
+        "error={:?}",
+        outcome.error
+    );
+    assert_eq!(
+        outcome.final_state,
+        TaskLifecycleState::Ready,
+        "error={:?}",
+        outcome.error
+    );
+    assert_eq!(outcome.artifact_content.as_deref(), Some(artifact));
+    assert_eq!(
+        outcome.cost.input_tokens,
+        84 + 30 * (requests.len() as u32 - 2)
+    );
+    assert_eq!(
+        outcome.cost.output_tokens,
+        34 + 20 * (requests.len() as u32 - 2)
+    );
+    assert!(outcome.error.is_none());
+    let ticket = requests[ticket_index]
+        .iter()
+        .filter(|message| {
+            message.role == MessageRole::User && message.content.starts_with("H06 repair ticket v1")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ticket.len(), 1);
+    assert!(ticket[0].content.len() <= 4096);
+    assert!(ticket[0].content.contains("recoverable=false"));
+    assert!(ticket[0].content.contains("passed_gate_digest="));
+    assert!(!ticket[0].content.contains("LEGACY_PROMPT_MUST_NOT_RUN"));
+    assert!(
+        !ticket[0]
+            .content
+            .contains("ARC_NATIVE_SYSTEM_ROLE_SENTINEL")
+    );
+    assert!(!ticket[0].content.contains("ARCBENCH_API_KEY"));
+    let final_tickets = requests
+        .last()
+        .unwrap()
+        .iter()
+        .filter(|message| {
+            message.role == MessageRole::User && message.content.starts_with("H06 repair ticket v1")
+        })
+        .count();
+    assert_eq!(final_tickets, 1);
+    let tools = provider.tool_requests();
+    for pair in tools.windows(2) {
+        assert_eq!(
+            pair[0].iter().map(|tool| &tool.name).collect::<Vec<_>>(),
+            pair[1].iter().map(|tool| &tool.name).collect::<Vec<_>>()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn h06_m4_missing_artifact_repairs_in_same_task() {
+    let workspace = TempDir::new().unwrap();
+    let provider = ScriptedLlmProvider::new(vec![
+        end_turn("first candidate"),
+        write_file_call("repair-1", ".arc/delegated/result.json", r#"{"ok":true}"#),
+        end_turn("repaired candidate"),
+    ]);
+    let harness = DispatchHarness::build(provider.clone(), workspace).with_h06_repair();
+    let observer = RecordingObserver::new();
+    let outcome = harness
+        .dispatch
+        .run_session(
+            "coding",
+            &sample_arc_input(
+                harness._workspace.path(),
+                ".arc/delegated/result.json",
+                Some(json!({
+                    "type": "object", "required": ["ok"], "properties": {"ok": {"type": "boolean"}}
+                })),
+            ),
+            &observer,
+        )
+        .await
+        .unwrap();
+
+    assert_h06_ready(&outcome, &observer, &provider, r#"{"ok":true}"#);
+    let requests = provider.requests();
+    let ticket = requests[1]
+        .iter()
+        .find(|message| message.content.starts_with("H06 repair ticket v1"))
+        .unwrap();
+    assert!(ticket.content.contains("artifact/exists"));
+    assert!(ticket.content.contains(".arc/delegated/result.json"));
+    assert!(
+        !ticket
+            .content
+            .contains(&harness._workspace.path().display().to_string())
+    );
+    assert_eq!(
+        requests[2]
+            .iter()
+            .filter(|message| message.role == MessageRole::User
+                && message.content.contains("Design the booking interface."))
+            .count(),
+        1
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn h06_m4_schema_failure_repairs_and_rechecks_final_artifact() {
+    let workspace = TempDir::new().unwrap();
+    let artifact = workspace.path().join(".arc/delegated/result.json");
+    std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+    std::fs::write(&artifact, r#"{"count":"wrong"}"#).unwrap();
+    let provider = ScriptedLlmProvider::new(vec![
+        read_file_call("read-schema", ".arc/delegated/result.json"),
+        end_turn("first candidate"),
+        write_file_call("repair-2", ".arc/delegated/result.json", r#"{"count":2}"#),
+        end_turn("repaired candidate"),
+    ]);
+    let harness = DispatchHarness::build(provider.clone(), workspace).with_h06_repair();
+    let observer = RecordingObserver::new();
+    let outcome = harness.dispatch.run_session(
+        "coding",
+        &sample_arc_input(harness._workspace.path(), ".arc/delegated/result.json", Some(json!({
+            "type": "object", "required": ["count"], "properties": {"count": {"type": "integer"}}
+        }))),
+        &observer,
+    ).await.unwrap();
+
+    assert_h06_ready(&outcome, &observer, &provider, r#"{"count":2}"#);
+    let ticket = provider.requests()[2]
+        .iter()
+        .find(|message| message.content.starts_with("H06 repair ticket v1"))
+        .unwrap()
+        .content
+        .clone();
+    assert!(ticket.contains("artifact/schema"));
+    assert!(ticket.contains("schema_pointer="));
+    assert!(ticket.contains(".arc/delegated/result.json"));
+    assert!(!ticket.contains("\"properties\""));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn h06_m4_required_validator_fail_repairs_and_rechecks() {
+    use octos_agent::workspace_policy::ValidatorSpec;
+    let workspace = TempDir::new().unwrap();
+    std::fs::write(workspace.path().join("result.json"), "{}").unwrap();
+    write_m0_completion_validator(
+        workspace.path(),
+        ValidatorSpec::FileExists {
+            path: "required.txt".into(),
+            min_bytes: None,
+        },
+    );
+    let provider = ScriptedLlmProvider::new(vec![
+        end_turn("first candidate"),
+        write_file_call("repair-3", "required.txt", "ready"),
+        end_turn("repaired candidate"),
+    ]);
+    let harness = DispatchHarness::build(provider.clone(), workspace).with_h06_repair();
+    let observer = RecordingObserver::new();
+    let outcome = harness
+        .dispatch
+        .run_session(
+            "coding",
+            &json!({"prompt": "deliver result", "expected_artifact": "result.json"}),
+            &observer,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(provider.requests().len(), 3, "outcome={outcome:?}");
+    assert_h06_ready(&outcome, &observer, &provider, "{}");
+    assert_eq!(outcome.validator_results.len(), 1);
+    assert_eq!(outcome.validator_results[0].status, ValidatorStatus::Pass);
+    let ticket = provider.requests()[1]
+        .iter()
+        .find(|message| message.content.starts_with("H06 repair ticket v1"))
+        .unwrap()
+        .content
+        .clone();
+    assert!(ticket.contains("m0-gate"));
+    assert!(ticket.contains("required validator failed"));
+}
+
+#[tokio::test]
+async fn h06_m4_off_keeps_single_request_failure() {
+    let workspace = TempDir::new().unwrap();
+    let provider = ScriptedLlmProvider::new(vec![
+        end_turn("first candidate"),
+        write_file_call("unused", ".arc/delegated/result.json", "{}"),
+        end_turn("unused"),
+    ]);
+    let harness = DispatchHarness::build(provider.clone(), workspace);
+    let observer = RecordingObserver::new();
+    let outcome = harness
+        .dispatch
+        .run_session(
+            "coding",
+            &sample_arc_input(
+                harness._workspace.path(),
+                ".arc/delegated/result.json",
+                Some(json!({"type":"object"})),
+            ),
+            &observer,
+        )
+        .await
+        .unwrap();
+    assert_m0_terminal_failure(&outcome, &observer, &provider, "artifact_missing:", None);
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    let request = serde_json::to_string(&requests[0]).unwrap();
+    assert_eq!(
+        request.matches("ARC_NATIVE_SYSTEM_ROLE_SENTINEL").count(),
+        1
+    );
+    assert_eq!(request.matches("Design the booking interface.").count(), 1);
+    assert!(!request.contains("H06 repair ticket v1"));
+    assert!(!request.contains("LEGACY_PROMPT_MUST_NOT_RUN"));
+    let tool_requests = provider.tool_requests();
+    assert_eq!(tool_requests.len(), 1);
+    assert!(
+        tool_requests[0]
+            .iter()
+            .all(|tool| !tool.name.contains("repair") && !tool.name.contains("completion"))
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn h06_m6_initial_pass_is_ready_without_repair_ticket() {
+    let workspace = TempDir::new().unwrap();
+    std::fs::write(workspace.path().join("result.json"), "{}").unwrap();
+    let provider = ScriptedLlmProvider::new(vec![end_turn("complete")]);
+    let harness = DispatchHarness::build(provider.clone(), workspace).with_h06_repair();
+    let observer = RecordingObserver::new();
+
+    let outcome = harness
+        .dispatch
+        .run_session(
+            "coding",
+            &json!({"prompt":"deliver", "expected_artifact":"result.json"}),
+            &observer,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.final_state, TaskLifecycleState::Ready);
+    assert_eq!(outcome.artifact_content.as_deref(), Some("{}"));
+    assert_eq!(outcome.cost.input_tokens, 42);
+    assert_eq!(outcome.cost.output_tokens, 17);
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0]
+            .iter()
+            .all(|message| !message.content.starts_with("H06 repair ticket v1"))
+    );
+    assert_eq!(
+        observer.snapshot(),
+        vec![
+            TaskLifecycleState::Running,
+            TaskLifecycleState::Verifying,
+            TaskLifecycleState::Ready,
+        ]
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn h06_m6_multiple_required_failures_are_sorted_and_all_rechecked() {
+    use octos_agent::workspace_policy::ValidatorSpec;
+
+    let workspace = TempDir::new().unwrap();
+    std::fs::write(workspace.path().join("result.json"), "{}").unwrap();
+    write_completion_validators(
+        workspace.path(),
+        vec![
+            completion_file_validator(
+                "z-required",
+                true,
+                false,
+                ValidatorSpec::FileExists {
+                    path: "z.txt".into(),
+                    min_bytes: None,
+                },
+            ),
+            completion_file_validator(
+                "a-required",
+                true,
+                false,
+                ValidatorSpec::FileExists {
+                    path: "a.txt".into(),
+                    min_bytes: None,
+                },
+            ),
+        ],
+    );
+    let provider = ScriptedLlmProvider::new(vec![
+        end_turn("first candidate"),
+        write_file_call("fix-a", "a.txt", "ready"),
+        end_turn("one gate repaired"),
+        write_file_call("fix-z", "z.txt", "ready"),
+        end_turn("all gates repaired"),
+    ]);
+    let harness = DispatchHarness::build_with_max_iterations(provider.clone(), workspace, 6)
+        .with_h06_repair();
+
+    let outcome = harness
+        .dispatch
+        .run_session(
+            "coding",
+            &json!({"prompt":"deliver", "expected_artifact":"result.json"}),
+            &RecordingObserver::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.final_state, TaskLifecycleState::Ready);
+    assert_eq!(provider.requests().len(), 5);
+    assert_eq!(outcome.cost.input_tokens, 186);
+    assert_eq!(outcome.cost.output_tokens, 91);
+    assert_eq!(outcome.validator_results.len(), 2);
+    assert!(
+        outcome
+            .validator_results
+            .iter()
+            .all(|result| result.status == ValidatorStatus::Pass)
+    );
+    let requests = provider.requests();
+    let first_ticket = requests[1]
+        .iter()
+        .find(|message| message.content.starts_with("H06 repair ticket v1"))
+        .unwrap();
+    let a_position = first_ticket.content.find("a-required").unwrap();
+    let z_position = first_ticket.content.find("z-required").unwrap();
+    assert!(
+        a_position < z_position,
+        "ticket must use stable gate ordering"
+    );
+    let second_ticket = requests[3]
+        .iter()
+        .rev()
+        .find(|message| message.content.starts_with("H06 repair ticket v1"))
+        .unwrap();
+    assert!(second_ticket.content.contains("round=2/2"));
+    assert!(second_ticket.content.contains("z-required"));
+    assert!(!second_ticket.content.contains("failure[0].gate=a-required"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn h06_m6_optional_failure_does_not_repair_or_block_ready() {
+    use octos_agent::workspace_policy::ValidatorSpec;
+
+    let workspace = TempDir::new().unwrap();
+    std::fs::write(workspace.path().join("result.json"), "{}").unwrap();
+    write_completion_validators(
+        workspace.path(),
+        vec![completion_file_validator(
+            "optional-note",
+            false,
+            true,
+            ValidatorSpec::FileExists {
+                path: "optional.txt".into(),
+                min_bytes: None,
+            },
+        )],
+    );
+    let provider = ScriptedLlmProvider::new(vec![end_turn("complete")]);
+    let harness = DispatchHarness::build(provider.clone(), workspace).with_h06_repair();
+
+    let outcome = harness
+        .dispatch
+        .run_session(
+            "coding",
+            &json!({"prompt":"deliver", "expected_artifact":"result.json"}),
+            &RecordingObserver::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.final_state, TaskLifecycleState::Ready);
+    assert_eq!(provider.requests().len(), 1);
+    assert_eq!(outcome.validator_results.len(), 1);
+    assert_eq!(outcome.validator_results[0].status, ValidatorStatus::Fail);
+    assert!(
+        provider.requests()[0]
+            .iter()
+            .all(|message| !message.content.starts_with("H06 repair ticket v1"))
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn h06_m4_second_failed_candidate_stops_after_one_repair_round() {
+    let workspace = TempDir::new().unwrap();
+    let provider = ScriptedLlmProvider::new(vec![
+        end_turn("first candidate"),
+        end_turn("unchanged candidate"),
+    ]);
+    let harness = DispatchHarness::build(provider.clone(), workspace).with_h06_repair();
+    let observer = RecordingObserver::new();
+    let outcome = harness
+        .dispatch
+        .run_session(
+            "coding",
+            &json!({"prompt":"deliver", "expected_artifact":"missing.json"}),
+            &observer,
+        )
+        .await
+        .unwrap();
+    assert_eq!(provider.requests().len(), 2);
+    assert_eq!(outcome.final_state, TaskLifecycleState::Failed);
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .unwrap()
+            .starts_with("artifact_missing:")
+    );
+    assert_eq!(outcome.cost.input_tokens, 84);
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("h06_terminal=no_workspace_change")
+    );
+    assert_eq!(
+        observer.snapshot(),
+        vec![
+            TaskLifecycleState::Running,
+            TaskLifecycleState::Verifying,
+            TaskLifecycleState::Failed,
+        ]
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn h06_m5_two_repairs_accumulate_usage_and_finish_ready() {
+    use octos_agent::workspace_policy::ValidatorSpec;
+    let workspace = TempDir::new().unwrap();
+    write_m0_completion_validator(
+        workspace.path(),
+        ValidatorSpec::FileExists {
+            path: "required.txt".into(),
+            min_bytes: None,
+        },
+    );
+    let provider = ScriptedLlmProvider::new(vec![
+        end_turn("first candidate"),
+        write_file_call("fix-validator", "required.txt", "ready"),
+        end_turn("validator repaired"),
+        write_file_call("fix-artifact", "result.json", "{}"),
+        end_turn("artifact repaired"),
+    ]);
+    let harness = DispatchHarness::build_with_max_iterations(provider.clone(), workspace, 6)
+        .with_h06_repair();
+    let observer = RecordingObserver::new();
+    let outcome = harness
+        .dispatch
+        .run_session(
+            "coding",
+            &json!({"prompt":"deliver", "expected_artifact":"result.json"}),
+            &observer,
+        )
+        .await
+        .unwrap();
+    assert_eq!(provider.requests().len(), 5, "outcome={outcome:?}");
+    assert_eq!(
+        outcome.final_state,
+        TaskLifecycleState::Ready,
+        "{:?}",
+        outcome.error
+    );
+    assert_eq!(outcome.cost.input_tokens, 186);
+    assert_eq!(outcome.cost.output_tokens, 91);
+    let requests = provider.requests();
+    let second_ticket = serde_json::to_string(&requests[3]).unwrap();
+    assert!(second_ticket.contains("round=2/2"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn h06_m5_failed_strategy_restores_first_candidate() {
+    let workspace = TempDir::new().unwrap();
+    let root = workspace.path().to_path_buf();
+    let provider = ScriptedLlmProvider::new(vec![
+        end_turn("first candidate"),
+        write_file_call("decoy", "decoy.txt", "not a fix"),
+        end_turn("same failure after edit"),
+        end_turn("same failure again"),
+    ]);
+    let harness = DispatchHarness::build_with_max_iterations(provider.clone(), workspace, 6)
+        .with_h06_repair();
+    let observer = RecordingObserver::new();
+    let outcome = harness
+        .dispatch
+        .run_session(
+            "coding",
+            &json!({"prompt":"deliver", "expected_artifact":"missing.json"}),
+            &observer,
+        )
+        .await
+        .unwrap();
+    assert_eq!(provider.requests().len(), 4);
+    assert_eq!(outcome.final_state, TaskLifecycleState::Failed);
+    assert!(!root.join("decoy.txt").exists());
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("h06_terminal=no_workspace_change")
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn h06_m5_one_round_uses_same_policy_and_restores() {
+    let workspace = TempDir::new().unwrap();
+    let root = workspace.path().to_path_buf();
+    let provider = ScriptedLlmProvider::new(vec![
+        end_turn("first candidate"),
+        write_file_call("decoy", "decoy.txt", "not a fix"),
+        end_turn("same failure"),
+    ]);
+    let harness = DispatchHarness::build_with_max_iterations(provider.clone(), workspace, 5)
+        .with_h06_rounds(1);
+    let outcome = harness
+        .dispatch
+        .run_session(
+            "coding",
+            &json!({"prompt":"deliver", "expected_artifact":"missing.json"}),
+            &RecordingObserver::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(provider.requests().len(), 3);
+    assert_eq!(outcome.final_state, TaskLifecycleState::Failed);
+    assert!(!root.join("decoy.txt").exists());
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("h06_terminal=unchanged_failure")
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn h06_m5_regression_restores_prior_hard_passes() {
+    let workspace = TempDir::new().unwrap();
+    let artifact = workspace.path().join(".arc/delegated/result.json");
+    std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+    std::fs::write(&artifact, r#"{"count":"wrong"}"#).unwrap();
+    let provider = ScriptedLlmProvider::new(vec![
+        read_file_call("read-before-edit", ".arc/delegated/result.json"),
+        end_turn("schema mismatch"),
+        write_file_call("regress-json", ".arc/delegated/result.json", "{"),
+        end_turn("invalid JSON"),
+    ]);
+    let harness = DispatchHarness::build_with_max_iterations(provider.clone(), workspace, 6)
+        .with_h06_repair();
+    let outcome = harness.dispatch.run_session(
+        "coding",
+        &sample_arc_input(
+            harness._workspace.path(),
+            ".arc/delegated/result.json",
+            Some(json!({"type":"object", "required":["count"], "properties":{"count":{"type":"integer"}}})),
+        ),
+        &RecordingObserver::new(),
+    ).await.unwrap();
+    assert_eq!(provider.requests().len(), 4);
+    assert_eq!(outcome.final_state, TaskLifecycleState::Failed);
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("h06_terminal=regressed")
+    );
+    assert_eq!(
+        std::fs::read_to_string(artifact).unwrap(),
+        r#"{"count":"wrong"}"#
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn h06_m5_uncovered_ignored_file_fails_closed() {
+    let workspace = TempDir::new().unwrap();
+    let root = workspace.path().to_path_buf();
+    let provider = ScriptedLlmProvider::new(vec![
+        end_turn("first candidate"),
+        write_file_call("ignore", ".gitignore", "hidden.txt\n"),
+        write_file_call("hidden", "hidden.txt", "uncovered"),
+        end_turn("unsafe candidate"),
+    ]);
+    let harness = DispatchHarness::build_with_max_iterations(provider.clone(), workspace, 6)
+        .with_h06_repair();
+    let outcome = harness
+        .dispatch
+        .run_session(
+            "coding",
+            &json!({"prompt":"deliver", "expected_artifact":"missing.json"}),
+            &RecordingObserver::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(provider.requests().len(), 4);
+    assert_eq!(outcome.final_state, TaskLifecycleState::Failed);
+    assert!(outcome.artifact_path.is_none());
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("rollback_unavailable")
+    );
+    assert!(root.join("hidden.txt").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn h06_m5_rejects_uncovered_workspace_before_provider() {
+    let workspace = TempDir::new().unwrap();
+    std::fs::write(workspace.path().join(".gitignore"), "*.json\n").unwrap();
+    let provider = ScriptedLlmProvider::new(vec![end_turn("unused")]);
+    let harness = DispatchHarness::build(provider.clone(), workspace).with_h06_repair();
+    let outcome = harness
+        .dispatch
+        .run_session(
+            "coding",
+            &json!({"prompt":"deliver", "expected_artifact":"result.json"}),
+            &RecordingObserver::new(),
+        )
+        .await
+        .unwrap();
+    assert!(provider.requests().is_empty());
+    assert_eq!(outcome.final_state, TaskLifecycleState::Failed);
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .unwrap()
+            .starts_with("rollback_unavailable:")
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn h06_m5_rejects_side_effectful_validator_before_provider() {
+    use octos_agent::workspace_policy::ValidatorSpec;
+    let workspace = TempDir::new().unwrap();
+    write_m0_completion_validator(
+        workspace.path(),
+        ValidatorSpec::Command {
+            cmd: "true".into(),
+            args: Vec::new(),
+        },
+    );
+    let provider = ScriptedLlmProvider::new(vec![end_turn("unused")]);
+    let harness = DispatchHarness::build(provider.clone(), workspace).with_h06_repair();
+    let outcome = harness
+        .dispatch
+        .run_session(
+            "coding",
+            &json!({"prompt":"deliver", "expected_artifact":"result.json"}),
+            &RecordingObserver::new(),
+        )
+        .await
+        .unwrap();
+    assert!(provider.requests().is_empty());
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("file_exists validators")
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn h06_m5_rejects_nested_git_before_provider() {
+    let workspace = TempDir::new().unwrap();
+    std::fs::create_dir_all(workspace.path().join("nested/.git")).unwrap();
+    std::fs::write(
+        workspace.path().join("nested/.git/HEAD"),
+        "ref: refs/heads/main\n",
+    )
+    .unwrap();
+    let provider = ScriptedLlmProvider::new(vec![end_turn("unused")]);
+    let harness = DispatchHarness::build(provider.clone(), workspace).with_h06_repair();
+    let outcome = harness
+        .dispatch
+        .run_session(
+            "coding",
+            &json!({"prompt":"deliver", "expected_artifact":"result.json"}),
+            &RecordingObserver::new(),
+        )
+        .await
+        .unwrap();
+    assert!(provider.requests().is_empty());
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .unwrap()
+            .starts_with("rollback_unavailable:")
+    );
+}
+
+#[tokio::test]
+async fn h06_m4_invalid_input_is_terminal_before_provider() {
+    let workspace = TempDir::new().unwrap();
+    let provider = ScriptedLlmProvider::new(vec![end_turn("unused")]);
+    let harness = DispatchHarness::build(provider.clone(), workspace).with_h06_repair();
+    let mut input = sample_arc_input(
+        harness._workspace.path(),
+        ".arc/delegated/result.json",
+        Some(json!({"type":"object"})),
+    );
+    input["expected_artifact"] = json!("../outside.json");
+    let observer = RecordingObserver::new();
+    let result = harness
+        .dispatch
+        .run_session("coding", &input, &observer)
+        .await;
+    assert!(matches!(result, Err(McpServerError::InvalidParams(_))));
+    assert!(provider.requests().is_empty());
+    assert_eq!(
+        observer.snapshot(),
+        vec![TaskLifecycleState::Running, TaskLifecycleState::Failed]
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn h06_m4_validator_error_and_budget_do_not_request_repair() {
+    use octos_agent::workspace_policy::ValidatorSpec;
+    let workspace = TempDir::new().unwrap();
+    std::fs::write(workspace.path().join("result.json"), "{}").unwrap();
+    write_m0_completion_validator(
+        workspace.path(),
+        ValidatorSpec::FileExists {
+            path: "${args.unavailable}".into(),
+            min_bytes: None,
+        },
+    );
+    let provider = ScriptedLlmProvider::new(vec![end_turn("candidate")]);
+    let harness = DispatchHarness::build(provider.clone(), workspace).with_h06_repair();
+    let observer = RecordingObserver::new();
+    let outcome = harness
+        .dispatch
+        .run_session(
+            "coding",
+            &json!({"prompt":"deliver", "expected_artifact":"result.json"}),
+            &observer,
+        )
+        .await
+        .unwrap();
+    assert_eq!(provider.requests().len(), 1);
+    assert_eq!(outcome.final_state, TaskLifecycleState::Failed);
+    assert_eq!(outcome.validator_results[0].status, ValidatorStatus::Error);
+    assert_eq!(
+        observer.snapshot().last(),
+        Some(&TaskLifecycleState::Failed)
+    );
+
+    let workspace = TempDir::new().unwrap();
+    std::fs::write(workspace.path().join("old.json"), r#"{"stale":true}"#).unwrap();
+    write_m0_completion_validator(
+        workspace.path(),
+        ValidatorSpec::FileExists {
+            path: "required.txt".into(),
+            min_bytes: None,
+        },
+    );
+    let provider = ScriptedLlmProvider::new(vec![end_turn("candidate")]);
+    let harness = DispatchHarness::build_with_max_iterations(provider.clone(), workspace, 1)
+        .with_h06_repair();
+    let observer = RecordingObserver::new();
+    let outcome = harness
+        .dispatch
+        .run_session(
+            "coding",
+            &json!({"prompt":"deliver", "expected_artifact":"old.json"}),
+            &observer,
+        )
+        .await
+        .unwrap();
+    assert_eq!(provider.requests().len(), 1);
+    assert_eq!(outcome.final_state, TaskLifecycleState::Failed);
+    assert!(outcome.artifact_path.is_none());
+    assert!(outcome.artifact_content.is_none());
+    assert_eq!(outcome.cost.input_tokens, 42);
+    assert_eq!(outcome.cost.output_tokens, 17);
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("h06_terminal=task_budget_exhausted")
+    );
+    assert_eq!(
+        observer.snapshot(),
+        vec![TaskLifecycleState::Running, TaskLifecycleState::Failed]
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn h06_m6_provider_error_preserves_partial_usage_and_restores_candidate() {
+    let workspace = TempDir::new().unwrap();
+    let provider = ResponseThenAuthErrorProvider::new(end_turn("first candidate"));
+    let harness = DispatchHarness::build(provider.clone(), workspace).with_h06_repair();
+
+    let outcome = harness
+        .dispatch
+        .run_session(
+            "coding",
+            &json!({"prompt":"deliver", "expected_artifact":"missing.json"}),
+            &RecordingObserver::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.final_state, TaskLifecycleState::Failed);
+    assert_eq!(provider.requests().len(), 2);
+    assert_eq!(outcome.cost.input_tokens, 42);
+    assert_eq!(outcome.cost.output_tokens, 17);
+    assert!(outcome.artifact_path.is_none());
+    let error = outcome.error.as_deref().unwrap();
+    assert!(error.contains("usage_status=partial"), "{error}");
+    assert!(error.contains("scripted authentication failure"), "{error}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn h06_m6_concurrent_invocations_keep_repair_state_isolated() {
+    let workspace_one = TempDir::new().unwrap();
+    let workspace_two = TempDir::new().unwrap();
+    let provider_one = ScriptedLlmProvider::new(vec![
+        end_turn("one initial"),
+        write_file_call("one-write", "result.json", r#"{"owner":"one"}"#),
+        end_turn("one complete"),
+    ]);
+    let provider_two = ScriptedLlmProvider::new(vec![
+        end_turn("two initial"),
+        write_file_call("two-write", "result.json", r#"{"owner":"two"}"#),
+        end_turn("two complete"),
+    ]);
+    let harness_one = DispatchHarness::build(provider_one.clone(), workspace_one).with_h06_repair();
+    let harness_two = DispatchHarness::build(provider_two.clone(), workspace_two).with_h06_repair();
+    let observer_one = RecordingObserver::new();
+    let observer_two = RecordingObserver::new();
+    let input_one = json!({
+        "prompt":"CONCURRENT_ONE_SENTINEL",
+        "expected_artifact":"result.json"
+    });
+    let input_two = json!({
+        "prompt":"CONCURRENT_TWO_SENTINEL",
+        "expected_artifact":"result.json"
+    });
+
+    let (outcome_one, outcome_two) = tokio::join!(
+        harness_one
+            .dispatch
+            .run_session("coding", &input_one, &observer_one),
+        harness_two
+            .dispatch
+            .run_session("coding", &input_two, &observer_two),
+    );
+    let outcome_one = outcome_one.unwrap();
+    let outcome_two = outcome_two.unwrap();
+
+    assert_eq!(outcome_one.final_state, TaskLifecycleState::Ready);
+    assert_eq!(outcome_two.final_state, TaskLifecycleState::Ready);
+    assert_eq!(
+        outcome_one.artifact_content.as_deref(),
+        Some(r#"{"owner":"one"}"#)
+    );
+    assert_eq!(
+        outcome_two.artifact_content.as_deref(),
+        Some(r#"{"owner":"two"}"#)
+    );
+    assert_eq!(provider_one.requests().len(), 3);
+    assert_eq!(provider_two.requests().len(), 3);
+    let one_messages = serde_json::to_string(&provider_one.requests()).unwrap();
+    let two_messages = serde_json::to_string(&provider_two.requests()).unwrap();
+    assert!(one_messages.contains("CONCURRENT_ONE_SENTINEL"));
+    assert!(!one_messages.contains("CONCURRENT_TWO_SENTINEL"));
+    assert!(two_messages.contains("CONCURRENT_TWO_SENTINEL"));
+    assert!(!two_messages.contains("CONCURRENT_ONE_SENTINEL"));
+    let one_ticket = provider_one.requests()[1]
+        .iter()
+        .find(|message| message.content.starts_with("H06 repair ticket v1"))
+        .unwrap()
+        .content
+        .clone();
+    let two_ticket = provider_two.requests()[1]
+        .iter()
+        .find(|message| message.content.starts_with("H06 repair ticket v1"))
+        .unwrap()
+        .content
+        .clone();
+    assert_ne!(one_ticket, two_ticket);
+}
+
+#[tokio::test]
+async fn h06_m0_validator_error_is_terminal() {
+    use octos_agent::workspace_policy::ValidatorSpec;
+
+    let workspace = TempDir::new().unwrap();
+    std::fs::write(workspace.path().join("result.json"), "{}").unwrap();
+    write_m0_completion_validator(
+        workspace.path(),
+        ValidatorSpec::FileExists {
+            path: "${args.unavailable}".into(),
+            min_bytes: None,
+        },
+    );
+    let provider = ScriptedLlmProvider::new(vec![end_turn("done")]);
+    let harness = DispatchHarness::build(provider.clone(), workspace);
+    let observer = RecordingObserver::new();
+    let outcome = harness
+        .dispatch
+        .run_session(
+            "coding",
+            &json!({"prompt": "deliver result", "expected_artifact": "result.json"}),
+            &observer,
+        )
+        .await
+        .unwrap();
+
+    assert_m0_terminal_failure(
+        &outcome,
+        &observer,
+        &provider,
+        "contract_failed:",
+        Some(ValidatorStatus::Error),
+    );
+}
+
+#[tokio::test]
+async fn h06_m0_invalid_arc_input_never_calls_provider() {
+    let workspace = TempDir::new().unwrap();
+    let provider = ScriptedLlmProvider::new(vec![end_turn("must not run")]);
+    let harness = DispatchHarness::build(provider.clone(), workspace);
+    let mut input = sample_arc_input(
+        harness._workspace.path(),
+        ".arc/delegated/result.json",
+        Some(json!({"type": "object"})),
+    );
+    input["expected_artifact"] = json!("../outside.json");
+    let observer = RecordingObserver::new();
+    let result = harness
+        .dispatch
+        .run_session("coding", &input, &observer)
+        .await;
+
+    assert!(matches!(result, Err(McpServerError::InvalidParams(_))));
+    assert!(provider.requests().is_empty());
+    assert_eq!(
+        observer.snapshot(),
+        vec![TaskLifecycleState::Running, TaskLifecycleState::Failed]
+    );
 }
 
 #[tokio::test]

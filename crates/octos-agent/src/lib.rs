@@ -21,6 +21,7 @@ pub mod bundled_app_skills;
 pub mod bundled_pipelines;
 pub mod compaction;
 pub mod compaction_tiered;
+pub mod completion_gate;
 pub mod cost_ledger;
 pub mod dispatch_policy;
 pub mod event_bus;
