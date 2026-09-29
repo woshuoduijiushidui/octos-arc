@@ -1,7 +1,16 @@
 import os
 import unittest
+from unittest import mock
 
-from main import OctosDriver, describe_node, folder_descendants, inline_sources, inline_spec_text, unchanged_node_ids
+from main import (
+    OctosDriver,
+    describe_node,
+    folder_descendants,
+    h01e_checkpoint_enabled,
+    inline_sources,
+    inline_spec_text,
+    unchanged_node_ids,
+)
 import main as m
 
 
@@ -64,6 +73,209 @@ class TransientTests(unittest.TestCase):
     def test_should_retry_provider_errors(self):
         self.assertTrue(OctosDriver._transient("HTTP 503 Service Temporarily Unavailable"))
         self.assertTrue(OctosDriver._transient("failed to send streaming request"))
+
+
+class H01ObservationTests(unittest.TestCase):
+    def test_h01e_checkpoint_is_c_only_and_can_be_disabled(self):
+        self.assertFalse(h01e_checkpoint_enabled("B", None))
+        self.assertTrue(h01e_checkpoint_enabled("C", None))
+        self.assertFalse(h01e_checkpoint_enabled("C", "0"))
+        self.assertTrue(h01e_checkpoint_enabled("C", "1"))
+        with self.assertRaises(ValueError):
+            h01e_checkpoint_enabled("B", "1")
+        with self.assertRaises(ValueError):
+            h01e_checkpoint_enabled("C", "yes")
+
+    @mock.patch("octos_stdio.OctosStdioSession")
+    def test_c_driver_enables_structured_compaction_server_flag(self, session_cls):
+        from pathlib import Path
+
+        driver = OctosDriver(
+            "octos",
+            Path("."),
+            {},
+            Path(".arc/data"),
+            10,
+            Path(".arc/octos-events.jsonl"),
+            h01e_llm_checkpoint=True,
+        )
+
+        driver._get_session()
+
+        self.assertEqual(
+            session_cls.call_args.kwargs["extra_args"],
+            ["--llm-compaction"],
+        )
+
+    def test_should_write_allowlisted_run_observation_without_sensitive_fields(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from arcbench_agent_runtime.context import RuntimePaths
+        from arcbench_agent_runtime.events import EventClient
+
+        with tempfile.TemporaryDirectory() as tmp:
+            events = EventClient(RuntimePaths.from_env(project_dir=tmp))
+            events.record_h01_observation(
+                "B",
+                "run",
+                {
+                    "compaction_count": 0,
+                    "h01e_extra_requests": 0,
+                    "h01e_extra_tokens": 0,
+                    "typed_input_enabled": True,
+                    "api_key": "must-not-be-logged",
+                    "command": "printenv",
+                },
+            )
+
+            record = json.loads(
+                (Path(tmp) / ".arc" / "runner-events.jsonl").read_text()
+            )
+            self.assertEqual(record["type"], "h01_observation")
+            self.assertEqual(record["variant"], "B")
+            self.assertEqual(record["kind"], "run")
+            self.assertEqual(record["h01e_extra_requests"], 0)
+            self.assertEqual(record["h01e_extra_tokens"], 0)
+            self.assertNotIn("api_key", record)
+            self.assertNotIn("command", record)
+            self.assertNotIn("must-not-be-logged", json.dumps(record))
+
+    def test_should_publish_h01e_usage_totals_at_shutdown(self):
+        import argparse
+        import json
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+
+        from arcbench_agent_runtime.context import RuntimePaths
+        from arcbench_agent_runtime.events import EventClient
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".arc").mkdir()
+            (root / ".arc" / "llm-usage.jsonl").write_text(
+                json.dumps({
+                    "request_kind": "h01e_compaction",
+                    "prompt_tokens": 31,
+                    "completion_tokens": 11,
+                })
+                + "\n",
+                encoding="utf-8",
+            )
+            with mock.patch.dict(
+                "os.environ",
+                {
+                    "OCTOS_H01_VARIANT": "C",
+                    "OCTOS_H01E_LLM_CHECKPOINT": "0",
+                },
+            ):
+                flow = m.Flow(argparse.Namespace(web_port=3000), root, root)
+            flow.events = EventClient(RuntimePaths.from_env(project_dir=str(root)))
+            flow.driver = SimpleNamespace(h01_compaction_count=2)
+            flow.task_evidence = object()
+
+            flow.stop_llm_proxy()
+
+            record = json.loads(
+                (root / ".arc" / "runner-events.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()[-1]
+            )
+            self.assertEqual(record["variant"], "C")
+            self.assertEqual(record["h01e_extra_requests"], 1)
+            self.assertEqual(record["h01e_extra_tokens"], 42)
+            self.assertEqual(record["compaction_count"], 2)
+
+    def test_should_reduce_compaction_and_artifact_recall_events_to_safe_metadata(self):
+        import tempfile
+        from pathlib import Path
+
+        observations = []
+        with tempfile.TemporaryDirectory() as tmp:
+            driver = OctosDriver(
+                "octos",
+                Path(tmp),
+                {},
+                Path(tmp) / "data",
+                10,
+                Path(tmp) / "octos-events.jsonl",
+                h01_observer=lambda kind, fields: observations.append((kind, fields)),
+            )
+            compaction = {
+                "status": "installed",
+                "token_estimate_before": 1200,
+                "token_estimate_after": 400,
+                "summarizer_kind": "extractive",
+                "candidate_decision": "accepted",
+                "candidate_reason": "accepted_within_budget",
+                "error": "raw error must not be copied",
+            }
+            driver._log_event(
+                "context/compaction_completed",
+                {"compaction": compaction},
+            )
+            driver._log_event(
+                "tool/started",
+                {
+                    "tool_call_id": "call-1",
+                    "tool_name": "read_file",
+                    "arguments": {
+                        "path": ".arc/evidence/acceptance-0001.json",
+                        "api_key": "must-not-be-logged",
+                    },
+                },
+            )
+            driver._log_event(
+                "tool/completed",
+                {
+                    "tool_call_id": "call-1",
+                    "tool_name": "read_file",
+                    "success": True,
+                    "output_preview": "raw acceptance log must not be copied",
+                },
+            )
+            driver._log_event(
+                "tool/started",
+                {
+                    "tool_call_id": "call-2",
+                    "tool_name": "shell",
+                    "arguments": {"command": "echo must-not-be-logged"},
+                },
+            )
+            event_log = (Path(tmp) / "octos-events.jsonl").read_text()
+
+        self.assertEqual(
+            observations[0],
+            (
+                "compaction",
+                {
+                    "compaction_count": 1,
+                    "tokens_before": 1200,
+                    "tokens_after": 400,
+                    "summarizer_kind": "extractive",
+                    "candidate_decision": "accepted",
+                    "candidate_reason": "accepted_within_budget",
+                },
+            ),
+        )
+        self.assertEqual(
+            observations[1],
+            (
+                "artifact",
+                {
+                    "operation": "recall",
+                    "status": "found",
+                    "artifact_ref": ".arc/evidence/acceptance-0001.json",
+                },
+            ),
+        )
+        self.assertNotIn("must-not-be-logged", repr(observations))
+        self.assertNotIn("raw acceptance log", repr(observations))
+        self.assertNotIn("must-not-be-logged", event_log)
+        self.assertNotIn("raw acceptance log", event_log)
+        self.assertNotIn('"command"', event_log)
 
 
 class FolderDescendantTests(unittest.TestCase):
@@ -163,6 +375,58 @@ class AlreadyPassingProbeTests(unittest.TestCase):
                    "b.spec.ts": SimpleNamespace(error=None, total=2, passed=1, all_passed=False)}
         flow.run_specs = lambda specs, **kw: results[specs[0]]
         self.assertEqual(flow.already_passing_nodes(["REQ-1", "REQ-2", "REQ-3"]), {"REQ-1"})
+
+
+class TaskEvidenceLifecycleTests(unittest.TestCase):
+    def test_should_record_each_existing_app_probe(self):
+        from acceptance import RunSummary
+        from unittest.mock import Mock
+
+        flow = object.__new__(m.Flow)
+        flow.spec_map = {"REQ-1": ["REQ-1.spec.ts"]}
+        flow.probe_count = 0
+        flow.probe_summaries = {}
+        summary = RunSummary(passed=1, total=1, run_id="acceptance-0001")
+        flow.run_specs = Mock(return_value=summary)
+        flow.activate_task_evidence = Mock()
+        flow.record_task_evidence = Mock()
+
+        self.assertEqual(flow.already_passing_nodes(["REQ-1"]), {"REQ-1"})
+        flow.activate_task_evidence.assert_called_once_with(
+            "REQ-1", "probe", "check whether the existing app already satisfies REQ-1"
+        )
+        flow.record_task_evidence.assert_called_once_with(
+            summary,
+            ["REQ-1.spec.ts"],
+            "probe",
+            "reuse the existing implementation",
+        )
+
+    def test_should_refresh_source_after_restoring_application_files(self):
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "frontend").mkdir()
+            (root / "backend").mkdir()
+            git = Mock()
+            store = Mock()
+            store.capsule = object()
+            flow = object.__new__(m.Flow)
+            flow.output_dir = root
+            flow.runtime = SimpleNamespace(git=git)
+            flow.task_evidence = store
+
+            flow.restore_app("0123456789abcdef")
+
+            store.refresh_source.assert_called_once_with(
+                "restore",
+                "revalidate the restored source before treating prior passes as current",
+            )
+            self.assertEqual(git.run.call_count, 3)
 
 
 class CodegenManifestTests(unittest.TestCase):

@@ -1,7 +1,20 @@
 import json
 import unittest
 
-from llm_proxy import BUDGET_NOTICE, destream_request, enforce_turn_budget, ensure_max_tokens, inject_reasoning, request_shape, to_sse, trim_request, trim_system_prompt, usage_record
+from llm_proxy import (
+    BUDGET_NOTICE,
+    destream_request,
+    enforce_turn_budget,
+    ensure_max_tokens,
+    h01e_usage_totals,
+    inject_reasoning,
+    request_kind,
+    request_shape,
+    to_sse,
+    trim_request,
+    trim_system_prompt,
+    usage_record,
+)
 
 
 class InjectTests(unittest.TestCase):
@@ -37,6 +50,51 @@ class UsageTests(unittest.TestCase):
     def test_should_return_none_without_usage(self):
         self.assertIsNone(usage_record(b'{"choices": []}', 1, "low"))
         self.assertIsNone(usage_record(b"garbage", 1, "low"))
+
+    def test_should_record_h01e_request_even_when_provider_returns_no_usage(self):
+        rec = usage_record(
+            b'{"error":{"message":"provider unavailable"}}',
+            7,
+            "low",
+            "h01e_compaction",
+        )
+        self.assertEqual(rec["request_kind"], "h01e_compaction")
+        self.assertFalse(rec["usage_available"])
+        self.assertNotIn("prompt_tokens", rec)
+
+    def test_should_classify_and_total_h01e_requests_without_prompt_content(self):
+        import tempfile
+        from pathlib import Path
+
+        body = json.dumps({
+            "messages": [{"role": "system", "content": "ordinary"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "h01e_structured_checkpoint", "schema": {}},
+            },
+        }).encode()
+        self.assertEqual(request_kind(body), "h01e_compaction")
+        self.assertEqual(request_kind(b'{"messages": []}'), "agent")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "llm-usage.jsonl"
+            path.write_text(
+                "\n".join([
+                    json.dumps({
+                        "request_kind": "agent",
+                        "prompt_tokens": 100,
+                        "completion_tokens": 20,
+                    }),
+                    json.dumps({
+                        "request_kind": "h01e_compaction",
+                        "prompt_tokens": 30,
+                        "completion_tokens": 10,
+                    }),
+                    "{malformed",
+                ]),
+                encoding="utf-8",
+            )
+            self.assertEqual(h01e_usage_totals(path), (1, 40))
 
 
 class SseTests(unittest.TestCase):

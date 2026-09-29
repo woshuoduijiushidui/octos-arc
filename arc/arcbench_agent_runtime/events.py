@@ -6,6 +6,32 @@ from typing import Any
 from .context import RuntimePaths
 from .jsonio import append_jsonl
 
+_H01_FIELDS = {
+    "run": {
+        "compaction_count",
+        "h01e_extra_requests",
+        "h01e_extra_tokens",
+        "typed_input_enabled",
+    },
+    "capsule": {"status", "schema", "bytes", "estimated_tokens"},
+    "compaction": {
+        "compaction_count",
+        "tokens_before",
+        "tokens_after",
+        "summarizer_kind",
+        "candidate_decision",
+        "candidate_reason",
+    },
+    "artifact": {
+        "operation",
+        "status",
+        "artifact_ref",
+        "artifact_sha256",
+        "artifact_bytes",
+        "reason",
+    },
+}
+
 
 def utc_timestamp() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
@@ -18,6 +44,33 @@ class EventClient:
 
     def set_requirement_state_writer(self, writer) -> None:
         self._requirement_state_writer = writer
+
+    def record_h01_observation(
+        self, variant: str, kind: str, fields: dict[str, Any]
+    ) -> None:
+        variant = str(variant or "").strip().upper()
+        if variant not in {"A", "B", "C"}:
+            raise ValueError(f"invalid H01 variant: {variant!r}")
+        allowed = _H01_FIELDS.get(kind)
+        if allowed is None:
+            raise ValueError(f"invalid H01 observation kind: {kind!r}")
+        payload: dict[str, Any] = {
+            "type": "h01_observation",
+            "variant": variant,
+            "kind": kind,
+            "timestamp": utc_timestamp(),
+        }
+        for key in sorted(allowed):
+            value = fields.get(key)
+            if isinstance(value, bool) or value is None:
+                payload[key] = value
+            elif isinstance(value, int):
+                payload[key] = max(0, value)
+            elif isinstance(value, str):
+                value = value.strip()
+                if "\n" not in value and len(value.encode("utf-8")) <= 512:
+                    payload[key] = value
+        append_jsonl(self.paths.runner_events_path, payload)
 
     def _emit_requirement_state(self, node_id: str, phase: str, status: str, message: str | None = None) -> None:
         normalized_node_id = str(node_id or "").strip()

@@ -49,6 +49,8 @@ Environment (all optional):
     OCTOS_ARC_MAX_TOKENS      minimum max_tokens the proxy enforces on chat requests (32768; kernel arc.11 sends 4096)
     OCTOS_ARC_CODEGEN         "0" disables one-request codegen turns for one-node tasks (default on)
     OCTOS_SESSION_SCOPE       turn (default) | node | run — when a fresh octos session starts
+    OCTOS_H01_VARIANT         A | B (default) | C experiment variant
+    OCTOS_H01E_LLM_CHECKPOINT "0" disables C checkpoint; "1" enables it (C default)
     OCTOS_ARC_INSTALL_PLAYWRIGHT  "0" never installs Playwright on the fly
     OCTOS_ARC_ALIAS_SPEC_IDS  "0" stops mirroring node states onto spec ids
     OCTOS_PERF_CONTRACT       "0" drops the performance rules from prompts
@@ -87,8 +89,9 @@ from codegen import (FORMAT_INSTRUCTIONS, dedupe_nav_links, delimiter_drift,  # 
                      parse_file_blocks, unchanged_rewrites, unparsed_reply_digest,
                      write_files)
 from guard import TurnMonitor  # noqa: E402
-from llm_proxy import LlmProxy, configured_model_routes  # noqa: E402
+from llm_proxy import LlmProxy, configured_model_routes, h01e_usage_totals  # noqa: E402
 from requirement_order import ancestors_of, node_fingerprint, topo_order  # noqa: E402
+from task_evidence import TaskEvidenceError, TaskEvidenceStore  # noqa: E402
 
 BUNDLE_DIR = Path(__file__).resolve().parent
 
@@ -98,6 +101,15 @@ def log(msg: str) -> None:
     stdout on long runs but keeps stderr as a separate field)."""
     print(msg, flush=True)
     print(msg, file=sys.stderr, flush=True)
+
+
+def h01e_checkpoint_enabled(variant: str, raw: str | None) -> bool:
+    if raw not in (None, "0", "1"):
+        raise ValueError("OCTOS_H01E_LLM_CHECKPOINT must be 0 or 1")
+    enabled = variant == "C" if raw is None else raw == "1"
+    if enabled and variant != "C":
+        raise ValueError("OCTOS_H01E_LLM_CHECKPOINT is only valid for H01 variant C")
+    return enabled
 
 
 # ---------------------------------------------------------------- postflight
@@ -791,6 +803,70 @@ class PermanentProviderError(RuntimeError):
     """Account failures require external action, not another generation attempt."""
 
 
+_REDACTED_EVENT_KEYS = {
+    "api_key",
+    "arguments",
+    "authorization",
+    "command",
+    "content",
+    "credentials",
+    "env",
+    "error",
+    "input",
+    "message",
+    "output",
+    "output_preview",
+    "password",
+    "prompt",
+    "response",
+    "secret",
+    "text",
+}
+
+
+def _event_value_bytes(value) -> int:
+    try:
+        return len(
+            json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        )
+    except (TypeError, ValueError):
+        return len(str(value).encode("utf-8", errors="replace"))
+
+
+def _bounded_event_string(value: str, limit: int = 512) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= limit:
+        return value
+    end = limit
+    while end > 0:
+        try:
+            return encoded[:end].decode("utf-8")
+        except UnicodeDecodeError:
+            end -= 1
+    return ""
+
+
+def _safe_event_value(value):
+    if isinstance(value, dict):
+        safe = {}
+        for key, item in value.items():
+            normalized_key = str(key).lower()
+            if normalized_key in _REDACTED_EVENT_KEYS:
+                safe[f"{key}_bytes"] = _event_value_bytes(item)
+                continue
+            safe[str(key)] = _safe_event_value(item)
+        return safe
+    if isinstance(value, list):
+        return [_safe_event_value(item) for item in value[:32]]
+    if isinstance(value, str):
+        return _bounded_event_string(value)
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return _bounded_event_string(str(value))
+
+
 def permanent_provider_error(text: str) -> bool:
     lowered = text.lower()
     codes = re.findall(r"\bhttp(?:/\d(?:\.\d)?)?\s+(\d{3})\b", lowered)
@@ -807,8 +883,17 @@ class OctosDriver:
     (system prompt + tool schemas) is what the provider's prefix cache keys on.
     """
 
-    def __init__(self, octos_bin: str, cwd: Path, env: dict, data_dir: Path,
-                 max_iterations: int, events_log: Path) -> None:
+    def __init__(
+        self,
+        octos_bin: str,
+        cwd: Path,
+        env: dict,
+        data_dir: Path,
+        max_iterations: int,
+        events_log: Path,
+        h01_observer=None,
+        h01e_llm_checkpoint: bool = False,
+    ) -> None:
         self.mode = os.environ.get("OCTOS_DRIVER", "stdio")
         # "turn": new session every turn; "node": one session per requirement
         # node (design -> implement -> repairs share context); "run": one session.
@@ -825,6 +910,10 @@ class OctosDriver:
         self.data_dir = data_dir
         self.max_iterations = max_iterations
         self.events_log = events_log
+        self.h01_observer = h01_observer
+        self.h01e_llm_checkpoint = h01e_llm_checkpoint
+        self.h01_compaction_count = 0
+        self._h01_artifact_reads: dict[str, str] = {}
         self._session = None
         self.monitor: TurnMonitor | None = None
         self.hooks: list = []  # profile hooks (protected-directory deny), set by the flow
@@ -844,6 +933,106 @@ class OctosDriver:
                 self.close()
             self.tools_disabled = previous
 
+    def _observe_h01(self, kind: str, fields: dict) -> None:
+        if self.h01_observer is None:
+            return
+        try:
+            self.h01_observer(kind, fields)
+        except Exception:
+            pass
+
+    def _acceptance_artifact_ref(self, arguments: dict) -> str | None:
+        raw = str(arguments.get("path") or arguments.get("file_path") or "")
+        if not raw or "\\" in raw:
+            return None
+        path = Path(raw)
+        if path.is_absolute():
+            try:
+                path = path.relative_to(Path(self.cwd))
+            except ValueError:
+                return None
+        if (
+            len(path.parts) != 3
+            or path.parts[:2] != (".arc", "evidence")
+            or any(part in ("", ".", "..") for part in path.parts)
+        ):
+            return None
+        return path.as_posix()
+
+    def _observe_h01_transport_event(self, method: str, params: dict) -> None:
+        if method == "h01/capsule":
+            self._observe_h01(
+                "capsule",
+                {
+                    "status": params.get("status"),
+                    "schema": params.get("schema"),
+                    "bytes": int(params.get("bytes") or 0),
+                    "estimated_tokens": int(params.get("estimated_tokens") or 0),
+                },
+            )
+            return
+        if method == "context/compaction_completed":
+            compaction = params.get("compaction") or {}
+            self.h01_compaction_count += 1
+            self._observe_h01(
+                "compaction",
+                {
+                    "compaction_count": self.h01_compaction_count,
+                    "tokens_before": int(
+                        compaction.get("token_estimate_before") or 0
+                    ),
+                    "tokens_after": (
+                        int(compaction["token_estimate_after"])
+                        if compaction.get("token_estimate_after") is not None
+                        else None
+                    ),
+                    "summarizer_kind": str(
+                        compaction.get("summarizer_kind") or "unknown"
+                    ),
+                    "candidate_decision": str(
+                        compaction.get("candidate_decision")
+                        or (
+                            "accepted"
+                            if compaction.get("status") == "installed"
+                            else "rejected"
+                        )
+                    ),
+                    "candidate_reason": str(
+                        compaction.get("candidate_reason")
+                        or (
+                            "accepted_legacy"
+                            if compaction.get("status") == "installed"
+                            else "rejected_legacy"
+                        )
+                    ),
+                },
+            )
+            return
+        if method == "tool/started" and params.get("tool_name") == "read_file":
+            artifact_ref = self._acceptance_artifact_ref(
+                params.get("arguments") or {}
+            )
+            if artifact_ref:
+                self._h01_artifact_reads[str(params.get("tool_call_id") or "")] = (
+                    artifact_ref
+                )
+            return
+        if method == "tool/completed":
+            artifact_ref = self._h01_artifact_reads.pop(
+                str(params.get("tool_call_id") or ""), None
+            )
+            if artifact_ref:
+                self._observe_h01(
+                    "artifact",
+                    {
+                        "operation": "recall",
+                        "status": (
+                            "found" if params.get("success") is not False else "failed"
+                        ),
+                        "artifact_ref": artifact_ref,
+                    },
+                )
+
     def _log_event(self, method: str, params: dict) -> None:
         if method == "core/marker":
             log(f"[core-mod] {params.get('line', '')}")
@@ -852,9 +1041,16 @@ class OctosDriver:
                 self.monitor.observe(method, params)
             except Exception:  # noqa: BLE001 - guard must never break a turn
                 pass
+        self._observe_h01_transport_event(method, params)
         try:
             with self.events_log.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps({"method": method, "params": params}, ensure_ascii=False) + "\n")
+                fh.write(
+                    json.dumps(
+                        {"method": method, "params": _safe_event_value(params)},
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
         except OSError:
             pass
 
@@ -862,7 +1058,12 @@ class OctosDriver:
         if self._session is None:
             from octos_stdio import OctosStdioSession
             self._session = OctosStdioSession(self.octos_bin, self.cwd, self.env, self.data_dir,
-                                              on_event=self._log_event)
+                                              on_event=self._log_event,
+                                              extra_args=(
+                                                  ["--llm-compaction"]
+                                                  if self.h01e_llm_checkpoint
+                                                  else None
+                                              ))
             self._session.bootstrap_profile(
                 provider=self.env.get("_ARC_PROVIDER", "openai"),
                 model=self.env.get("_ARC_MODEL", ""),
@@ -1561,6 +1762,15 @@ class Flow:
         self.alias_states = os.environ.get("OCTOS_ARC_ALIAS_SPEC_IDS", "1") != "0"
         self.perf_contract = os.environ.get("OCTOS_PERF_CONTRACT", "1") != "0"
         self.guard_enabled = os.environ.get("OCTOS_GUARD", "1") != "0"
+        self.h01_variant = os.environ.get("OCTOS_H01_VARIANT", "B").strip().upper()
+        if self.h01_variant not in {"A", "B", "C"}:
+            raise ValueError(
+                f"OCTOS_H01_VARIANT must be A, B, or C; got {self.h01_variant!r}"
+            )
+        self.h01e_llm_checkpoint = h01e_checkpoint_enabled(
+            self.h01_variant,
+            os.environ.get("OCTOS_H01E_LLM_CHECKPOINT"),
+        )
         self.t_start = time.time()
         self.runtime = None
         self.events = None
@@ -1582,6 +1792,7 @@ class Flow:
         self.last_codegen_wrote: bool | None = None
         self.evolution = False
         self.folder_children: dict[str, list[str]] = {}
+        self.task_evidence: TaskEvidenceStore | None = None
 
     # -- helpers ----------------------------------------------------------
     def wound_down(self) -> bool:
@@ -1611,6 +1822,59 @@ class Flow:
             for alias, target in self.aliases.items():
                 if target == node_id:
                     fn(alias, message)
+
+    def record_h01_observation(self, kind: str, fields: dict) -> None:
+        events = getattr(self, "events", None)
+        if events is None:
+            return
+        events.record_h01_observation(self.h01_variant, kind, fields)
+
+    def activate_task_evidence(
+        self, node_id: str, phase: str, next_action: str = ""
+    ) -> None:
+        store = getattr(self, "task_evidence", None)
+        if store is None:
+            return
+        try:
+            store.activate(node_id, phase, next_action)
+        except TaskEvidenceError as exc:
+            log(f"[evidence] could not activate {node_id}/{phase}: {exc}")
+
+    def activate_suite_evidence(
+        self, node_ids: list[str], phase: str, next_action: str = ""
+    ) -> None:
+        store = getattr(self, "task_evidence", None)
+        if store is None:
+            return
+        try:
+            store.activate_suite(node_ids, phase, next_action)
+        except TaskEvidenceError as exc:
+            log(f"[evidence] could not activate full suite/{phase}: {exc}")
+
+    def record_task_evidence(
+        self,
+        summary: RunSummary,
+        specs: list[str],
+        phase: str,
+        next_action: str = "",
+    ):
+        store = getattr(self, "task_evidence", None)
+        if store is None:
+            return None
+        try:
+            return store.record_verification(summary, specs, phase, next_action)
+        except TaskEvidenceError as exc:
+            log(f"[evidence] could not record {phase} verification: {exc}")
+            return None
+
+    def refresh_task_evidence(self, phase: str, next_action: str = "") -> None:
+        store = getattr(self, "task_evidence", None)
+        if store is None or store.capsule is None:
+            return
+        try:
+            store.refresh_source(phase, next_action)
+        except TaskEvidenceError as exc:
+            log(f"[evidence] could not refresh {phase} source state: {exc}")
 
     def protected_prefixes(self) -> list[str]:
         prefixes = [".arc/", str(self.output_dir / ".arc"), "requirements/", str(self.req_dir)]
@@ -1981,6 +2245,16 @@ class Flow:
             return False
         summary = self.run_specs(specs)
         passed = (not summary.error) and summary.total and summary.passed == summary.total
+        self.record_task_evidence(
+            summary,
+            specs,
+            "verify" if passed else "repair",
+            (
+                "continue with the accepted tiny implementation"
+                if passed
+                else f"repair the tiny implementation for {node_id}"
+            ),
+        )
         log(f"[flow] {node_id}: tiny tier {'passed' if passed else 'failed'} its specs"
             f" ({summary.passed}/{summary.total})" if not summary.error else f"[flow] {node_id}: tiny tier could not run specs")
         if not passed:
@@ -2252,6 +2526,9 @@ class Flow:
                 git.run(["checkout", sha, "--", part], check=False)
         git.run(["clean", "-fd", "-e", "node_modules", "-e", "dist", "--", "frontend", "backend"], check=False)
         log(f"[flow] restored frontend/ and backend/ to best commit {sha[:8]}")
+        self.refresh_task_evidence(
+            "restore", "revalidate the restored source before treating prior passes as current"
+        )
 
     # -- acceptance -------------------------------------------------------
     def setup_playwright(self) -> None:
@@ -2323,9 +2600,17 @@ class Flow:
             mode = "none" if getattr(self, "nodes_to_implement", 2) <= 1 else "low"
         upstream = os.environ.get("OPENAI_BASE_URL", "")
         routes_configured = bool(json.loads(configured_model_routes() or "[]"))
-        if mode == "passthrough" and not routes_configured:
+        if (
+            mode == "passthrough"
+            and not routes_configured
+            and not self.h01e_llm_checkpoint
+        ):
             return
         if not upstream.startswith("http"):
+            if self.h01e_llm_checkpoint:
+                raise ValueError(
+                    "H01e requires an HTTP provider endpoint so its usage is measurable"
+                )
             if routes_configured:
                 raise ValueError("model routing requires an HTTP provider endpoint")
             return
@@ -2336,7 +2621,7 @@ class Flow:
                                       trim=os.environ.get("OCTOS_ARC_TRIM_PROMPT", "1") != "0",
                                       min_max_tokens=int(os.environ.get("OCTOS_ARC_MAX_TOKENS", "32768"))).start()
         except OSError as exc:
-            if routes_configured:
+            if routes_configured or self.h01e_llm_checkpoint:
                 raise
             log(f"[proxy] could not start local LLM proxy ({exc}); using the endpoint directly")
             return
@@ -2349,6 +2634,23 @@ class Flow:
         proxy = getattr(self, "llm_proxy", None)
         if proxy:
             proxy.stop()
+        usage_path = self.output_dir / ".arc" / "llm-usage.jsonl"
+        h01e_requests, h01e_tokens = h01e_usage_totals(usage_path)
+        driver = getattr(self, "driver", None)
+        self.record_h01_observation(
+            "run",
+            {
+                "compaction_count": int(
+                    getattr(driver, "h01_compaction_count", 0) or 0
+                ),
+                "h01e_extra_requests": h01e_requests,
+                "h01e_extra_tokens": h01e_tokens,
+                "typed_input_enabled": (
+                    getattr(self, "task_evidence", None) is not None
+                    and os.environ.get("OCTOS_DRIVER", "stdio") != "chat"
+                ),
+            },
+        )
         self.log_usage_summary()
 
     def log_usage_summary(self) -> None:
@@ -2393,7 +2695,7 @@ class Flow:
             if err is None:
                 err = server.start()
             if err is not None:
-                return RunSummary(error=err)
+                return self.runner.infrastructure_failure(specs, err)
             summary = self.runner.run(specs, f"http://127.0.0.1:{self.smoke_port}", workers=workers)
             return summary
         finally:
@@ -2425,13 +2727,25 @@ class Flow:
         A failing extension is repaired without replacing working features."""
         if self.runner is None or not specs:
             return None
-        best_passed, best_sha, regressions, stalls = -1, self.head(), 0, 0
+        best_passed, best_sha, best_summary, regressions, stalls = (
+            -1,
+            self.head(),
+            None,
+            0,
+            0,
+        )
         rewrite_used = False
         previous_failures = None
         self.codegen_blocked = False  # same failure twice in codegen mode -> tool mode for this node
         for attempt in range(self.repair_rounds + 1):
             summary = self.run_specs(specs)
             if summary.error and summary.killed:
+                self.record_task_evidence(
+                    summary,
+                    specs,
+                    "verify",
+                    "retry acceptance after the runner is available",
+                )
                 log(f"[acceptance] {node_id}: test runner killed ({summary.error[:120]}); no verdict from this round")
                 return None
             if summary.error:
@@ -2439,12 +2753,23 @@ class Flow:
                 failures = (f"- Feature: app startup\n  Failed at: build/start\n"
                             f"  Observation: {startup_error_digest(summary.error, 600)}\n"
                             f"  Steps: npm run build -> npm start")
-                summary = RunSummary(passed=0, total=max(1, len(specs)))
+                summary.passed = 0
+                summary.total = max(1, len(specs))
                 passed = 0
             else:
                 passed = summary.passed
                 failures = failure_summaries(summary) + failure_source_context(summary, self.tests_dir)
                 self.record_tests(node_id, specs, summary)
+            self.record_task_evidence(
+                summary,
+                specs,
+                "verify" if summary.total and passed == summary.total else "repair",
+                (
+                    "continue to the next requirement"
+                    if summary.total and passed == summary.total
+                    else f"repair the failing acceptance evidence for {node_id}"
+                ),
+            )
             log(f"[acceptance] {node_id} round {attempt}: {passed}/{summary.total}")
             was_codegen = self.codegen_mode()
             normalized = failure_signature(summary) if summary.results else failures
@@ -2498,7 +2823,13 @@ class Flow:
             if passed > best_passed:
                 if best_passed >= 0:
                     self.commit(f"{node_id} (repair {attempt}): {passed}/{summary.total} pass")
-                best_passed, best_sha, regressions, stalls = passed, self.head(), 0, 0
+                best_passed, best_sha, best_summary, regressions, stalls = (
+                    passed,
+                    self.head(),
+                    summary,
+                    0,
+                    0,
+                )
             elif passed == best_passed and attempt > 0:
                 stalls += 1
                 if stalls >= 2 and not (was_codegen and self.codegen_blocked):
@@ -2510,6 +2841,13 @@ class Flow:
                 regressions += 1
                 if regressions >= 2 and best_sha:
                     self.restore_app(best_sha)
+                    if best_summary is not None:
+                        self.record_task_evidence(
+                            best_summary,
+                            specs,
+                            "repair",
+                            f"continue repairing {node_id} from the restored best state",
+                        )
                     self.pending_corrections.append(
                         f"Your last two repairs made the tests worse; the harness restored frontend/ and backend/ "
                         f"to the best state ({best_passed}/{summary.total}). Start from that code.")
@@ -2581,6 +2919,13 @@ class Flow:
         # even when the current commit already equals the best recorded commit.
         if best_passed > 0 and best_sha:
             self.restore_app(best_sha)
+            if best_summary is not None:
+                self.record_task_evidence(
+                    best_summary,
+                    specs,
+                    "verify",
+                    f"review unresolved acceptance evidence for {node_id}",
+                )
             self.commit(f"{node_id}: keep best acceptance state {best_passed}")
         return False
 
@@ -2710,6 +3055,9 @@ class Flow:
         design_wanted = self.design_enabled and total >= self.design_min_nodes
         inline_design = design_wanted and self.design_mode == "inline"
         if design_wanted and not inline_design:
+            self.activate_task_evidence(
+                node_id, "design", f"design the implementation for {node_id}"
+            )
             design = self.design(node, ordered, deadline)
         if design:
             self.designs[node_id] = design
@@ -2718,6 +3066,9 @@ class Flow:
         elif not inline_design:
             self.mark("design_done", node_id, "design folded into the implementation prompt")
 
+        self.activate_task_evidence(
+            node_id, "implement", f"implement and verify {node_id}"
+        )
         self.mark("implementation_started", node_id)
         design_text = ("Design contract for this node (follow it):\n"
                        + json.dumps(design, ensure_ascii=False)[:4000] + "\n") if design else ""
@@ -2897,8 +3248,21 @@ class Flow:
             specs = list(self.spec_map.get(node_id) or [])
             if not specs:
                 continue
+            self.activate_task_evidence(
+                node_id, "probe", f"check whether the existing app already satisfies {node_id}"
+            )
             summary = self.run_specs(specs)
             self.probe_count += 1
+            self.record_task_evidence(
+                summary,
+                specs,
+                "probe",
+                (
+                    "reuse the existing implementation"
+                    if summary.all_passed
+                    else f"implement or repair {node_id}"
+                ),
+            )
             if summary.error:
                 log(f"[acceptance] probe {node_id}: existing app does not build/start/serve ({summary.error[:160]})")
                 continue
@@ -2914,6 +3278,9 @@ class Flow:
         """Evolution: unchanged node — carry the design/impl over, re-run its specs."""
         node_id = str(node.get("id"))
         specs = list(self.spec_map.get(node_id) or [])
+        self.activate_task_evidence(
+            node_id, "regression", f"verify unchanged behavior for {node_id}"
+        )
         self.mark("design_started", node_id)
         self.mark("design_done", node_id, "unchanged since the previous requirement version; carried over")
         self.mark("implementation_started", node_id)
@@ -2922,10 +3289,23 @@ class Flow:
         if self.runner is not None and specs:
             summary = self.probe_summaries.pop(node_id, None) or self.run_specs(specs)
             if summary.error:
+                self.record_task_evidence(
+                    summary, specs, "regression", "resolve the acceptance infrastructure error"
+                )
                 log(f"[acceptance] regression {node_id} infrastructure error: {summary.error[:300]}")
             else:
                 self.record_tests(node_id, specs, summary)
                 verdict = summary.all_passed
+                self.record_task_evidence(
+                    summary,
+                    specs,
+                    "regression",
+                    (
+                        "continue to the next requirement"
+                        if verdict
+                        else f"repair the regression in {node_id}"
+                    ),
+                )
                 log(f"[acceptance] regression {node_id}: {summary.passed}/{summary.total}")
                 if not verdict:
                     deadline = time.time() + min(self.node_budget_cap, max(240, self.remaining() / 2))
@@ -2951,13 +3331,34 @@ class Flow:
         specs = sorted({spec for paths in verified.values() for spec in paths})
         if len(specs) < 2:
             return
+        self.activate_suite_evidence(
+            list(verified),
+            "regression",
+            f"run regression checkpoint {index}",
+        )
         workers = workers_for_final(getattr(self, "mem_limit", None),
                                     int(os.environ.get("OCTOS_ARC_FINAL_WORKERS", "4")))
         summary = self.run_specs(specs, workers=workers, grader_like=True)
         if summary.error or summary.killed:
+            self.record_task_evidence(
+                summary,
+                specs,
+                "regression",
+                "retry the regression checkpoint when the runner is available",
+            )
             log(f"[acceptance] checkpoint {index}: no reliable verdict; {summary.error or 'runner killed'}")
             return
         grouped = nodes_for_failures(summary.results, verified)
+        self.record_task_evidence(
+            summary,
+            specs,
+            "regression",
+            (
+                "continue implementation"
+                if not grouped
+                else "repair the regressions reported by the checkpoint"
+            ),
+        )
         log(f"[acceptance] checkpoint {index}: {summary.passed}/{summary.total}; "
             f"regressed nodes {sorted(node for node in grouped if node)}")
         for node in grouped:
@@ -3065,6 +3466,16 @@ class Flow:
             return  # single spec already judged by the node run
         # One more round than the identical-failure escalation needs, so the
         # changed approach actually gets to run.
+        suite_nodes = [
+            node_id
+            for node_id, specs in self.spec_map.items()
+            if node_id and specs
+        ]
+        self.activate_suite_evidence(
+            suite_nodes,
+            "full_suite",
+            "verify all requirements together",
+        )
         rounds = int(os.environ.get("OCTOS_FINAL_REPAIR_ROUNDS", "3"))
         workers = workers_for_final(getattr(self, "mem_limit", None), int(os.environ.get("OCTOS_ARC_FINAL_WORKERS", "4")))
         previous_failing: frozenset | None = None
@@ -3089,6 +3500,12 @@ class Flow:
         for attempt in range(rounds + 1):
             summary = self.run_specs(all_specs, workers=workers, grader_like=True)
             while summary.error and summary.killed and workers > 1:
+                self.record_task_evidence(
+                    summary,
+                    all_specs,
+                    "full_suite",
+                    "retry the full suite when the runner is available",
+                )
                 # Cloud 29c840566f36: the runner was OOM-killed under a 512 MiB
                 # cgroup. The memory a suite needs is not known before running it,
                 # so give the box a count it can hold instead of abandoning the
@@ -3109,7 +3526,8 @@ class Flow:
                 failures = (f"- Feature: application startup exactly as the grader runs it (only PORT set)\n"
                             f"  Failed at: npm start\n  Observation: {startup_error_digest(summary.error, 700)}\n"
                             f"  Steps: npm run build -> npm start")
-                summary = RunSummary(passed=0, total=len(all_specs))
+                summary.passed = 0
+                summary.total = len(all_specs)
             else:
                 grouped = nodes_for_failures(summary.results, self.spec_map)
                 failures = failure_summaries(summary) + failure_source_context(summary, self.tests_dir)
@@ -3120,6 +3538,16 @@ class Flow:
                           for path in (paths or [])}
                 passed_a_round |= {owners.get(Path(r.file or "").name)
                                    for r in summary.results if r.ok} - {None}
+            self.record_task_evidence(
+                summary,
+                all_specs,
+                "full_suite",
+                (
+                    "finish the run"
+                    if not grouped
+                    else "repair the failures from the full acceptance suite"
+                ),
+            )
             log(f"[acceptance] full suite round {attempt}: {summary.passed}/{summary.total}; failing nodes "
                 f"{sorted(k for k in grouped if k) or ('all' if None in grouped and not summary.results else [])}")
             self.record_full_suite(summary, grouped)
@@ -3223,6 +3651,12 @@ class Flow:
         if best is not None and best["sha"] and last_passed < best["passed"]:
             log(f"[acceptance] full suite: last round {last_passed} < best {best['passed']}; restoring the best state")
             self.restore_app(best["sha"])
+            self.record_task_evidence(
+                best["summary"],
+                all_specs,
+                "full_suite",
+                "finish from the restored best full-suite state",
+            )
             self.record_full_suite(best["summary"], best["grouped"])
             self.commit(f"chore: keep best full-suite state {best['passed']}/{best['summary'].total}")
 
@@ -3435,12 +3869,38 @@ class Flow:
                 raise ValueError("no ATOMIC requirement nodes found")
             self.classify_tree(tree)
             node_ids = [str(n.get("id")) for n in ordered]
+            self.folder_children = folder_descendants(tree)
+            requirement_file = self.req_dir / "requirements.yaml"
+            if not requirement_file.is_file():
+                requirement_file = self.req_dir / "requirements.yml"
+            try:
+                self.task_evidence = TaskEvidenceStore(
+                    self.output_dir,
+                    requirement_file,
+                    tree,
+                    ordered,
+                    self.folder_children,
+                    observer=self.record_h01_observation,
+                )
+            except TaskEvidenceError as exc:
+                self.task_evidence = None
+                log(f"[evidence] task evidence disabled: {exc}")
+            self.record_h01_observation(
+                "run",
+                {
+                    "compaction_count": 0,
+                    "h01e_extra_requests": 0,
+                    "h01e_extra_tokens": 0,
+                    "typed_input_enabled": (
+                        self.task_evidence is not None
+                        and os.environ.get("OCTOS_DRIVER", "stdio") != "chat"
+                    ),
+                },
+            )
             if not self.budget_explicit:
                 # 32-node trees need hours, not the 1-hour smoke default.
                 self.budget = max(self.budget, self.seconds_per_node * len(ordered))
             log(f"[flow] {len(ordered)} atomic nodes in dependency order: {node_ids}; time budget {self.budget}s")
-            self.folder_children = folder_descendants(tree)
-
             self.evolution = self.has_app()
             unchanged: set[str] = set()
             if self.evolution:
@@ -3523,7 +3983,9 @@ class Flow:
             env["PORT"] = str(self.smoke_port)  # a bare `npm start` inside a turn must not hit the grading port
             self.driver = DryRunDriver() if dry_run else OctosDriver(
                 octos_bin, self.output_dir, env, data_dir, int(os.environ.get("OCTOS_MAX_ITERATIONS", "500")),
-                events_log=self.output_dir / ".arc" / "octos-events.jsonl")
+                events_log=self.output_dir / ".arc" / "octos-events.jsonl",
+                h01_observer=self.record_h01_observation,
+                h01e_llm_checkpoint=self.h01e_llm_checkpoint)
             self.driver.hooks = protected_hooks(protected)
             threading.Thread(target=_port_watchdog, args=(self.web_port, self.output_dir, watchdog_stop),
                              daemon=True).start()
