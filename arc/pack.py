@@ -23,6 +23,12 @@ ARC_DIR = Path(__file__).resolve().parent
 OUTPUT = ARC_DIR.parent / "octos-arc-bundle.zip"
 
 # 平台要的包内容。main.py 必须在根，其余带目录结构。
+#
+# `public-tests` 必须在包里：`main.locate_acceptance_tests` 的第三个候选就是
+# `bundle_dir/public-tests`（按需求树根名匹配 manifest.json）。平台不往
+# /workspace/tests 挂 spec 的题目（官方 hackathon）只能靠这一条拿到 spec，
+# 否则每个节点都没有本地判定、修复回路全程禁用。平台会挂 spec 的题目不受影响：
+# /workspace/tests 排在前面，命中后不会走到这里。
 ENTRIES = (
     "main.py",
     "rust_engine.py",
@@ -37,7 +43,9 @@ ENTRIES = (
     "guard.py",
     "llm_proxy.py",
     "codegen.py",
+    "task_evidence.py",
     "hooks",
+    "public-tests",
     "requirements.txt",
     "arcbench_agent_runtime",
 )

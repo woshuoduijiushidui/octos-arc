@@ -30,6 +30,36 @@ class SpecIdTests(unittest.TestCase):
         self.assertIsNone(spec_node_id("support/e2e.ts"))
         self.assertIsNone(spec_node_id("smoke.spec.ts"))
 
+    def test_should_extract_dashed_requirement_id(self):
+        """hackathon 两题的 id 是 `REQ-1-1-1`（其余题都是 `REQ-1.1`）。
+
+        只认点号的正则会把它截成 `REQ-1`，而 `REQ-1` 是 FOLDER、不在原子节点表里，
+        于是每条 spec 都落进 None（回归集）：节点永远拿不到自己的验收用例，
+        `acceptance_loop` 因 `not specs` 直接返回 None，修复回路全程禁用。
+        """
+        self.assertEqual(spec_node_id("REQ-1-1-1.spec.ts"), "REQ-1-1-1")
+        self.assertEqual(spec_node_id("REQ-1-3-1-import-csv.spec.ts"), "REQ-1-3-1")
+        self.assertEqual(spec_node_id("sub/REQ-12-3-4-x.spec.ts"), "REQ-12-3-4")
+
+    def test_should_extract_every_numeric_segment_from_a_mixed_id(self):
+        self.assertEqual(spec_node_id("REQ-1.2-3.spec.ts"), "REQ-1.2-3")
+
+    def test_should_still_reject_non_requirement_specs(self):
+        self.assertIsNone(spec_node_id("login.spec.ts"))
+        self.assertIsNone(spec_node_id("REQ-abc.spec.ts"))
+
+
+class DashedIdMappingTests(unittest.TestCase):
+    def test_should_hand_each_dashed_spec_to_its_own_atomic_node(self):
+        node_ids = ["REQ-1-1-1", "REQ-1-2-1", "REQ-1-3-1"]
+        specs = ["REQ-1-3-1.spec.ts", "REQ-1-1-1.spec.ts", "REQ-1-2-1.spec.ts"]
+        mapping, aliases = map_specs_to_nodes(specs, node_ids)
+        self.assertEqual(mapping["REQ-1-1-1"], ["REQ-1-1-1.spec.ts"])
+        self.assertEqual(mapping["REQ-1-2-1"], ["REQ-1-2-1.spec.ts"])
+        self.assertEqual(mapping["REQ-1-3-1"], ["REQ-1-3-1.spec.ts"])
+        self.assertEqual(mapping[None], [])
+        self.assertEqual(aliases, {})
+
 
 class MappingTests(unittest.TestCase):
     def test_should_match_exact_ids(self):

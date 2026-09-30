@@ -24,7 +24,11 @@ from pathlib import Path
 from typing import Callable
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
-_SPEC_ID = re.compile(r"^(REQ-\d+(?:\.\d+)*)(?=[.\-_ ]|$)")
+_SPEC_ID = re.compile(r"^(REQ-\d+(?:[.\-]\d+)*)(?=[.\-_ ]|$)")
+# Segment separator is either `.` or `-`: arc-bench-web packs use `REQ-2.7.6.1`, the
+# hackathon packs use `REQ-1-1-1`. Accepting only `.` truncated the dashed form to
+# `REQ-1`, which is a FOLDER and absent from the atomic node list, so every spec
+# fell into the unmapped set and no node ever received its acceptance cases.
 
 
 def spec_node_id(rel_path: str) -> str | None:

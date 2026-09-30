@@ -9,5 +9,7 @@
  "arc-bench-web--ctrip": "Ctrip Travel System",
  "arc-bench-web--keep": "Keep",
  "arc-bench-web--prestashop": "PrestaShop E-commerce Website",
- "arc-bench-web--stackoverflow": "Stack Overflow Platform"
+ "arc-bench-web--stackoverflow": "Stack Overflow Platform",
+ "hackathon--sheet": "Core Requirements for an Online Spreadsheet Data Workspace",
+ "hackathon--github": "GitHub Collaboration Platform Core Requirements"
 }

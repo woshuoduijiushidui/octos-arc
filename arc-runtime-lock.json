@@ -16,16 +16,18 @@
     "original_bundle_sha256": "1914ace16d50de61f3d7e9d3838c439f65bbfd64e7c0493992de198528f54a5e"
   },
   "runtime_release": {
-    "version": "v2.0.3-rc.11-arc.14",
-    "source_commit": "08b5202176bcd3074f6d8cdbe4a62fe6b001b77a",
+    "version": "v2.0.3-rc.11-arc.23",
+    "source_commit": "7a79c5bc656886e8b3a5b55f58d0ee5851537d96",
+    "release_tag_commit": "426f6a8e49d62ae9ecc57b2bd4e22506a85d79e1",
+    "provenance_note": "The binary's baked OCTOS_GIT_SHA (crates/octos-cli/build.rs: `git rev-parse HEAD`) is 7a79c5bc656886e8b3a5b55f58d0ee5851537d96, which is NOT a commit of this repository; that object does not exist here and no branch contains it. The short hash in the version string (7a79c5b) is that commit's first seven characters. release-metadata.txt records the tag commit 426f6a8e… instead, so the release was published from a working copy whose HEAD was 7a79c5bc…. `octos arc run --lock` compares source_commit against the binary's OCTOS_GIT_SHA, so the machine-checked field carries the value the artifact actually reports and the tag commit is kept beside it; writing the tag commit there instead is verified to fail the pin check. The build tree was clean (see verified_by.source_dirty), so the only remaining gap is that commit itself: it is not reachable from any published branch, which is what makes this release non-reproducible from the repository. A rebuild published from a committed revision is what would close that.",
     "target": "x86_64-unknown-linux-gnu",
-    "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+    "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
     "archive": "octos-bundle-x86_64-unknown-linux-gnu.tar.gz",
-    "archive_sha256": "cf301dc7a498bf97c49104a348e5f888690f639bb9ed964f8b229b040cb9b4cd",
+    "archive_sha256": "62e8d5384484e931f6cf9fb20eee38008071a4f4d6c5ed6ecd4d8f283c2f5473",
     "binary": "octos",
-    "binary_version": "octos 2.0.3-rc.11 (08b52021 2026-09-18)",
-    "binary_sha256": "b7a2bd368b3b930863b543daa8e82db2b5acd2a085cbde47abc1aeca16b83df2",
-    "url": "https://github.com/woshuoduijiushidui/octos-arc/releases/download/v2.0.3-rc.11-arc.14/octos-bundle-x86_64-unknown-linux-gnu.tar.gz"
+    "binary_version": "octos 2.0.3-rc.11 (7a79c5b 2026-09-30)",
+    "binary_sha256": "a7172706ffad4c4e5faccdf6ba867e1b36c1a05b4197b4d53e638e32a56d5b74",
+    "url": "https://github.com/woshuoduijiushidui/octos-arc/releases/download/v2.0.3-rc.11-arc.23/octos-bundle-x86_64-unknown-linux-gnu.tar.gz"
   },
   "build": {
     "source_commit": "08e10c058ff8d6248d8cfaa91309ec6d430d4ae1",
@@ -34,6 +36,17 @@
     "command": "cargo build --locked -p octos-cli --no-default-features --features api",
     "binary": "target/release/octos",
     "binary_sha256": "a856afaf88c1967ad95ec2268259665085aa9a9ef6adb27aef0c29a6558488b1"
+  },
+  "verified_by": {
+    "when": "2026-09-30",
+    "how": "Downloaded octos-bundle-x86_64-unknown-linux-gnu.tar.gz (62,487,625 B) and recomputed both digests locally; both match the published bundle.sha256 / octos.sha256 and release-metadata.txt. source_commit was read out of the extracted ELF as a 40-hex constant adjacent to the baked OCTOS_BUILD_TARGET string, not copied from the release notes. The whole manifest was then verified by the real binary: running `octos arc <req> --output-dir <dir> --mode create --runtime-lock <this file>` (without --prepare-only, which returns before pin::verify) reached the stage after the pin check and stopped at 'Set --model or MODEL' (runner.rs:475). Substituting only the tag commit for source_commit under the same conditions fails at pin.rs:68 'Runtime source commit mismatch', so the pin check really did run and accept these values.",
+    "archive_sha256_recomputed": "62e8d5384484e931f6cf9fb20eee38008071a4f4d6c5ed6ecd4d8f283c2f5473",
+    "binary_sha256_recomputed": "a7172706ffad4c4e5faccdf6ba867e1b36c1a05b4197b4d53e638e32a56d5b74",
+    "source_dirty": false,
+    "source_dirty_evidence": "pin::verify refuses a binary built from tracked uncommitted changes, and in the run above it did not refuse: the failure came from the later model-configuration stage, so OCTOS_SOURCE_DIRTY was baked as \"false\" and the release came from a clean tree.",
+    "unverified": [
+      "provenance of commit 7a79c5bc656886e8b3a5b55f58d0ee5851537d96 (absent from this repository, so the build tree cannot be reconstructed from here)"
+    ]
   },
   "model_configuration": null,
   "arc_submission": null,

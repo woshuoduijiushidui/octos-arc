@@ -513,7 +513,7 @@ def source_listing(output_dir: Path, limit: int = 60) -> str:
 # from it at runtime and the two MUST be bumped together. `OCTOS_RELEASE_URL`
 # overrides it for controlled tests only.
 OCTOS_RELEASE_URL = (
-    "https://github.com/woshuoduijiushidui/octos-arc/releases/download/v2.0.3-rc.11-arc.22/"
+    "https://github.com/woshuoduijiushidui/octos-arc/releases/download/v2.0.3-rc.11-arc.23/"
     "octos-bundle-x86_64-unknown-linux-gnu.tar.gz"
 )
 
@@ -1297,6 +1297,7 @@ def compact_spec_lines(text: str) -> str:
 
 UI_CONTRACT_DATA = """\
 - Treat examples as examples unless the requirement explicitly identifies initial records or enumerated values. Implement general handling for other valid inputs. Preserve required initial data without overwriting existing user data; do not invent broad lists or fixed sample accounts.
+- When a requirement addresses grid cells by coordinate (a spreadsheet cell `A1`, or a table addressed by row number and column letter), expose the container with `role="grid"` and every cell with `role="gridcell"`, and give each gridcell the coordinate as its accessible name (`aria-label="A1"`) because its visible text is the cell's value. Row headers are `role="rowheader"` with the row number as their accessible name, column headers `role="columnheader"` with the column letter, and gridcells also carry `aria-rowindex` / `aria-colindex`, 1-based over the grid's rows and columns in displayed order. A harness that must act on a specific cell can then find it by name or by index instead of guessing from its value.
 """
 
 UI_CONTRACT_SESSION = """\
@@ -1826,6 +1827,30 @@ class Flow:
 
     def time_up(self) -> bool:
         return self.remaining() <= 0
+
+    def final_verdict_for_undecided(self, node_id: str, rehearsed: bool, final_ok: bool | None) -> bool | None:
+        """Verdict for a node the per-node loop never judged.
+
+        With acceptance specs, the closing LLM turn plus the startup rehearsal is the
+        established fallback for a node whose own run was skipped or inconclusive. Two
+        cases must not be turned into a pass, because neither is evidence about a
+        requirement — an app that builds and starts is not an app that meets one:
+
+          * the run has no acceptance specs at all;
+          * this node has no spec of its own (a partially covered task: the closing
+            turn judges the app, not this requirement).
+
+        Those nodes stay without a verdict, which is also what stops `mark_folders`
+        and the closing loop from writing `test_passed` for them.
+
+        Cloud hackathon--sheet `986f71047724`: no spec was mounted, `acceptance_loop`
+        returned None for all 24 nodes, and the closing block turned that single LLM
+        turn into 24 `test_passed` events — the dashboard showed 42/42 green against a
+        real score of 32/100.
+        """
+        if not self.tests_dir or not self.spec_map.get(node_id):
+            return None
+        return bool(rehearsed and final_ok is not False)
 
     def mark(self, kind: str, node_id: str, message: str | None = None) -> None:
         fn = getattr(self.events, f"mark_{kind}")
@@ -3959,6 +3984,10 @@ class Flow:
                     f"{ {k: v for k, v in self.spec_map.items() if v} }; aliases {self.aliases}")
             else:
                 log("[tests] no acceptance specs found; building from requirement text only")
+                log("[tests] WARNING: without specs there is no local verdict for any node — the repair "
+                    "loop, the regression checkpoints and the full-suite pass are all disabled, and every "
+                    "node will be reported UNVERIFIED. Ship the task's specs in this bundle "
+                    "(arc/public-tests + pack.py ENTRIES) or the score is decided blind.")
 
             self.maybe_probe(node_ids)
             self.runtime.git.ensure_repo()
@@ -4037,12 +4066,17 @@ class Flow:
                                             self.node_timeout, "final check")
                     self.commit("chore: final verification pass")
                 rehearsed = self.rehearsal()
+                unverifiable = [n for n in undecided if not self.spec_map.get(n)]
+                if unverifiable:
+                    log(f"[flow] {len(unverifiable)} node(s) without their own acceptance spec stay "
+                        f"UNVERIFIED (no test state is written for them): {unverifiable}")
                 for node_id in undecided:
-                    if rehearsed and final_ok is not False:
+                    verdict = self.final_verdict_for_undecided(node_id, rehearsed, final_ok)
+                    if verdict is True:
                         self.mark("test_passed", node_id, "final check and startup rehearsal passed")
-                    else:
+                    elif verdict is False:
                         self.mark("test_failed", node_id, "final check or startup rehearsal failed")
-                    self.test_verdict[node_id] = bool(rehearsed and final_ok is not False)
+                    self.test_verdict[node_id] = verdict
             finally:
                 watchdog_stop.set()
                 self.postflight()
@@ -4055,7 +4089,9 @@ class Flow:
             self.commit("chore: traceability and acceptance state")
             failed = [i for i in node_ids if self.test_verdict.get(i) is not True]
             if failed:
-                self.events.mark_run_completed(f"completed; nodes not verified: {', '.join(failed)}")
+                reason = "completed; nodes not verified" if self.tests_dir else \
+                    "completed; no acceptance specs were available, so no node could be verified"
+                self.events.mark_run_completed(f"{reason}: {', '.join(failed)}")
             else:
                 self.events.mark_run_completed("all requirement nodes implemented and verified")
             _reap_stray_processes("postflight", self.output_dir)
@@ -4087,7 +4123,13 @@ class Flow:
     def mark_folders(self) -> None:
         """The platform counts FOLDER nodes as requirements too ("45 requirements
         and 32 scenarios" for a 32-leaf tree); derive their state from their
-        atomic descendants so the functional-rate denominator is covered."""
+        atomic descendants so the functional-rate denominator is covered.
+
+        Without acceptance specs no descendant can ever carry a verdict, so the
+        test state is skipped entirely instead of defaulting to a verdict: the
+        folders were designed and implemented, and that is all that is known.
+        """
+        specs_available = bool(self.tests_dir)
         for folder_id, leaves in self.folder_children.items():
             if not leaves:
                 continue
@@ -4095,12 +4137,15 @@ class Flow:
             self.events.mark_design_started(folder_id)
             self.events.mark_design_done(folder_id, f"{len(leaves)} atomic children designed")
             self.events.mark_implementation_started(folder_id)
-            if all(v is not None for v in verdicts) or any(leaf in self.impl_failed for leaf in leaves):
+            if (all(v is not None for v in verdicts) or any(leaf in self.impl_failed for leaf in leaves)
+                    or not specs_available):
                 done = [leaf for leaf in leaves if leaf not in self.impl_failed]
                 if done:
                     self.events.mark_implementation_done(folder_id, f"{len(done)}/{len(leaves)} atomic children implemented")
                 else:
                     self.events.mark_implementation_failed(folder_id, "no atomic child implemented")
+            if not specs_available:
+                continue
             if all(v is True for v in verdicts):
                 self.events.mark_test_passed(folder_id, f"all {len(leaves)} atomic children pass")
             else:
