@@ -540,6 +540,14 @@ test('REQ-1: roll a dice', async ({ page }) => {
         self.assertIn("page.goto('/');", out)
         self.assertNotIn("await", out); self.assertNotIn("import", out); self.assertNotIn("});", out.splitlines())
 
+    def test_should_skip_tiny_when_it_cannot_be_verified(self):
+        # arc.log: every node ran a tiny turn that logged "tiny tier unverified
+        # (no runner to serve it)" and then fell through to the compact/tool tier
+        # anyway -- up to 871s of paid model time per node for no verifiable gain.
+        self.assertFalse(m.tiny_tier_verifiable(None, ["a.spec.ts"]))
+        self.assertFalse(m.tiny_tier_verifiable(object(), []))
+        self.assertTrue(m.tiny_tier_verifiable(object(), ["a.spec.ts"]))
+
     def test_should_gate_tiny_mode_by_spec_size(self):
         import argparse, os
         from pathlib import Path

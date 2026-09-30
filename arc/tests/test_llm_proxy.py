@@ -3,6 +3,7 @@ import unittest
 
 from llm_proxy import (
     BUDGET_NOTICE,
+    CODEGEN_BUDGET_NOTICE,
     destream_request,
     enforce_turn_budget,
     ensure_max_tokens,
@@ -182,6 +183,19 @@ class TurnBudgetTests(unittest.TestCase):
         self.assertEqual(out["messages"][-1], {"role": "user", "content": BUDGET_NOTICE})
         again = json.loads(enforce_turn_budget(json.dumps(out).encode(), 7, 6))
         self.assertEqual(sum(1 for m in again["messages"] if m.get("content") == BUDGET_NOTICE), 1)
+
+    def test_should_ask_a_toolless_codegen_turn_for_files_not_a_summary(self):
+        # arc.log REQ-5-2-1: a tool-less codegen/tiny turn hit its request budget
+        # and was told "do not call any more tools; reply with a one-line summary",
+        # so the model summarised instead of emitting <<<FILE>>> blocks and the
+        # turn wrote nothing. The notice must fit the turn's actual output form.
+        body = json.dumps({"model": "m", "messages": [{"role": "user", "content": "write the files"}]}).encode()
+        out = json.loads(enforce_turn_budget(body, 3, 3))
+        self.assertNotEqual(out["messages"][-1]["content"], BUDGET_NOTICE)
+        self.assertEqual(out["messages"][-1]["content"], CODEGEN_BUDGET_NOTICE)
+        self.assertIn("<<<FILE", CODEGEN_BUDGET_NOTICE)
+        again = json.loads(enforce_turn_budget(json.dumps(out).encode(), 4, 3))
+        self.assertEqual(sum(1 for m in again["messages"] if m.get("content") == CODEGEN_BUDGET_NOTICE), 1)
 
 
 class MaxTokensTests(unittest.TestCase):

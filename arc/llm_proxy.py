@@ -358,6 +358,14 @@ def trim_request(body: bytes, drop_tools: set[str] = DROP_TOOLS) -> bytes:
 BUDGET_NOTICE = ("Tool budget for this turn is exhausted. Do not call any more tools: reply now with a one-line "
                  "summary of what you changed. The harness will build and test the app.")
 
+# A tool-less codegen/tiny turn emits files as text blocks, not tool calls. Telling
+# it to "call no more tools and summarise" made the model do exactly that and skip
+# the <<<FILE>>> blocks (arc.log REQ-5-2-1: "reply contained no file blocks"), so
+# the exhausted-budget notice must ask for the files it is actually supposed to write.
+CODEGEN_BUDGET_NOTICE = ("Request budget for this turn is exhausted. You are writing files directly, not calling "
+                         "tools: reply now with the complete content of every changed file, one "
+                         "<<<FILE relative/path>>> ... <<<END FILE>>> block per file, nothing else.")
+
 
 def enforce_turn_budget(body: bytes, used: int, budget: int) -> bytes:
     """Once `used` requests have been made in the current turn, strip the tool
@@ -372,11 +380,14 @@ def enforce_turn_budget(body: bytes, used: int, budget: int) -> bytes:
         return body
     if not isinstance(data, dict) or "messages" not in data:
         return body
+    # A tool-less turn has no schemas to strip and no tool call to stop: keep it
+    # writing files. Only a tool turn is told to stop and summarise.
+    notice = BUDGET_NOTICE if data.get("tools") else CODEGEN_BUDGET_NOTICE
     data.pop("tools", None)
     data.pop("tool_choice", None)
     msgs = list(data.get("messages") or [])
-    if not msgs or msgs[-1].get("role") != "user" or msgs[-1].get("content") != BUDGET_NOTICE:
-        msgs.append({"role": "user", "content": BUDGET_NOTICE})
+    if not msgs or msgs[-1].get("role") != "user" or msgs[-1].get("content") != notice:
+        msgs.append({"role": "user", "content": notice})
     data["messages"] = msgs
     return json.dumps(data, ensure_ascii=False).encode("utf-8")
 

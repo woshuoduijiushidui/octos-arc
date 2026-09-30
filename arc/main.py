@@ -1269,6 +1269,18 @@ def strip_code_fences(text: str) -> str:
     return m.group(1).strip() if m else text
 
 
+def tiny_tier_verifiable(runner, specs: list[str]) -> bool:
+    """Whether the tiny tier can be judged before it is attempted.
+
+    The tiny turn writes one page and is only useful if `run_specs` can then
+    accept it. With no runner (no Playwright, no spec files) or no specs mapped
+    to this node it always logs "tiny tier unverified" and falls through to the
+    compact/tool tier anyway -- arc.log burned up to 871s of paid model time per
+    node on turns that could never pass. Skip that turn instead.
+    """
+    return runner is not None and bool(specs)
+
+
 def compact_spec_lines(text: str) -> str:
     """The spec's statements without imports, blank lines, `await` and closing
     braces — what a page must satisfy, in the spec's own words."""
@@ -3092,7 +3104,8 @@ class Flow:
         codegen_prompt = None
         implement_timeout = min(self.node_timeout, self.implement_fraction * node_budget, deadline - time.time())
         tiny_ok = False
-        if not corrections and self.codegen_mode() and self.tiny_mode(len(self.spec_bodies(node_id))):
+        if (not corrections and self.codegen_mode() and tiny_tier_verifiable(self.runner, specs)
+                and self.tiny_mode(len(self.spec_bodies(node_id)))):
             tiny_ok = self.tiny_turn(node_id, specs, implement_timeout, node)
             self.current_spec_chars = len(self.spec_bodies(node_id))
         if tiny_ok:
