@@ -118,8 +118,31 @@ export async function openHome(page: Page): Promise<void> {
   await page.goto('/');
 }
 
+/**
+ * Bound every interaction so a control that never resolves fails fast instead of
+ * burning Playwright's 30 s default. Cloud 101-C1-R23: two nodes sat at 0/4 for
+ * six to eight repair rounds, and each round paid that timeout per lookup.
+ */
+export const ACTION_TIMEOUT_MS = 8000;
+
 export async function clickNamed(scope: Scope, value: Match): Promise<void> {
-  await (await resolveNamed(scope, value)).click();
+  await (await resolveNamed(scope, value)).click({ timeout: ACTION_TIMEOUT_MS });
+}
+
+/** Try each candidate name in order; only the last one is allowed to fail the test. */
+export async function clickFirstAvailable(scope: Scope, values: Match[]): Promise<void> {
+  for (const value of values) {
+    try {
+      const locator = await resolveNamed(scope, value);
+      if (await locator.isVisible({ timeout: 200 })) {
+        await locator.click({ timeout: ACTION_TIMEOUT_MS });
+        return;
+      }
+    } catch {
+      // continue
+    }
+  }
+  await clickNamed(scope, values[0]);
 }
 
 export async function expectVisible(scope: Scope, value: Match): Promise<void> {
@@ -149,7 +172,8 @@ export async function fillField(scope: Scope, labelOrPlaceholder: Match, value: 
       // continue
     }
   }
-  await (await firstVisible([target(scope).getByRole('textbox'), target(scope).locator('input')])).fill(value);
+  await (await firstVisible([target(scope).getByRole('textbox'), target(scope).locator('input')]))
+    .fill(value, { timeout: ACTION_TIMEOUT_MS });
 }
 
 export async function expectErrorText(page: Page, message: string | RegExp): Promise<void> {
@@ -253,9 +277,41 @@ export async function openYourOrganizations(page: Page): Promise<void> {
   await clickNamed(page, /your organizations/i);
 }
 
+/**
+ * REQ-2-1-1 covers both "a visitor has opened the overview page of a public
+ * organization" and "a signed-in organization member has opened that
+ * organization's overview page", so this must not require a session. Cloud
+ * 101-C1-R23 pinned the node at 0/4 for six rounds because the previous version
+ * went straight through the account menu, which a visitor does not have.
+ */
 export async function openOrganization(page: Page, name: string | RegExp = /acme/i): Promise<void> {
-  await openYourOrganizations(page);
-  await clickNamed(page, name);
+  const pattern = name instanceof RegExp ? name : new RegExp(escapeRegExp(name), 'i');
+  const menu = page.getByRole('button', { name: /account menu/i }).first();
+  if (await menu.isVisible({ timeout: 500 }).catch(() => false)) {
+    try {
+      await openYourOrganizations(page);
+      await clickNamed(page, name);
+      return;
+    } catch {
+      // fall through to the anonymous routes
+    }
+  }
+  const searched = page.getByRole('searchbox', { name: /^search$/i }).first();
+  if (await searched.isVisible({ timeout: 500 }).catch(() => false)) {
+    await searched.click({ timeout: ACTION_TIMEOUT_MS });
+    await searched.fill('Acme Demo').catch(() => undefined);
+    await searched.press('Enter');
+    const hit = page.getByRole('link', { name: pattern }).first();
+    if (await hit.isVisible({ timeout: 3000 }).catch(() => false)) {
+      await hit.click({ timeout: ACTION_TIMEOUT_MS });
+      return;
+    }
+  }
+  for (const path of ['/acme-demo', '/organizations/acme-demo', '/orgs/acme-demo']) {
+    const response = await page.goto(path).catch(() => null);
+    if (response && response.ok()) return;
+  }
+  throw new Error('could not reach the organization overview as a visitor or as a member');
 }
 
 /** Repository entry through the global "Search" searchbox (REQ-3-1). */
