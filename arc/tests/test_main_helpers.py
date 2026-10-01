@@ -193,6 +193,7 @@ class H01ObservationTests(unittest.TestCase):
         from pathlib import Path
 
         observations = []
+        main_log = []
         with tempfile.TemporaryDirectory() as tmp:
             driver = OctosDriver(
                 "octos",
@@ -202,6 +203,10 @@ class H01ObservationTests(unittest.TestCase):
                 10,
                 Path(tmp) / "octos-events.jsonl",
                 h01_observer=lambda kind, fields: observations.append((kind, fields)),
+            )
+            driver.tool_trace = m.ToolEventTrace(
+                "REQ-3-2-1 implement",
+                main_log.append,
             )
             compaction = {
                 "status": "installed",
@@ -244,6 +249,7 @@ class H01ObservationTests(unittest.TestCase):
                     "arguments": {"command": "echo must-not-be-logged"},
                 },
             )
+            driver.tool_trace.finish()
             event_log = (Path(tmp) / "octos-events.jsonl").read_text()
 
         self.assertEqual(
@@ -276,6 +282,75 @@ class H01ObservationTests(unittest.TestCase):
         self.assertNotIn("must-not-be-logged", event_log)
         self.assertNotIn("raw acceptance log", event_log)
         self.assertNotIn('"command"', event_log)
+        self.assertEqual(len(main_log), 4)
+        self.assertTrue(main_log[0].startswith("[tool.event] "))
+        self.assertTrue(main_log[-1].startswith("[tool.summary] "))
+        self.assertNotIn("must-not-be-logged", "\n".join(main_log))
+        self.assertNotIn("raw acceptance log", "\n".join(main_log))
+
+
+class ToolEventMainLogTests(unittest.TestCase):
+    def test_driver_should_stream_tool_events_and_finish_the_summary(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        lines = []
+        with tempfile.TemporaryDirectory() as tmp:
+            driver = OctosDriver(
+                "octos",
+                Path(tmp),
+                {},
+                Path(tmp) / "data",
+                10,
+                Path(tmp) / "octos-events.jsonl",
+            )
+            monitor = m.TurnMonitor([], label="REQ-3-1-1 implement")
+
+            def fake_heartbeat(_fn):
+                driver._log_event(
+                    "tool/started",
+                    {
+                        "turn_id": "protocol-turn",
+                        "tool_call_id": "call-1",
+                        "tool_name": "grep",
+                        "arguments": {"pattern": "private-pattern"},
+                    },
+                )
+                driver._log_event(
+                    "tool/completed",
+                    {
+                        "turn_id": "protocol-turn",
+                        "tool_call_id": "call-1",
+                        "tool_name": "grep",
+                        "success": True,
+                        "output_preview": "private-result",
+                        "duration_ms": 19,
+                    },
+                )
+                return True, "done"
+
+            with mock.patch.object(m, "log", side_effect=lines.append):
+                with mock.patch.object(
+                    driver,
+                    "_run_with_heartbeat",
+                    side_effect=fake_heartbeat,
+                ):
+                    self.assertEqual(
+                        driver.run("prompt", 60, monitor),
+                        (True, "done"),
+                    )
+
+        event_lines = [line for line in lines if line.startswith("[tool.event] ")]
+        summary_lines = [line for line in lines if line.startswith("[tool.summary] ")]
+        self.assertEqual(len(event_lines), 2)
+        self.assertEqual(len(summary_lines), 1)
+        summary = json.loads(summary_lines[0].split(" ", 1)[1])
+        self.assertEqual(summary["node"], "REQ-3-1-1")
+        self.assertEqual(summary["counts"], {"grep": 1})
+        self.assertEqual(summary["duration_ms_by_tool"], {"grep": 19})
+        self.assertNotIn("private-pattern", "\n".join(lines))
+        self.assertNotIn("private-result", "\n".join(lines))
 
 
 class FolderDescendantTests(unittest.TestCase):

@@ -88,7 +88,7 @@ from acceptance import (  # noqa: E402
 from codegen import (FORMAT_INSTRUCTIONS, dedupe_nav_links, delimiter_drift,  # noqa: E402
                      parse_file_blocks, unchanged_rewrites, unparsed_reply_digest,
                      write_files)
-from guard import TurnMonitor  # noqa: E402
+from guard import ToolEventTrace, TurnMonitor  # noqa: E402
 from llm_proxy import LlmProxy, configured_model_routes, h01e_usage_totals  # noqa: E402
 from requirement_order import ancestors_of, node_fingerprint, topo_order  # noqa: E402
 from task_evidence import TaskEvidenceError, TaskEvidenceStore  # noqa: E402
@@ -916,6 +916,7 @@ class OctosDriver:
         self._h01_artifact_reads: dict[str, str] = {}
         self._session = None
         self.monitor: TurnMonitor | None = None
+        self.tool_trace: ToolEventTrace | None = None
         self.hooks: list = []  # profile hooks (protected-directory deny), set by the flow
         self.tools_disabled = False
 
@@ -1036,6 +1037,11 @@ class OctosDriver:
     def _log_event(self, method: str, params: dict) -> None:
         if method == "core/marker":
             log(f"[core-mod] {params.get('line', '')}")
+        if self.tool_trace is not None and method in ("tool/started", "tool/completed"):
+            try:
+                self.tool_trace.observe(method, params)
+            except Exception:  # noqa: BLE001 - diagnostics must never break a turn
+                pass
         if self.monitor is not None and method in ("tool/started", "tool/completed"):
             try:
                 self.monitor.observe(method, params)
@@ -1077,7 +1083,14 @@ class OctosDriver:
 
     def run(self, prompt: str, timeout: int, monitor: TurnMonitor | None = None) -> tuple[bool, str]:
         self.monitor = monitor
-        if self.mode == "chat" and not self.tools_disabled:
+        uses_stdio = self.mode != "chat" or self.tools_disabled
+        self.tool_trace = ToolEventTrace(
+            getattr(monitor, "label", "unlabelled"),
+            log,
+            observation="complete" if uses_stdio else "unavailable",
+        )
+        tool_trace = self.tool_trace
+        if not uses_stdio:
             fn = lambda remaining: run_octos(self.octos_bin, self.cwd, prompt, self.env, self.data_dir,  # noqa: E731
                                    remaining, self.max_iterations)
         else:
@@ -1085,6 +1098,11 @@ class OctosDriver:
         try:
             ok, text = self._run_with_heartbeat(lambda: self._run_with_retries(fn, timeout))
         finally:
+            try:
+                tool_trace.finish()
+            except Exception:  # noqa: BLE001 - diagnostics must never break a turn
+                pass
+            self.tool_trace = None
             self.monitor = None
             if self.session_scope == "turn":
                 self.close()
@@ -1157,6 +1175,11 @@ class OctosDriver:
             return session.run_turn(prompt, timeout=remaining)
         except Exception as exc:  # noqa: BLE001
             self.close()
+            tool_trace = getattr(self, "tool_trace", None)
+            if tool_trace is not None:
+                tool_trace.mark_incomplete(
+                    "stdio_error" if self.tools_disabled else "stdio_chat_fallback"
+                )
             if self.tools_disabled:
                 return False, f"tool-free stdio driver error: {exc}"[:1000]
             remaining = deadline - time.monotonic()
@@ -1986,7 +2009,8 @@ class Flow:
         no_shell = bool(getattr(proxy, "extra_drop_tools", None))
         monitor = TurnMonitor(self.protected_prefixes(),
                               expect_verification=expect_verification and not no_shell,
-                              allowed_prefixes=[".arc/design/", str(self.output_dir / ".arc" / "design")])
+                              allowed_prefixes=[".arc/design/", str(self.output_dir / ".arc" / "design")],
+                              label=label)
         if proxy is not None:
             # Per-turn reasoning: OCTOS_ARC_IMPLEMENT_REASONING (e.g. "none") applies
             # to first implement turns of small tasks; rewrite/repair keep the base mode.

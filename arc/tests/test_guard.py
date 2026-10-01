@@ -1,6 +1,7 @@
+import json
 import unittest
 
-from guard import TurnMonitor
+from guard import ToolEventTrace, TurnMonitor
 
 
 def started(name, args, call_id="c1"):
@@ -69,6 +70,96 @@ class TurnMonitorTests(unittest.TestCase):
         m.observe(*completed("c1", True))
         m.finish("Here is my plan...")
         self.assertFalse(m.wrote_files)
+
+
+class ToolEventTraceTests(unittest.TestCase):
+    def test_should_emit_live_safe_events_and_an_aggregate_summary(self):
+        lines = []
+        trace = ToolEventTrace("REQ-3-2-1 implement", lines.append)
+        secret_command = "curl -H 'Authorization: Bearer secret-value' localhost"
+
+        for index in range(3):
+            call_id = f"call-secret-value-{index}"
+            trace.observe(
+                "tool/started",
+                {
+                    "turn_id": "turn-1",
+                    "tool_call_id": call_id,
+                    "tool_name": "shell",
+                    "arguments": {"command": secret_command},
+                },
+            )
+            trace.observe(
+                "tool/completed",
+                {
+                    "turn_id": "turn-1",
+                    "tool_call_id": call_id,
+                    "tool_name": "shell",
+                    "success": False,
+                    "output_preview": "secret-value failed in /workspace/private",
+                    "duration_ms": 25,
+                },
+            )
+        trace.finish()
+
+        self.assertEqual(len(lines), 7)
+        self.assertTrue(all(line.startswith("[tool.") for line in lines))
+        joined = "\n".join(lines)
+        self.assertNotIn("secret-value", joined)
+        self.assertNotIn("/workspace/private", joined)
+        summary = json.loads(lines[-1].split(" ", 1)[1])
+        self.assertEqual(summary["event"], "summary")
+        self.assertEqual(summary["node"], "REQ-3-2-1")
+        self.assertEqual(summary["counts"], {"shell": 3})
+        self.assertEqual(summary["failures"], {"shell": 3})
+        self.assertEqual(summary["duration_ms_by_tool"], {"shell": 75})
+        self.assertEqual(summary["max_consecutive_repeat"], 3)
+        self.assertEqual(summary["repeated_calls"][0]["count"], 3)
+        self.assertEqual(summary["repeated_failures"][0]["count"], 3)
+        self.assertEqual(summary["slowest_calls"][0]["duration_ms"], 25)
+
+    def test_should_report_unfinished_and_unmatched_tool_events(self):
+        lines = []
+        trace = ToolEventTrace("final check", lines.append)
+        trace.observe(
+            "tool/started",
+            {
+                "tool_call_id": "pending",
+                "tool_name": "grep",
+                "arguments": {"pattern": "needle"},
+            },
+        )
+        trace.observe(
+            "tool/completed",
+            {
+                "tool_call_id": "orphan",
+                "tool_name": "read_file",
+                "success": True,
+            },
+        )
+        trace.finish()
+
+        summary = json.loads(lines[-1].split(" ", 1)[1])
+        self.assertEqual(summary["pending"], 1)
+        self.assertEqual(summary["unmatched_completions"], 1)
+
+    def test_should_report_when_tool_events_are_not_observable(self):
+        lines = []
+        trace = ToolEventTrace(
+            "REQ-1 implement",
+            lines.append,
+            observation="unavailable",
+        )
+        trace.finish()
+
+        summary = json.loads(lines[-1].split(" ", 1)[1])
+        self.assertEqual(summary["started"], 0)
+        self.assertEqual(summary["observation"], "unavailable")
+
+        trace.mark_incomplete("stdio_chat_fallback")
+        marker = json.loads(lines[-1].split(" ", 1)[1])
+        self.assertEqual(marker["event"], "observation")
+        self.assertEqual(marker["reason"], "stdio_chat_fallback")
 
 
 if __name__ == "__main__":
