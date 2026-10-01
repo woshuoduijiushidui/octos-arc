@@ -61,7 +61,7 @@ release, and the release URL must live under that same repository:
   "schema_version": 1,
   "repository": "<owner>/<repository> that published the release",
   "runtime_release": {
-    "version": "v2.0.3-rc.11-arc.14",
+    "version": "v2.0.3-rc.11-arc.23",
     "source_commit": "<40-character build commit>",
     "target": "x86_64-unknown-linux-gnu",
     "binary_sha256": "<64-character executable SHA-256>",

@@ -22,6 +22,11 @@ Thumbs.db
 .claude/worktrees/
 .worktrees/
 
+# pi agent session state at the repo root (same class as the Claude worktrees
+# above): agent-tool scratch that must never be tracked. Anchored so a nested
+# `.pi` belonging to something else is not swept up.
+/.pi/
+
 # Octos runtime state (keep config, ignore runtime data)
 .octos/*
 !.octos/AGENTS.md
