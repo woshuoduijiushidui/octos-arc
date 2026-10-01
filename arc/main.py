@@ -2218,16 +2218,28 @@ class Flow:
         the leaderboard is pass rate >= 80%, so a cheaper run that drops below it scores
         nothing at all.
 
+        **Re-raised to 400000 on 2026-10-01, now that the mechanism behind the revert is
+        closed.** The revert reasoned from this gate, but the recorded cause lives in the
+        quoting budget instead (`codegen_context_chars() - len(spec)`), which the gate does
+        not touch: `relevant_sources` marked out-of-budget files as "Other files,
+        unchanged" while the header demanded a complete file back, so the model rewrote
+        files it had never seen and deleted the handlers they held. That is now prevented
+        twice over -- the wording forbids it, and `drop_unseen_rewrites()` refuses a
+        whole-file rewrite of a file that exists on disk and was not quoted, logs the
+        refusal, and moves that node to tool mode. The changelog records that the gate and
+        the guard were never measured together, so this run is that measurement rather than
+        a repeat of the reverted one.
+
         Keeping the env knob: a gate sized by the *files a node will actually rewrite*
-        (rather than the whole app) would recover most of the speed without breaking the
-        invariant, but that is a different change and is unmeasured.
+        (rather than the whole app) would recover most of the speed without widening the
+        exposure at all, but that is a different change and is still unmeasured.
+        `OCTOS_ARC_CODEGEN_SOURCE_FIT_CHARS=90000` restores the output-budget gate exactly.
 
         The repair-side budget (`inline_source_chars`, #199) is left alone on purpose:
         that one is about whether more quoted source helps or dilutes a repair, which is a
         different question and still unmeasured.
         """
-        return int(os.environ.get("OCTOS_ARC_CODEGEN_SOURCE_FIT_CHARS",
-                                  str(self.codegen_context_chars())))
+        return int(os.environ.get("OCTOS_ARC_CODEGEN_SOURCE_FIT_CHARS", "400000"))
 
     def codegen_context_fits(self, spec_text: str) -> bool:
         """Do not request complete file replacements with omitted source bodies.

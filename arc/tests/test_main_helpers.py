@@ -799,27 +799,33 @@ class RelevantSourcesTests(unittest.TestCase):
                 (root / "frontend/index.html").write_text("p" * 50000)
                 self.assertTrue(flow.codegen_context_fits("x" * 12000))
 
-    def test_an_app_past_the_budget_falls_back_to_tool_mode(self):
-        """An app whose sources no longer fit must NOT take the single-request path.
+    def test_the_source_gate_is_sized_for_codegen_not_for_the_output_budget(self):
+        """The source-fit gate carries its own default (400000), not the output budget.
 
-        This gate was briefly raised to 400000 to escape tool mode (it is 65% of
-        stackoverflow 97848d542ac8's nodes and 90% of its wall clock, 19.6x the median per
-        node). The raise was submitted as 95da0dc11e93 and reverted on 2026-09-18, because
-        it bought that speed with correctness:
+        History, kept because it is what makes re-raising it defensible. This gate was
+        raised to 400000 once before and reverted on 2026-09-18 (95da0dc11e93) because it
+        bought speed with correctness:
 
             run                        path            result   regressed  never-passed
             stackoverflow 97848d542ac8 65% tool mode   66/66    0          0
             stackoverflow 34ca94da0075 100% codegen    mid-run  9          7
-            12306         99196f2e802b 100% codegen    mid-run  29         0
+            12306       99196f2e802b 100% codegen    mid-run  29         0
 
-        The tool-mode run finished with zero regressions; the codegen-only runs regressed
-        9 and 29 nodes, and 12306's losses were entirely regressions -- not one node it
-        could not build, only nodes it built and then broke. A node seeing part of a shared
-        file and asked to return it complete drops the handlers it never saw, and those
-        belong to other nodes' specs. So an app past the budget has to use tool mode, and
-        this test pins that.
+        The recorded cause was not the gate. `relevant_sources` marked out-of-budget files
+        as "Other files, unchanged" while the header demanded a complete file back, so the
+        model rewrote files it had never seen and dropped the handlers they held -- and
+        that mechanism is independent of how wide the gate is, because the quoting budget
+        is `codegen_context_chars() - len(spec)`. The revert only narrowed the exposure.
+        The mechanism is now closed on its own: the wording forbids it and
+        `drop_unseen_rewrites()` refuses a whole-file rewrite of a file that exists on disk
+        and was not quoted (main.py:2403), logging the refusal and moving that node to tool
+        mode. The gate and the guard were never measured together -- the changelog says so.
+
+        So the gate is wide again while the spec-size half of it is untouched, and the env
+        knob still overrides either way.
         """
         from pathlib import Path
+        from unittest.mock import patch
         import argparse, tempfile
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -827,11 +833,19 @@ class RelevantSourcesTests(unittest.TestCase):
             (root / "backend").mkdir(); (root / "frontend").mkdir()
             (root / "backend/server.js").write_text("b" * 26000)
             (root / "frontend/index.html").write_text("p" * 55000)   # 81000 total
-            self.assertEqual(flow.codegen_source_fit_chars(), flow.codegen_context_chars())
-            self.assertFalse(flow.codegen_context_fits("x" * 12000))
-            # A small app still takes the fast path -- the revert is not "always tool mode".
-            (root / "frontend/index.html").write_text("p" * 200)
-            self.assertTrue(flow.codegen_context_fits("x" * 1000))
+            with patch.dict("os.environ", {"OCTOS_ARC_CODEGEN_SOURCE_FIT_CHARS": "400000"}):
+                self.assertTrue(flow.codegen_context_fits("x" * 12000))
+                # The spec-size rule is unchanged: 60% of the output budget still refuses.
+                self.assertFalse(
+                    flow.codegen_context_fits("x" * int(flow.codegen_context_chars() * 0.6)))
+                # Past the source budget, tool mode again.
+                (root / "frontend/index.html").write_text("p" * 400000)
+                self.assertFalse(flow.codegen_context_fits("x" * 12000))
+        # Without the override the default is the wide gate, not the output budget.
+        flow = m.Flow(argparse.Namespace(web_port=1), Path("."), Path("."))
+        os.environ.pop("OCTOS_ARC_CODEGEN_SOURCE_FIT_CHARS", None)
+        self.assertEqual(flow.codegen_source_fit_chars(), 400000)
+        self.assertGreater(flow.codegen_source_fit_chars(), flow.codegen_context_chars())
 
     def test_the_fit_gate_stays_overridable(self):
         """The knob survives the revert: a gate sized by the files a node will actually
