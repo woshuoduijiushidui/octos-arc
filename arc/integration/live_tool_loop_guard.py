@@ -11,8 +11,8 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from guard import ToolEventTrace, TurnMonitor
-from octos_stdio import OctosStdioSession
+import main as arc_main
+from guard import TurnMonitor
 
 
 def run(binary: Path) -> None:
@@ -57,7 +57,7 @@ def run(binary: Path) -> None:
                         "name": "shell",
                         "arguments": json.dumps({
                             "command": (
-                                f"printf 'private-loop-{index}\\n' >&2; exit 7"
+                                f"printf 'fixture-output-{index}\\n' >&2; exit 7"
                             ),
                         }),
                     },
@@ -99,58 +99,45 @@ def run(binary: Path) -> None:
         # Docker-backed sandbox, which is not installed in the WSL test image.
         "OCTOS_DANGER_FULL_ACCESS": "1",
         "OCTOS_NO_PROGRESS": "0",
+        "_ARC_PROVIDER": "openai",
+        "_ARC_MODEL": "live-guard-local-fixture",
+        "_ARC_BASE_URL": f"http://127.0.0.1:{server.server_port}/v1",
+        "_ARC_KEY_ENV": "OPENAI_API_KEY",
     })
 
     monitor = TurnMonitor([], label="REQ-guard repair")
     safe_logs: list[str] = []
-    trace = ToolEventTrace(
-        monitor.label,
-        safe_logs.append,
-        fingerprint_key=monitor.fingerprint_key,
-    )
-    actions: list[dict] = []
-    session = None
-
-    def observe(method: str, params: dict) -> None:
-        trace.observe(method, params)
-        action = monitor.observe(method, params)
-        if action is None:
-            return
-        if action.kind == "steer":
-            accepted = session.steer_active_turn(action.message)
-        else:
-            accepted = session.interrupt_active_turn()
-        monitor.record_action_result(action, accepted)
-        trace.record_guard_action(action, accepted)
-        actions.append({
-            "kind": action.kind,
-            "repeat": action.repeat_count,
-            "family_repeat": action.family_repeat_count,
-            "accepted": accepted,
-        })
+    original_log = arc_main.log
+    arc_main.log = safe_logs.append
+    driver = None
 
     try:
-        session = OctosStdioSession(
+        driver = arc_main.OctosDriver(
             str(binary),
             workspace,
             env,
             root / "data",
-            on_event=observe,
+            20,
+            root / "octos-events.jsonl",
         )
-        session.bootstrap_profile(
-            "openai",
-            "live-guard-local-fixture",
-            f"http://127.0.0.1:{server.server_port}/v1",
-            "OPENAI_API_KEY",
-            timeout=180,
+        ok, text = driver.run(
+            "Exercise the local loop guard.",
+            timeout=120,
+            monitor=monitor,
         )
-        session.open(timeout=30)
-        ok, text = session.run_turn("Exercise the local loop guard.", timeout=120)
-        trace.finish()
-        assert not ok, (text, session.stderr_tail())
+        assert not ok, text
         assert text.startswith("interrupted:"), text
         assert not failures, failures
         assert len(requests) == 10, len(requests)
+        actions = [
+            {
+                "kind": action.kind,
+                "repeat": action.repeat_count,
+                "family_repeat": action.family_repeat_count,
+                "accepted": accepted,
+            }
+            for action, accepted in monitor._action_results
+        ]
         assert actions == [
             {"kind": "steer", "repeat": 1, "family_repeat": 6, "accepted": True},
             {"kind": "steer", "repeat": 1, "family_repeat": 8, "accepted": True},
@@ -158,23 +145,26 @@ def run(binary: Path) -> None:
             {"kind": "interrupt", "repeat": 1, "family_repeat": 10, "accepted": True},
         ], actions
         joined = "\n".join(safe_logs)
-        assert "private-loop" not in joined
+        assert "fixture-output" not in joined
         assert "printf" not in joined
-    except Exception:
-        if session is not None:
-            print(session.stderr_tail(200), file=sys.stderr)
-        raise
+        assert '"tool":"shell"' in joined
+        assert '"command_fp":' in joined
+        assert '"shell_failure_kinds":{"nonzero_exit":10}' in joined, joined
+        event_log = (root / "octos-events.jsonl").read_text(encoding="utf-8")
+        assert "fixture-output" not in event_log
+        assert "printf" not in event_log
     finally:
-        if session is not None:
-            session.close()
+        if driver is not None:
+            driver.close()
+        arc_main.log = original_log
         runtime.cleanup()
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
 
     print(
-        "PASS: the pinned stdio runtime accepted three live reminders and "
-        "interrupted the tenth related shell failure; safe logs omitted raw data."
+        "PASS: OctosDriver sent three live reminders and interrupted the tenth "
+        "related shell failure; safe logs omitted raw data."
     )
 
 

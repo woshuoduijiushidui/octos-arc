@@ -88,7 +88,7 @@ from acceptance import (  # noqa: E402
 from codegen import (FORMAT_INSTRUCTIONS, dedupe_nav_links, delimiter_drift,  # noqa: E402
                      parse_file_blocks, unchanged_rewrites, unparsed_reply_digest,
                      write_files)
-from guard import ToolEventTrace, TurnMonitor  # noqa: E402
+from guard import SHELL_TOOLS as SHELL_TOOL_NAMES, ToolEventTrace, TurnMonitor  # noqa: E402
 from llm_proxy import LlmProxy, configured_model_routes, h01e_usage_totals  # noqa: E402
 from requirement_order import ancestors_of, node_fingerprint, topo_order  # noqa: E402
 from task_evidence import TaskEvidenceError, TaskEvidenceStore  # noqa: E402
@@ -867,6 +867,27 @@ def _safe_event_value(value):
     return _bounded_event_string(str(value))
 
 
+def _safe_turn_control_fields(result) -> dict:
+    if not isinstance(result, dict):
+        return {}
+    fields = {
+        "rpc_reason": result.get("reason"),
+        "rpc_terminal_state": result.get("terminal_state"),
+        "rpc_ack_timeout": bool(result.get("ack_timeout", False)),
+        "fallback_started": bool(result.get("fallback_started", False)),
+        "fallback_stopped": bool(result.get("fallback_stopped", False)),
+        "fallback_reason": result.get("fallback_reason"),
+        "fallback_terminal_state": result.get("fallback_terminal_state"),
+        "fallback_ack_timeout": bool(result.get("fallback_ack_timeout", False)),
+        "session_closed": bool(result.get("session_closed", False)),
+    }
+    return {
+        key: str(value)[:80] if isinstance(value, str) else value
+        for key, value in fields.items()
+        if value not in (None, False, "")
+    }
+
+
 def permanent_provider_error(text: str) -> bool:
     lowered = text.lower()
     codes = re.findall(r"\bhttp(?:/\d(?:\.\d)?)?\s+(\d{3})\b", lowered)
@@ -1066,28 +1087,43 @@ class OctosDriver:
     def _apply_guard_action(self, action) -> None:
         accepted = False
         error_type = None
+        control_result = {}
         session = self._session
         try:
             if session is not None and action.kind == "steer":
-                accepted = session.steer_active_turn(action.message)
+                control_result = session.steer_active_turn(action.message)
+                accepted = bool(control_result.get("steered"))
             elif session is not None and action.kind == "interrupt":
-                accepted = session.interrupt_active_turn()
+                control_result = session.interrupt_active_turn()
+                accepted = bool(control_result.get("interrupted"))
+            elif session is None:
+                control_result = {"reason": "no_session"}
         except Exception as exc:  # noqa: BLE001 - a guard RPC failure must not kill the turn
             error_type = type(exc).__name__
+        control_fields = _safe_turn_control_fields(control_result)
         monitor = self.monitor
         if monitor is not None:
             monitor.record_action_result(action, accepted)
         tool_trace = self.tool_trace
         if tool_trace is not None:
             try:
-                tool_trace.record_guard_action(action, accepted, error_type)
+                tool_trace.record_guard_action(
+                    action,
+                    accepted,
+                    error_type,
+                    control_fields,
+                )
             except Exception:  # noqa: BLE001 - diagnostics must never break a turn
                 pass
+        control_text = " ".join(
+            f"{key}={value}" for key, value in control_fields.items()
+        )
         log(
             f"[guard.live] action={action.kind} reason={action.reason} "
             f"tool={action.tool} repeat={action.repeat_count} "
             f"family_repeat={action.family_repeat_count} accepted={accepted} "
             f"error_type={error_type or 'none'}"
+            + (f" {control_text}" if control_text else "")
         )
 
     def _get_session(self):
@@ -2134,7 +2170,7 @@ class Flow:
             blocks.append(UI_CONTRACT_SESSION)
         return "".join(blocks)
 
-    SHELL_TOOLS = {"bash", "shell", "exec_command"}
+    SHELL_TOOLS = SHELL_TOOL_NAMES
 
     def minimal_mode(self, total_nodes: int) -> bool:
         mode = os.environ.get("OCTOS_VERIFY_MODE", "auto")

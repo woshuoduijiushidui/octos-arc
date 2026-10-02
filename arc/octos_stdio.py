@@ -192,10 +192,21 @@ class OctosStdioSession:
             params["profile_id"] = self.profile_id
         self._send("session/open", params, want_response=True, timeout=timeout)
 
-    def steer_active_turn(self, text: str, timeout: float = 30.0) -> bool:
+    def _interrupt_turn(self, turn_id: str, timeout: float) -> dict:
+        result = self._send(
+            "turn/interrupt",
+            {"session_id": self.session_id, "turn_id": turn_id},
+            want_response=True,
+            timeout=timeout,
+        )
+        if isinstance(result, dict):
+            return result
+        return {"interrupted": False, "reason": "invalid_response"}
+
+    def steer_active_turn(self, text: str, timeout: float = 30.0) -> dict:
         turn_id = self._active_turn_id
         if not turn_id:
-            return False
+            return {"steered": False, "reason": "no_local_active_turn"}
         result = self._send(
             "turn/steer",
             {
@@ -206,19 +217,41 @@ class OctosStdioSession:
             want_response=True,
             timeout=timeout,
         )
-        return bool(isinstance(result, dict) and result.get("steered"))
+        if not isinstance(result, dict):
+            return {"steered": False, "reason": "invalid_response"}
+        if result.get("steered"):
+            return result
 
-    def interrupt_active_turn(self, timeout: float = 30.0) -> bool:
+        fallback_turn = str(result.get("turn_id") or "")
+        if not fallback_turn or fallback_turn == turn_id:
+            return result
+        try:
+            cleanup = self._interrupt_turn(fallback_turn, timeout)
+        except Exception:
+            self.close()
+            raise
+        stopped = bool(
+            cleanup.get("interrupted")
+            or cleanup.get("terminal_state") in {"completed", "errored", "interrupted"}
+        )
+        outcome = {
+            **result,
+            "fallback_started": True,
+            "fallback_stopped": stopped,
+            "fallback_reason": cleanup.get("reason"),
+            "fallback_terminal_state": cleanup.get("terminal_state"),
+            "fallback_ack_timeout": bool(cleanup.get("ack_timeout", False)),
+        }
+        if not stopped:
+            self.close()
+            outcome["session_closed"] = True
+        return outcome
+
+    def interrupt_active_turn(self, timeout: float = 30.0) -> dict:
         turn_id = self._active_turn_id
         if not turn_id:
-            return False
-        result = self._send(
-            "turn/interrupt",
-            {"session_id": self.session_id, "turn_id": turn_id},
-            want_response=True,
-            timeout=timeout,
-        )
-        return bool(isinstance(result, dict) and result.get("interrupted"))
+            return {"interrupted": False, "reason": "no_local_active_turn"}
+        return self._interrupt_turn(turn_id, timeout)
 
     def _report_capsule(self, status: str, schema: str | None, size: int) -> None:
         observer = getattr(self, "on_event", None)

@@ -47,8 +47,8 @@ class TaskEvidenceInputTests(unittest.TestCase):
             {"interrupted": True},
         ])
 
-        self.assertTrue(session.steer_active_turn("change approach"))
-        self.assertTrue(session.interrupt_active_turn())
+        self.assertTrue(session.steer_active_turn("change approach")["steered"])
+        self.assertTrue(session.interrupt_active_turn()["interrupted"])
         steer = session._send.call_args_list[0]
         interrupt = session._send.call_args_list[1]
         self.assertEqual(steer.args[0], "turn/steer")
@@ -68,9 +68,52 @@ class TaskEvidenceInputTests(unittest.TestCase):
         session._active_turn_id = None
         session._send = Mock()
 
-        self.assertFalse(session.steer_active_turn("unused"))
-        self.assertFalse(session.interrupt_active_turn())
+        self.assertEqual(
+            session.steer_active_turn("unused"),
+            {"steered": False, "reason": "no_local_active_turn"},
+        )
+        self.assertEqual(
+            session.interrupt_active_turn(),
+            {"interrupted": False, "reason": "no_local_active_turn"},
+        )
         session._send.assert_not_called()
+
+    def test_should_interrupt_a_fallback_turn_started_by_a_steer_race(self):
+        session = object.__new__(OctosStdioSession)
+        session.session_id = "arc:test"
+        session._active_turn_id = "old-turn"
+        session.close = Mock()
+        session._send = Mock(side_effect=[
+            {"turn_id": "fallback-turn", "steered": False},
+            {"interrupted": True},
+        ])
+
+        result = session.steer_active_turn("change approach")
+
+        self.assertFalse(result["steered"])
+        self.assertTrue(result["fallback_started"])
+        self.assertTrue(result["fallback_stopped"])
+        self.assertEqual(
+            session._send.call_args_list[1].args[1],
+            {"session_id": "arc:test", "turn_id": "fallback-turn"},
+        )
+        session.close.assert_not_called()
+
+    def test_should_close_the_session_when_a_fallback_turn_cannot_be_stopped(self):
+        session = object.__new__(OctosStdioSession)
+        session.session_id = "arc:test"
+        session._active_turn_id = "old-turn"
+        session.close = Mock()
+        session._send = Mock(side_effect=[
+            {"turn_id": "fallback-turn", "steered": False},
+            {"interrupted": False, "reason": "turn_id_mismatch"},
+        ])
+
+        result = session.steer_active_turn("change approach")
+
+        self.assertFalse(result["fallback_stopped"])
+        self.assertTrue(result["session_closed"])
+        session.close.assert_called_once_with()
 
     def test_should_keep_legacy_text_only_payload_when_capsule_is_absent(self):
         with tempfile.TemporaryDirectory() as tmp:

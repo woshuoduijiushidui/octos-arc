@@ -75,6 +75,27 @@ class TransientTests(unittest.TestCase):
         self.assertTrue(OctosDriver._transient("failed to send streaming request"))
 
 
+class TurnControlLoggingTests(unittest.TestCase):
+    def test_should_log_control_outcome_without_turn_identifiers(self):
+        fields = m._safe_turn_control_fields({
+            "turn_id": "private-original-turn",
+            "fallback_turn_id": "private-fallback-turn",
+            "reason": "fallback_turn_started",
+            "fallback_started": True,
+            "fallback_stopped": True,
+            "fallback_reason": "interrupted",
+        })
+
+        self.assertEqual(fields, {
+            "rpc_reason": "fallback_turn_started",
+            "fallback_started": True,
+            "fallback_stopped": True,
+            "fallback_reason": "interrupted",
+        })
+        self.assertNotIn("turn_id", fields)
+        self.assertNotIn("fallback_turn_id", fields)
+
+
 class H01ObservationTests(unittest.TestCase):
     def test_h01e_checkpoint_is_c_only_and_can_be_disabled(self):
         self.assertFalse(h01e_checkpoint_enabled("B", None))
@@ -307,8 +328,8 @@ class LiveToolLoopGuardTests(unittest.TestCase):
                 Path(tmp) / "octos-events.jsonl",
             )
             driver._session = mock.Mock()
-            driver._session.steer_active_turn.return_value = True
-            driver._session.interrupt_active_turn.return_value = True
+            driver._session.steer_active_turn.return_value = {"steered": True}
+            driver._session.interrupt_active_turn.return_value = {"interrupted": True}
             monitor = TurnMonitor([], label="REQ-1 repair")
             driver.monitor = monitor
             driver.tool_trace = ToolEventTrace(
