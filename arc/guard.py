@@ -428,7 +428,7 @@ class TurnMonitor:
         self.errors_in_a_row = 0
         self._last_error = None
         self._max_repeat = 0
-        self._repeated_error = ""
+        self._peak_failure: dict | None = None
         self.protected_writes: list[str] = []
         self.written_paths: list[str] = []
         self._pending: dict[str, dict] = {}
@@ -436,7 +436,6 @@ class TurnMonitor:
         self._recent_failures: deque[
             tuple[tuple[str, str, str], tuple[str, str]] | None
         ] = deque(maxlen=_FAILURE_WINDOW_SIZE)
-        self._last_failure: dict | None = None
         self._interrupt_issued = False
         self._action_results: list[tuple[GuardAction, bool]] = []
         self._repeat_correction = ""
@@ -488,8 +487,6 @@ class TurnMonitor:
                 self.errors_in_a_row = family_count
                 self._last_error = family_key
                 observed_repeat = max(exact_count, family_count)
-                if observed_repeat > self._max_repeat:
-                    self._max_repeat, self._repeated_error = observed_repeat, preview
                 shell = pending.get("shell") or {}
                 evidence = {
                     "tool": tool,
@@ -503,7 +500,9 @@ class TurnMonitor:
                     "exit_reason": failure["exit_reason"],
                     "preview": preview,
                 }
-                self._last_failure = evidence
+                if observed_repeat > self._max_repeat:
+                    self._max_repeat = observed_repeat
+                    self._peak_failure = dict(evidence)
                 return self._next_action(evidence)
             else:
                 if self._is_material_success(tool, pending):
@@ -529,9 +528,8 @@ class TurnMonitor:
         self._last_error = None
         self.errors_in_a_row = 0
         self._recent_failures.clear()
-        self._last_failure = None
         self._max_repeat = 0
-        self._repeated_error = ""
+        self._peak_failure = None
 
     def _next_action(self, evidence: dict) -> GuardAction | None:
         if not self.live_actions or self._interrupt_issued:
@@ -621,7 +619,7 @@ class TurnMonitor:
                        "If no verification entry is supplied, build and exercise the app in a disposable copy "
                        "so validation does not change the delivered application's persistent data.")
         if self._max_repeat >= self.repeat_threshold:
-            evidence = self._last_failure or {}
+            evidence = self._peak_failure or {}
             tags = ", ".join(evidence.get("command_tags") or ("other",))
             interrupted = any(
                 action.kind == "interrupt" and accepted
@@ -633,7 +631,8 @@ class TurnMonitor:
                 f"Tool: {evidence.get('tool', 'unknown')}; command category: {tags}; "
                 f"failure kind: {evidence.get('failure_kind', 'unknown')}; "
                 f"exit status: {evidence.get('exit_reason', 'unavailable')}. "
-                f"Last unmodified error preview: {self._repeated_error[:200]!r}. "
+                "Unmodified error preview for that repeated failure: "
+                f"{str(evidence.get('preview') or '')[:200]!r}. "
                 "Do not repeat the same call. The root cause remains unknown unless the "
                 "error states it explicitly; obtain new diagnostic evidence and use a "
                 "materially different repair."
@@ -647,7 +646,7 @@ class TurnMonitor:
 
     def correction_log_text(self, correction: str) -> str:
         if correction == self._repeat_correction:
-            evidence = self._last_failure or {}
+            evidence = self._peak_failure or {}
             return (
                 "repeated tool failure; raw preview omitted; "
                 f"tool={evidence.get('tool', 'unknown')} "

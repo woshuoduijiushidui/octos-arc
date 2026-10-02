@@ -126,6 +126,34 @@ class TurnMonitorTests(unittest.TestCase):
         self.assertEqual(live_actions[0].kind, "steer")
         self.assertEqual(live_actions[0].repeat_count, 3)
 
+    def test_should_keep_peak_failure_evidence_together_in_final_correction(self):
+        m = TurnMonitor(protected_prefixes=[], live_actions=False)
+        for index in range(6):
+            call_id = f"shell-{index}"
+            m.observe(*started("shell", {"command": "npm test"}, call_id))
+            m.observe(*completed(call_id, False, "npm failed\n\nExit code: 1"))
+
+        m.observe(*started("read_file", {"path": "backend/app.py"}, "read"))
+        m.observe(*completed(
+            "read",
+            False,
+            "permission denied\n\nExit code: -1",
+        ))
+
+        correction = m.corrections()[0]
+        self.assertIn("same recent error 6 times", correction)
+        self.assertIn("Tool: shell", correction)
+        self.assertIn("command category: test", correction)
+        self.assertIn("failure kind: nonzero_exit", correction)
+        self.assertIn("exit status: nonzero", correction)
+        self.assertIn("npm failed", correction)
+        self.assertNotIn("read_file", correction)
+        self.assertNotIn("permission denied", correction)
+        self.assertIn(
+            "tool=shell kind=nonzero_exit count=6",
+            m.correction_log_text(correction),
+        )
+
     def test_should_reset_the_failure_window_after_material_success(self):
         m = TurnMonitor(protected_prefixes=[])
         actions = []
