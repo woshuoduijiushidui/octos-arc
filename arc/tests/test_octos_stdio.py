@@ -38,6 +38,40 @@ def task_evidence():
 
 
 class TaskEvidenceInputTests(unittest.TestCase):
+    def test_should_steer_and_interrupt_only_the_active_turn(self):
+        session = object.__new__(OctosStdioSession)
+        session.session_id = "arc:test"
+        session._active_turn_id = "turn-1"
+        session._send = Mock(side_effect=[
+            {"turn_id": "turn-1", "steered": True},
+            {"interrupted": True},
+        ])
+
+        self.assertTrue(session.steer_active_turn("change approach"))
+        self.assertTrue(session.interrupt_active_turn())
+        steer = session._send.call_args_list[0]
+        interrupt = session._send.call_args_list[1]
+        self.assertEqual(steer.args[0], "turn/steer")
+        self.assertEqual(steer.args[1]["expected_turn_id"], "turn-1")
+        self.assertEqual(
+            steer.args[1]["input"],
+            [{"kind": "text", "text": "change approach"}],
+        )
+        self.assertEqual(interrupt.args[0], "turn/interrupt")
+        self.assertEqual(
+            interrupt.args[1],
+            {"session_id": "arc:test", "turn_id": "turn-1"},
+        )
+
+    def test_should_refuse_turn_control_without_an_active_turn(self):
+        session = object.__new__(OctosStdioSession)
+        session._active_turn_id = None
+        session._send = Mock()
+
+        self.assertFalse(session.steer_active_turn("unused"))
+        self.assertFalse(session.interrupt_active_turn())
+        session._send.assert_not_called()
+
     def test_should_keep_legacy_text_only_payload_when_capsule_is_absent(self):
         with tempfile.TemporaryDirectory() as tmp:
             session = object.__new__(OctosStdioSession)
@@ -133,6 +167,7 @@ class TaskEvidenceInputTests(unittest.TestCase):
 
             self.assertTrue(ok)
             self.assertEqual(text, "")
+            self.assertIsNone(session._active_turn_id)
             params = session._send.call_args.args[1]
             self.assertEqual(
                 params["input"],

@@ -289,6 +289,64 @@ class H01ObservationTests(unittest.TestCase):
         self.assertNotIn("raw acceptance log", "\n".join(main_log))
 
 
+class LiveToolLoopGuardTests(unittest.TestCase):
+    def test_driver_should_steer_then_interrupt_without_logging_raw_data(self):
+        import tempfile
+        from pathlib import Path
+
+        from guard import ToolEventTrace, TurnMonitor
+
+        with tempfile.TemporaryDirectory() as tmp:
+            logs = []
+            driver = OctosDriver(
+                "octos",
+                Path(tmp),
+                {},
+                Path(tmp) / "data",
+                10,
+                Path(tmp) / "octos-events.jsonl",
+            )
+            driver._session = mock.Mock()
+            driver._session.steer_active_turn.return_value = True
+            driver._session.interrupt_active_turn.return_value = True
+            monitor = TurnMonitor([], label="REQ-1 repair")
+            driver.monitor = monitor
+            driver.tool_trace = ToolEventTrace(
+                monitor.label,
+                logs.append,
+                fingerprint_key=monitor.fingerprint_key,
+            )
+
+            for index in range(6):
+                call_id = f"c{index}"
+                driver._log_event(
+                    "tool/started",
+                    {
+                        "tool_call_id": call_id,
+                        "tool_name": "shell",
+                        "arguments": {"command": "pkill -f private-service"},
+                    },
+                )
+                driver._log_event(
+                    "tool/completed",
+                    {
+                        "tool_call_id": call_id,
+                        "tool_name": "shell",
+                        "success": False,
+                        "output_preview": "private-output\n\nExit code: -1",
+                    },
+                )
+
+            self.assertEqual(driver._session.steer_active_turn.call_count, 3)
+            driver._session.interrupt_active_turn.assert_called_once_with()
+            guard_lines = [line for line in logs if line.startswith("[guard.action]")]
+            self.assertEqual(len(guard_lines), 4)
+            self.assertNotIn("private-service", "\n".join(logs))
+            self.assertNotIn("private-output", "\n".join(logs))
+            self.assertTrue(all('"accepted":true' in line for line in guard_lines))
+            self.assertIn('"action":"interrupt"', guard_lines[-1])
+
+
 class ToolEventMainLogTests(unittest.TestCase):
     def test_driver_should_stream_tool_events_and_finish_the_summary(self):
         import json

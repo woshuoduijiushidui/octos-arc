@@ -1042,11 +1042,14 @@ class OctosDriver:
                 self.tool_trace.observe(method, params)
             except Exception:  # noqa: BLE001 - diagnostics must never break a turn
                 pass
+        action = None
         if self.monitor is not None and method in ("tool/started", "tool/completed"):
             try:
-                self.monitor.observe(method, params)
+                action = self.monitor.observe(method, params)
             except Exception:  # noqa: BLE001 - guard must never break a turn
                 pass
+        if action is not None:
+            self._apply_guard_action(action)
         self._observe_h01_transport_event(method, params)
         try:
             with self.events_log.open("a", encoding="utf-8") as fh:
@@ -1059,6 +1062,33 @@ class OctosDriver:
                 )
         except OSError:
             pass
+
+    def _apply_guard_action(self, action) -> None:
+        accepted = False
+        error_type = None
+        session = self._session
+        try:
+            if session is not None and action.kind == "steer":
+                accepted = session.steer_active_turn(action.message)
+            elif session is not None and action.kind == "interrupt":
+                accepted = session.interrupt_active_turn()
+        except Exception as exc:  # noqa: BLE001 - a guard RPC failure must not kill the turn
+            error_type = type(exc).__name__
+        monitor = self.monitor
+        if monitor is not None:
+            monitor.record_action_result(action, accepted)
+        tool_trace = self.tool_trace
+        if tool_trace is not None:
+            try:
+                tool_trace.record_guard_action(action, accepted, error_type)
+            except Exception:  # noqa: BLE001 - diagnostics must never break a turn
+                pass
+        log(
+            f"[guard.live] action={action.kind} reason={action.reason} "
+            f"tool={action.tool} repeat={action.repeat_count} "
+            f"family_repeat={action.family_repeat_count} accepted={accepted} "
+            f"error_type={error_type or 'none'}"
+        )
 
     def _get_session(self):
         if self._session is None:
@@ -1088,6 +1118,7 @@ class OctosDriver:
             getattr(monitor, "label", "unlabelled"),
             log,
             observation="complete" if uses_stdio else "unavailable",
+            fingerprint_key=getattr(monitor, "fingerprint_key", None),
         )
         tool_trace = self.tool_trace
         if not uses_stdio:
@@ -2010,7 +2041,8 @@ class Flow:
         monitor = TurnMonitor(self.protected_prefixes(),
                               expect_verification=expect_verification and not no_shell,
                               allowed_prefixes=[".arc/design/", str(self.output_dir / ".arc" / "design")],
-                              label=label)
+                              label=label,
+                              live_actions=self.guard_enabled)
         if proxy is not None:
             # Per-turn reasoning: OCTOS_ARC_IMPLEMENT_REASONING (e.g. "none") applies
             # to first implement turns of small tasks; rewrite/repair keep the base mode.
@@ -2057,7 +2089,7 @@ class Flow:
         if proxy is not None and proxy.turn_budget and proxy.turn_requests > proxy.turn_budget:
             log(f"[guard] {label}: request budget {proxy.turn_budget} hit; turn forced to finish")
         for c in monitor.corrections():
-            log(f"[guard] {label}: {c[:160]}")
+            log(f"[guard] {label}: {monitor.correction_log_text(c)}")
             if self.guard_enabled:
                 self.pending_corrections.append(c)
         restored = self.restore_protected()

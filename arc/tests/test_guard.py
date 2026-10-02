@@ -71,6 +71,83 @@ class TurnMonitorTests(unittest.TestCase):
         m.finish("Here is my plan...")
         self.assertFalse(m.wrote_files)
 
+    def test_should_remind_on_each_repeat_then_interrupt_the_sixth_failure(self):
+        m = TurnMonitor(protected_prefixes=[])
+        actions = []
+        for index in range(6):
+            call_id = f"c{index}"
+            m.observe(*started("shell", {"command": "pkill -f node"}, call_id))
+            action = m.observe(*completed(
+                call_id,
+                False,
+                "process 43101 did not exit\n\nExit code: -1",
+            ))
+            if action is not None:
+                actions.append(action)
+                m.record_action_result(action, True)
+
+        self.assertEqual([a.kind for a in actions], ["steer", "steer", "steer", "interrupt"])
+        self.assertEqual([a.repeat_count for a in actions], [3, 4, 5, 6])
+        self.assertIn("43101", actions[0].message)
+        self.assertIn("root cause is not known", actions[0].message)
+        m.finish("")
+        correction = " ".join(m.corrections())
+        self.assertIn("was interrupted", correction)
+        self.assertIn("43101", correction)
+
+    def test_should_not_treat_different_commands_as_the_same_call(self):
+        m = TurnMonitor(protected_prefixes=[])
+        actions = []
+        for index in range(6):
+            call_id = f"c{index}"
+            m.observe(*started("shell", {"command": f"probe-{index}"}, call_id))
+            action = m.observe(*completed(call_id, False, "(no output)\n\nExit code: -1"))
+            if action is not None:
+                actions.append(action)
+
+        self.assertTrue(actions)
+        self.assertTrue(all(a.reason == "failure_family_loop" for a in actions))
+        self.assertTrue(all(a.repeat_count == 1 for a in actions))
+        self.assertNotIn("interrupt", [a.kind for a in actions])
+
+    def test_should_reset_the_failure_episode_after_a_success(self):
+        m = TurnMonitor(protected_prefixes=[])
+        for index in range(2):
+            call_id = f"before-{index}"
+            m.observe(*started("shell", {"command": "npm test"}, call_id))
+            self.assertIsNone(m.observe(*completed(call_id, False, "failed\n\nExit code: 1")))
+
+    def test_should_interrupt_a_broad_failure_family_after_warnings(self):
+        m = TurnMonitor(protected_prefixes=[])
+        actions = []
+        for index in range(10):
+            call_id = f"c{index}"
+            m.observe(*started("shell", {"command": f"probe-{index}"}, call_id))
+            action = m.observe(*completed(call_id, False, "(no output)\n\nExit code: -1"))
+            if action is not None:
+                actions.append(action)
+                m.record_action_result(action, True)
+
+        self.assertEqual(
+            [(a.kind, a.family_repeat_count) for a in actions],
+            [("steer", 6), ("steer", 8), ("steer", 9), ("interrupt", 10)],
+        )
+
+    def test_should_not_emit_live_actions_when_guard_is_disabled(self):
+        m = TurnMonitor(protected_prefixes=[], live_actions=False)
+        for index in range(10):
+            call_id = f"c{index}"
+            m.observe(*started("shell", {"command": "npm test"}, call_id))
+            self.assertIsNone(
+                m.observe(*completed(call_id, False, "failed\n\nExit code: 1"))
+            )
+        m.observe(*started("read_file", {"path": "backend/server.js"}, "read"))
+        m.observe(*completed("read", True))
+        for index in range(2):
+            call_id = f"after-{index}"
+            m.observe(*started("shell", {"command": "npm test"}, call_id))
+            self.assertIsNone(m.observe(*completed(call_id, False, "failed\n\nExit code: 1")))
+
 
 class ToolEventTraceTests(unittest.TestCase):
     def test_should_emit_live_safe_events_and_an_aggregate_summary(self):
@@ -160,6 +237,44 @@ class ToolEventTraceTests(unittest.TestCase):
         marker = json.loads(lines[-1].split(" ", 1)[1])
         self.assertEqual(marker["event"], "observation")
         self.assertEqual(marker["reason"], "stdio_chat_fallback")
+
+    def test_should_emit_safe_structured_shell_diagnostics(self):
+        lines = []
+        trace = ToolEventTrace("REQ-1 repair", lines.append)
+        trace.observe(
+            "tool/started",
+            {
+                "tool_call_id": "c1",
+                "tool_name": "shell",
+                "arguments": {"command": "pkill -f private-service", "timeout_secs": 20},
+            },
+        )
+        trace.observe(
+            "tool/completed",
+            {
+                "tool_call_id": "c1",
+                "tool_name": "shell",
+                "success": False,
+                "output_preview": "(no output)\n\nExit code: -1",
+                "duration_ms": 91,
+            },
+        )
+        trace.finish()
+
+        joined = "\n".join(lines)
+        self.assertNotIn("private-service", joined)
+        self.assertNotIn("(no output)", joined)
+        start_event = json.loads(lines[0].split(" ", 1)[1])
+        end_event = json.loads(lines[1].split(" ", 1)[1])
+        summary = json.loads(lines[-1].split(" ", 1)[1])
+        self.assertEqual(start_event["command_tags"], ["process_cleanup"])
+        self.assertEqual(start_event["timeout_secs"], 20)
+        self.assertEqual(end_event["exit_code"], -1)
+        self.assertEqual(end_event["exit_reason"], "no_normal_exit_code")
+        self.assertEqual(end_event["failure_kind"], "no_exit_status")
+        self.assertFalse(end_event["output_present"])
+        self.assertEqual(summary["shell_command_tags"], {"process_cleanup": 1})
+        self.assertEqual(summary["shell_failure_kinds"], {"no_exit_status": 1})
 
 
 if __name__ == "__main__":

@@ -49,6 +49,7 @@ class OctosStdioSession:
         self._notifications: queue.Queue = queue.Queue()
         self._stderr_lines: list[str] = []
         self._id_counter = 0
+        self._active_turn_id: str | None = None
         self._reader = threading.Thread(target=self._read_stdout, daemon=True)
         self._reader.start()
         self._stderr_reader = threading.Thread(target=self._read_stderr, daemon=True)
@@ -191,6 +192,34 @@ class OctosStdioSession:
             params["profile_id"] = self.profile_id
         self._send("session/open", params, want_response=True, timeout=timeout)
 
+    def steer_active_turn(self, text: str, timeout: float = 30.0) -> bool:
+        turn_id = self._active_turn_id
+        if not turn_id:
+            return False
+        result = self._send(
+            "turn/steer",
+            {
+                "session_id": self.session_id,
+                "expected_turn_id": turn_id,
+                "input": [{"kind": "text", "text": text}],
+            },
+            want_response=True,
+            timeout=timeout,
+        )
+        return bool(isinstance(result, dict) and result.get("steered"))
+
+    def interrupt_active_turn(self, timeout: float = 30.0) -> bool:
+        turn_id = self._active_turn_id
+        if not turn_id:
+            return False
+        result = self._send(
+            "turn/interrupt",
+            {"session_id": self.session_id, "turn_id": turn_id},
+            want_response=True,
+            timeout=timeout,
+        )
+        return bool(isinstance(result, dict) and result.get("interrupted"))
+
     def _report_capsule(self, status: str, schema: str | None, size: int) -> None:
         observer = getattr(self, "on_event", None)
         if observer is not None:
@@ -234,46 +263,51 @@ class OctosStdioSession:
         if timeout <= 0:
             return False, "octos turn timed out"
         turn_id = str(uuid.uuid4())
-        self._send("turn/start", {
-            "session_id": self.session_id,
-            "turn_id": turn_id,
-            "input": self._turn_input_items(text),
-        }, want_response=True, timeout=min(60.0, timeout))
+        self._active_turn_id = turn_id
+        try:
+            self._send("turn/start", {
+                "session_id": self.session_id,
+                "turn_id": turn_id,
+                "input": self._turn_input_items(text),
+            }, want_response=True, timeout=min(60.0, timeout))
 
-        chunks: list[str] = []
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return False, "octos turn timed out"
-            if self.proc.poll() is not None:
-                return False, (f"octos process exited {self.proc.returncode}; "
-                               f"stderr tail: {self.stderr_tail()}")
-            try:
-                frame = self._notifications.get(timeout=min(remaining, 5.0))
-            except queue.Empty:
-                continue
-            method = frame.get("method", "")
-            params = frame.get("params") or {}
-            self.on_event(method, params)
-            if method == "server/heartbeat":
-                continue
-            if method == "message/delta" and params.get("turn_id") == turn_id:
-                chunks.append(str(params.get("text", "")))
-            elif method == "approval/requested":
-                # Auto-approve so unattended runs never block.
+            chunks: list[str] = []
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False, "octos turn timed out"
+                if self.proc.poll() is not None:
+                    return False, (f"octos process exited {self.proc.returncode}; "
+                                   f"stderr tail: {self.stderr_tail()}")
                 try:
-                    self._send("approval/respond", {
-                        "approval_id": params.get("approval_id"),
-                        "decision": "approve",
-                        "approval_scope": "request",
-                    }, want_response=True, timeout=30.0)
-                except OctosProtocolError:
-                    pass
-            elif method == "turn/completed" and params.get("turn_id") == turn_id:
-                return True, "".join(chunks)
-            elif method == "turn/error" and params.get("turn_id") == turn_id:
-                return False, (f"{params.get('code', 'error')}: "
-                               f"{params.get('message', '')}"[:1000])
+                    frame = self._notifications.get(timeout=min(remaining, 5.0))
+                except queue.Empty:
+                    continue
+                method = frame.get("method", "")
+                params = frame.get("params") or {}
+                self.on_event(method, params)
+                if method == "server/heartbeat":
+                    continue
+                if method == "message/delta" and params.get("turn_id") == turn_id:
+                    chunks.append(str(params.get("text", "")))
+                elif method == "approval/requested":
+                    # Auto-approve so unattended runs never block.
+                    try:
+                        self._send("approval/respond", {
+                            "approval_id": params.get("approval_id"),
+                            "decision": "approve",
+                            "approval_scope": "request",
+                        }, want_response=True, timeout=30.0)
+                    except OctosProtocolError:
+                        pass
+                elif method == "turn/completed" and params.get("turn_id") == turn_id:
+                    return True, "".join(chunks)
+                elif method == "turn/error" and params.get("turn_id") == turn_id:
+                    return False, (f"{params.get('code', 'error')}: "
+                                   f"{params.get('message', '')}"[:1000])
+        finally:
+            if self._active_turn_id == turn_id:
+                self._active_turn_id = None
 
     def close(self) -> None:
         try:
