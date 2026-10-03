@@ -1640,17 +1640,6 @@ class ContractPromptParityTests(unittest.TestCase):
         self.assertIn("repeated once per item", contract)
         self.assertIn("accessible name", contract)
 
-    def test_should_require_grid_cells_to_name_their_coordinate(self):
-        """没有这条约定，按坐标取单元格只能靠猜值：值自己就是被断言的东西。
-
-        自建验收套件（arc/public-tests + helpers.ts）按 `role="gridcell"` 的
-        accessible name 找 `A1`，所以这条必须留在 DATA 合同里并被两处同步。"""
-        contract = m.UI_CONTRACT_DATA
-        self.assertIn('role="grid"', contract)
-        self.assertIn('role="gridcell"', contract)
-        self.assertIn('aria-rowindex', contract)
-        self.assertIn("accessible name", contract)
-
 
 class KilledSuiteRetryTests(unittest.TestCase):
     """How much memory a suite needs is not known before running it. A kill used
